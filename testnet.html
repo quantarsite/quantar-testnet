@@ -1,0 +1,577 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width, initial-scale=1.0">
+<title>Quantar Testnet Explorer</title>
+<link href="https://fonts.googleapis.com/css2?family=Share+Tech+Mono&family=Orbitron:wght@400;700;900&display=swap" rel="stylesheet">
+<style>
+  :root {
+    --bg:       #0A0A0F;
+    --surface:  #0f0f1a;
+    --border:   #1a1a2e;
+    --cyan:     #00f5ff;
+    --purple:   #a855f7;
+    --green:    #00ff88;
+    --red:      #ff3366;
+    --text:     #c8d6e5;
+    --muted:    #4a5568;
+    --glow-c:   0 0 20px rgba(0,245,255,0.4);
+    --glow-p:   0 0 20px rgba(168,85,247,0.4);
+  }
+
+  * { margin: 0; padding: 0; box-sizing: border-box; }
+
+  body {
+    background: var(--bg);
+    color: var(--text);
+    font-family: 'Share Tech Mono', monospace;
+    min-height: 100vh;
+    overflow-x: hidden;
+  }
+
+  /* Grid background */
+  body::before {
+    content: '';
+    position: fixed;
+    inset: 0;
+    background-image:
+      linear-gradient(rgba(0,245,255,0.03) 1px, transparent 1px),
+      linear-gradient(90deg, rgba(0,245,255,0.03) 1px, transparent 1px);
+    background-size: 40px 40px;
+    pointer-events: none;
+    z-index: 0;
+  }
+
+  /* Scan line effect */
+  body::after {
+    content: '';
+    position: fixed;
+    inset: 0;
+    background: repeating-linear-gradient(
+      0deg,
+      transparent,
+      transparent 2px,
+      rgba(0,0,0,0.05) 2px,
+      rgba(0,0,0,0.05) 4px
+    );
+    pointer-events: none;
+    z-index: 1;
+  }
+
+  .container {
+    position: relative;
+    z-index: 2;
+    max-width: 1100px;
+    margin: 0 auto;
+    padding: 0 20px 60px;
+  }
+
+  /* Header */
+  header {
+    padding: 40px 0 32px;
+    border-bottom: 1px solid var(--border);
+    margin-bottom: 32px;
+    display: flex;
+    align-items: center;
+    justify-content: space-between;
+    flex-wrap: wrap;
+    gap: 16px;
+  }
+
+  .logo {
+    display: flex;
+    flex-direction: column;
+  }
+
+  .logo-top {
+    font-family: 'Orbitron', sans-serif;
+    font-size: 11px;
+    font-weight: 400;
+    letter-spacing: 6px;
+    color: var(--muted);
+    text-transform: uppercase;
+    margin-bottom: 4px;
+  }
+
+  .logo-main {
+    font-family: 'Orbitron', sans-serif;
+    font-size: 28px;
+    font-weight: 900;
+    background: linear-gradient(135deg, var(--cyan), var(--purple));
+    -webkit-background-clip: text;
+    -webkit-text-fill-color: transparent;
+    background-clip: text;
+    letter-spacing: 2px;
+  }
+
+  .logo-sub {
+    font-size: 11px;
+    color: var(--muted);
+    letter-spacing: 3px;
+    margin-top: 4px;
+  }
+
+  .live-badge {
+    display: flex;
+    align-items: center;
+    gap: 8px;
+    background: rgba(0,255,136,0.08);
+    border: 1px solid rgba(0,255,136,0.2);
+    padding: 8px 16px;
+    font-size: 11px;
+    letter-spacing: 3px;
+    color: var(--green);
+  }
+
+  .live-dot {
+    width: 8px;
+    height: 8px;
+    background: var(--green);
+    border-radius: 50%;
+    animation: pulse 1.5s infinite;
+    box-shadow: 0 0 8px var(--green);
+  }
+
+  @keyframes pulse {
+    0%, 100% { opacity: 1; transform: scale(1); }
+    50%       { opacity: 0.4; transform: scale(0.8); }
+  }
+
+  /* Stats grid */
+  .stats {
+    display: grid;
+    grid-template-columns: repeat(auto-fit, minmax(200px, 1fr));
+    gap: 16px;
+    margin-bottom: 32px;
+  }
+
+  .stat-card {
+    background: var(--surface);
+    border: 1px solid var(--border);
+    padding: 20px 24px;
+    position: relative;
+    overflow: hidden;
+    transition: border-color 0.3s;
+  }
+
+  .stat-card::before {
+    content: '';
+    position: absolute;
+    top: 0; left: 0;
+    width: 3px;
+    height: 100%;
+  }
+
+  .stat-card.cyan::before  { background: var(--cyan); box-shadow: var(--glow-c); }
+  .stat-card.purple::before { background: var(--purple); box-shadow: var(--glow-p); }
+  .stat-card.green::before  { background: var(--green); }
+
+  .stat-card:hover { border-color: var(--cyan); }
+
+  .stat-label {
+    font-size: 10px;
+    letter-spacing: 4px;
+    color: var(--muted);
+    text-transform: uppercase;
+    margin-bottom: 10px;
+  }
+
+  .stat-value {
+    font-family: 'Orbitron', sans-serif;
+    font-size: 28px;
+    font-weight: 700;
+    color: var(--cyan);
+    transition: all 0.3s;
+  }
+
+  .stat-value.purple { color: var(--purple); }
+  .stat-value.green  { color: var(--green); }
+
+  .stat-sub {
+    font-size: 10px;
+    color: var(--muted);
+    margin-top: 6px;
+    word-break: break-all;
+  }
+
+  /* Section */
+  .section-header {
+    display: flex;
+    align-items: center;
+    gap: 12px;
+    margin-bottom: 16px;
+  }
+
+  .section-title {
+    font-family: 'Orbitron', sans-serif;
+    font-size: 12px;
+    letter-spacing: 4px;
+    color: var(--cyan);
+    text-transform: uppercase;
+  }
+
+  .section-line {
+    flex: 1;
+    height: 1px;
+    background: linear-gradient(90deg, var(--border), transparent);
+  }
+
+  /* Block list */
+  .block-list {
+    display: flex;
+    flex-direction: column;
+    gap: 8px;
+  }
+
+  .block-row {
+    background: var(--surface);
+    border: 1px solid var(--border);
+    padding: 16px 20px;
+    display: grid;
+    grid-template-columns: 100px 1fr auto;
+    align-items: center;
+    gap: 16px;
+    transition: all 0.2s;
+    cursor: default;
+    animation: slideIn 0.3s ease forwards;
+    opacity: 0;
+    transform: translateY(-8px);
+  }
+
+  @keyframes slideIn {
+    to { opacity: 1; transform: translateY(0); }
+  }
+
+  .block-row:hover {
+    border-color: rgba(0,245,255,0.3);
+    background: rgba(0,245,255,0.03);
+  }
+
+  .block-row.new {
+    border-color: rgba(0,245,255,0.5);
+    animation: newBlock 0.5s ease forwards;
+  }
+
+  @keyframes newBlock {
+    0%   { background: rgba(0,245,255,0.1); border-color: var(--cyan); opacity: 0; transform: translateY(-12px); }
+    100% { background: var(--surface); border-color: var(--border); opacity: 1; transform: translateY(0); }
+  }
+
+  .block-height {
+    font-family: 'Orbitron', sans-serif;
+    font-size: 18px;
+    font-weight: 700;
+    color: var(--cyan);
+  }
+
+  .block-height-label {
+    font-size: 9px;
+    color: var(--muted);
+    letter-spacing: 3px;
+    margin-bottom: 2px;
+  }
+
+  .block-hash {
+    font-size: 11px;
+    color: var(--muted);
+    word-break: break-all;
+    line-height: 1.4;
+  }
+
+  .block-hash span {
+    color: var(--text);
+  }
+
+  .block-tag {
+    font-size: 9px;
+    letter-spacing: 2px;
+    padding: 4px 10px;
+    border: 1px solid rgba(0,255,136,0.3);
+    color: var(--green);
+    white-space: nowrap;
+  }
+
+  /* Node info */
+  .node-info {
+    background: var(--surface);
+    border: 1px solid var(--border);
+    padding: 20px 24px;
+    margin-top: 32px;
+  }
+
+  .node-row {
+    display: flex;
+    justify-content: space-between;
+    padding: 8px 0;
+    border-bottom: 1px solid var(--border);
+    font-size: 12px;
+    gap: 16px;
+  }
+
+  .node-row:last-child { border-bottom: none; }
+
+  .node-key {
+    color: var(--muted);
+    letter-spacing: 2px;
+    white-space: nowrap;
+  }
+
+  .node-val {
+    color: var(--cyan);
+    text-align: right;
+    word-break: break-all;
+  }
+
+  /* Loading */
+  .loading {
+    text-align: center;
+    padding: 40px;
+    color: var(--muted);
+    letter-spacing: 4px;
+    font-size: 11px;
+  }
+
+  .loading span {
+    animation: blink 1s infinite;
+  }
+
+  @keyframes blink {
+    0%, 100% { opacity: 1; }
+    50%       { opacity: 0; }
+  }
+
+  /* Error */
+  .error {
+    background: rgba(255,51,102,0.08);
+    border: 1px solid rgba(255,51,102,0.3);
+    color: var(--red);
+    padding: 16px 20px;
+    font-size: 12px;
+    letter-spacing: 2px;
+  }
+
+  /* Footer */
+  footer {
+    margin-top: 48px;
+    padding-top: 24px;
+    border-top: 1px solid var(--border);
+    display: flex;
+    justify-content: space-between;
+    align-items: center;
+    flex-wrap: wrap;
+    gap: 12px;
+  }
+
+  footer a {
+    color: var(--cyan);
+    text-decoration: none;
+    font-size: 11px;
+    letter-spacing: 2px;
+    transition: opacity 0.2s;
+  }
+
+  footer a:hover { opacity: 0.7; }
+
+  .footer-copy {
+    font-size: 11px;
+    color: var(--muted);
+    letter-spacing: 2px;
+  }
+
+  .hydra-badge {
+    font-size: 10px;
+    letter-spacing: 3px;
+    color: var(--purple);
+    border: 1px solid rgba(168,85,247,0.3);
+    padding: 4px 12px;
+  }
+
+  @media (max-width: 600px) {
+    .block-row {
+      grid-template-columns: 80px 1fr;
+    }
+    .block-tag { display: none; }
+    .stat-value { font-size: 22px; }
+  }
+</style>
+</head>
+<body>
+<div class="container">
+
+  <header>
+    <div class="logo">
+      <div class="logo-top">Quantar Network</div>
+      <div class="logo-main">TESTNET</div>
+      <div class="logo-sub">EXPLORER // CHAIN ID: quantar-testnet-1</div>
+    </div>
+    <div class="live-badge">
+      <div class="live-dot"></div>
+      LIVE
+    </div>
+  </header>
+
+  <!-- Stats -->
+  <div class="stats">
+    <div class="stat-card cyan">
+      <div class="stat-label">Latest Block</div>
+      <div class="stat-value" id="height">—</div>
+      <div class="stat-sub">5s block time</div>
+    </div>
+    <div class="stat-card purple">
+      <div class="stat-label">Node Address</div>
+      <div class="stat-value purple" style="font-size:13px;margin-top:4px" id="node-addr">—</div>
+      <div class="stat-sub" id="chain-id">—</div>
+    </div>
+    <div class="stat-card green">
+      <div class="stat-label">Signature Scheme</div>
+      <div class="stat-value green" style="font-size:13px;margin-top:4px">HYDRA-X</div>
+      <div class="stat-sub">ML-DSA-87 ∧ SLH-DSA</div>
+    </div>
+  </div>
+
+  <!-- Block hash -->
+  <div class="stats" style="grid-template-columns:1fr;margin-bottom:32px">
+    <div class="stat-card cyan">
+      <div class="stat-label">Latest Block Hash</div>
+      <div style="font-size:13px;color:var(--cyan);word-break:break-all;margin-top:8px" id="block-hash">—</div>
+    </div>
+  </div>
+
+  <!-- Block list -->
+  <div class="section-header">
+    <div class="section-title">Recent Blocks</div>
+    <div class="section-line"></div>
+  </div>
+
+  <div class="block-list" id="block-list">
+    <div class="loading">FETCHING BLOCKS<span>_</span></div>
+  </div>
+
+  <!-- Node info -->
+  <div class="node-info" style="margin-top:32px">
+    <div class="section-header" style="margin-bottom:12px">
+      <div class="section-title">Node Info</div>
+      <div class="section-line"></div>
+    </div>
+    <div class="node-row">
+      <span class="node-key">RPC ENDPOINT</span>
+      <span class="node-val">http://testnet.quantarnetwork.com:8545</span>
+    </div>
+    <div class="node-row">
+      <span class="node-key">CONSENSUS</span>
+      <span class="node-val">Proof-of-Authority / Round-Robin</span>
+    </div>
+    <div class="node-row">
+      <span class="node-key">CRYPTO</span>
+      <span class="node-val">HYDRA-X AND-Composition (FIPS 204 ∧ FIPS 205)</span>
+    </div>
+    <div class="node-row">
+      <span class="node-key">TOKEN</span>
+      <span class="node-val">QTR — 20,000,000 fixed supply</span>
+    </div>
+    <div class="node-row">
+      <span class="node-key">REPOSITORY</span>
+      <span class="node-val">github.com/quantarsite/quantar-testnet</span>
+    </div>
+    <div class="node-row">
+      <span class="node-key">VERSION</span>
+      <span class="node-val" id="version">—</span>
+    </div>
+  </div>
+
+  <footer>
+    <div>
+      <a href="https://quantarnetwork.com" target="_blank">quantarnetwork.com</a>
+      &nbsp;&nbsp;
+      <a href="https://github.com/quantarsite/quantar-testnet" target="_blank">github</a>
+    </div>
+    <div class="hydra-badge">HYDRA-X SECURED</div>
+    <div class="footer-copy">© 2026 QUANTAR NETWORK</div>
+  </footer>
+
+</div>
+
+<script>
+  const RPC = 'http://testnet.quantarnetwork.com:8545';
+  let lastHeight = -1;
+
+  async function fetchStatus() {
+    try {
+      const r = await fetch(`${RPC}/status`);
+      const d = await r.json();
+      document.getElementById('height').textContent   = d.height.toLocaleString();
+      document.getElementById('node-addr').textContent = d.node_address;
+      document.getElementById('chain-id').textContent  = d.chain_id;
+      document.getElementById('block-hash').textContent = d.block_hash;
+      document.getElementById('version').textContent   = `qtrc-node v${d.version}`;
+      return d.height;
+    } catch(e) {
+      return null;
+    }
+  }
+
+  async function fetchBlocks() {
+    try {
+      const r = await fetch(`${RPC}/blocks/latest`);
+      const d = await r.json();
+      return d.blocks || [];
+    } catch(e) {
+      return null;
+    }
+  }
+
+  function renderBlocks(blocks, latestHeight) {
+    const list = document.getElementById('block-list');
+    if (!blocks || blocks.length === 0) {
+      list.innerHTML = '<div class="loading">NO BLOCKS YET<span>_</span></div>';
+      return;
+    }
+
+    list.innerHTML = '';
+    blocks.forEach((b, i) => {
+      const isNew = b.height > lastHeight && lastHeight >= 0;
+      const div = document.createElement('div');
+      div.className = 'block-row' + (isNew ? ' new' : '');
+      div.style.animationDelay = `${i * 0.04}s`;
+
+      const shortHash = b.hash
+        ? `<span>${b.hash.slice(0,16)}…${b.hash.slice(-8)}</span>`
+        : `<span style="color:var(--muted)">hash not stored in memory</span>`;
+
+      div.innerHTML = `
+        <div>
+          <div class="block-height-label">BLOCK</div>
+          <div class="block-height">${b.height.toLocaleString()}</div>
+        </div>
+        <div class="block-hash">
+          HASH &nbsp;${shortHash}
+        </div>
+        <div class="block-tag">✓ COMMITTED</div>
+      `;
+      list.appendChild(div);
+    });
+  }
+
+  async function update() {
+    const height = await fetchStatus();
+    const blocks = await fetchBlocks();
+
+    if (blocks === null) {
+      document.getElementById('block-list').innerHTML =
+        '<div class="error">⚠ CANNOT REACH NODE — ' + RPC + '</div>';
+      return;
+    }
+
+    renderBlocks(blocks, height);
+    if (height !== null) lastHeight = height;
+  }
+
+  // Initial load
+  update();
+
+  // Poll every 5 seconds (block time)
+  setInterval(update, 5000);
+</script>
+</body>
+</html>
