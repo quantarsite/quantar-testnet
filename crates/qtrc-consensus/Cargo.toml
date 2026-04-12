@@ -1,0 +1,19 @@
+[package]
+name        = "qtrc-consensus"
+description = "Quantar PoA consensus engine — round-robin validator rotation"
+version.workspace    = true
+edition.workspace    = true
+authors.workspace    = true
+license.workspace    = true
+repository.workspace = true
+
+[dependencies]
+qtrc-crypto.path  = "../qtrc-crypto"
+qtrc-common.path  = "../qtrc-common"
+tokio.workspace      = true
+serde.workspace      = true
+serde_json.workspace = true
+thiserror.workspace  = true
+tracing.workspace    = true
+chrono.workspace     = true
+parking_lot.workspace = true

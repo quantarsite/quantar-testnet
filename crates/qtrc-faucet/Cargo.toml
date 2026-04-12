@@ -1,0 +1,31 @@
+[package]
+name        = "qtrc-faucet"
+description = "Quantar testnet faucet — drips 100 QTR to any valid address"
+version.workspace    = true
+edition.workspace    = true
+authors.workspace    = true
+license.workspace    = true
+repository.workspace = true
+
+[[bin]]
+name = "qtrc-faucet"
+path = "src/main.rs"
+
+[dependencies]
+qtrc-crypto.path     = "../qtrc-crypto"
+qtrc-common.path     = "../qtrc-common"
+
+tokio.workspace          = true
+serde.workspace          = true
+serde_json.workspace     = true
+axum.workspace           = true
+tower-http.workspace     = true
+thiserror.workspace      = true
+tracing.workspace        = true
+tracing-subscriber.workspace = true
+clap.workspace           = true
+chrono.workspace         = true
+anyhow.workspace         = true
+hex.workspace            = true
+dashmap.workspace        = true
+reqwest = { version = "0.12", features = ["json"] }

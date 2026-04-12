@@ -1,0 +1,6 @@
+/target
+/qtrc-data
+*.key
+*.pem
+Cargo.lock
+.env
