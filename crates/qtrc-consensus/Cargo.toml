@@ -10,6 +10,7 @@ repository.workspace = true
 [dependencies]
 qtrc-crypto.path  = "../qtrc-crypto"
 qtrc-common.path  = "../qtrc-common"
+hx-mempool        = { path = "../../../hx-mempool" }
 tokio.workspace      = true
 serde.workspace      = true
 serde_json.workspace = true

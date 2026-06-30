@@ -15,7 +15,6 @@ use pqcrypto_sphincsplus::sphincssha2256ssimple::{
 use pqcrypto_traits::sign::{
     DetachedSignature, PublicKey as PqPublicKey, SecretKey as PqSecretKey,
 };
-use sha3::{Digest, Sha3_256};
 use serde::{Deserialize, Serialize};
 use thiserror::Error;
 use zeroize::Zeroize;
@@ -42,18 +41,17 @@ pub enum CryptoError {
 // Address
 // ---------------------------------------------------------------------------
 
-/// A Quantar Network address — 32-byte SHA3-256 digest of the
+/// A Quantar Network address — 32-byte BLAKE3 digest of the
 /// concatenated ML-DSA-87 and SLH-DSA public keys.
 #[derive(Clone, Debug, PartialEq, Eq, Hash, Serialize, Deserialize)]
 pub struct Address(#[serde(with = "hex::serde")] pub [u8; 32]);
 
 impl Address {
     pub fn from_verifying_key(vk: &HydraXVerifyingKey) -> Self {
-        let mut hasher = Sha3_256::new();
+        let mut hasher = blake3::Hasher::new();
         hasher.update(vk.ml_dsa_pk.as_bytes());
         hasher.update(vk.slh_dsa_pk.as_bytes());
-        let digest: [u8; 32] = hasher.finalize().into();
-        Address(digest)
+        Address(*hasher.finalize().as_bytes())
     }
 
     pub fn as_hex(&self) -> String {
@@ -100,6 +98,18 @@ impl std::fmt::Debug for HydraXVerifyingKey {
 impl HydraXVerifyingKey {
     pub fn address(&self) -> Address {
         Address::from_verifying_key(self)
+    }
+
+    /// Raw bytes of the ML-DSA-87 public key (2592 bytes).
+    pub fn ml_dsa_pk_bytes(&self) -> &[u8] {
+        use pqcrypto_traits::sign::PublicKey;
+        self.ml_dsa_pk.as_bytes()
+    }
+
+    /// Raw bytes of the SLH-DSA-256s public key (64 bytes).
+    pub fn slh_dsa_pk_bytes(&self) -> &[u8] {
+        use pqcrypto_traits::sign::PublicKey;
+        self.slh_dsa_pk.as_bytes()
     }
 }
 

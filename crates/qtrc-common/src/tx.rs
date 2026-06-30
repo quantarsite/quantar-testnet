@@ -52,20 +52,21 @@ pub struct Transaction {
 
 impl Transaction {
     /// Canonical payload: fields signed by the sender.
-    /// The signature itself is excluded from the payload.
-    pub fn signing_payload(
-        from: &Address,
-        to: &Address,
-        amount: u64,
-        nonce: u64,
-        timestamp: i64,
-    ) -> Vec<u8> {
-        let mut buf = Vec::new();
+    ///
+    /// Layout matches hx-mempool `RawTransaction::signing_bytes()` with
+    /// fixed sentinel values for fee_per_gas=0, gas_limit=21_000, data=[]:
+    ///   nonce(8) || sender(32) || recipient(32) || value(16)
+    ///   || fee_per_gas(8) || gas_limit(8) || data_len(8)
+    pub fn signing_payload(from: &Address, to: &Address, amount: u64, nonce: u64) -> Vec<u8> {
+        const GAS_LIMIT: u64 = 21_000;
+        let mut buf = Vec::with_capacity(8 + 32 + 32 + 16 + 8 + 8 + 8);
+        buf.extend_from_slice(&nonce.to_le_bytes());
         buf.extend_from_slice(&from.0);
         buf.extend_from_slice(&to.0);
-        buf.extend_from_slice(&amount.to_le_bytes());
-        buf.extend_from_slice(&nonce.to_le_bytes());
-        buf.extend_from_slice(&timestamp.to_le_bytes());
+        buf.extend_from_slice(&(amount as u128).to_le_bytes());
+        buf.extend_from_slice(&0u64.to_le_bytes());       // fee_per_gas
+        buf.extend_from_slice(&GAS_LIMIT.to_le_bytes()); // gas_limit
+        buf.extend_from_slice(&0u64.to_le_bytes());       // data_len
         buf
     }
 
@@ -82,13 +83,7 @@ impl Transaction {
     ///   1. Both ML-DSA-87 and SLH-DSA signatures are valid.
     ///   2. The signing key's derived address matches `self.from`.
     pub fn verify(&self) -> Result<(), TxError> {
-        let payload = Self::signing_payload(
-            &self.from,
-            &self.to,
-            self.amount,
-            self.nonce,
-            self.timestamp,
-        );
+        let payload = Self::signing_payload(&self.from, &self.to, self.amount, self.nonce);
 
         // AND-composition check
         self.signature

@@ -6,6 +6,13 @@
 //!
 //! All block proposals and vote signatures are HYDRA-X AND-composed.
 
+mod adapter;
+
+use hx_mempool::{
+    ingestion::{IngestionPipeline, IngestResult, PqCryptoVerifier},
+    pool::TxPool,
+    sig_cache::{HydraXSigCache, SigCacheConfig},
+};
 use parking_lot::RwLock;
 use qtrc_common::{
     block::{Block, BlockHeader, ValidatorSig},
@@ -34,26 +41,41 @@ pub enum ConsensusError {
     InvalidTx(String),
 }
 
-/// The consensus engine — holds chain state and mempool.
+/// The consensus engine — holds chain state, mempool, and ingestion pipeline.
 pub struct ConsensusEngine {
     /// Current chain state (append-only, updated on commit)
     pub state:   Arc<RwLock<ChainState>>,
-    /// Pending transactions not yet in a block
+    /// Pending transactions queued for the next block
     pub mempool: Arc<RwLock<Vec<Transaction>>>,
     /// This node's keypair (used when this node is the proposer)
     keypair:     Arc<HydraXKeypair>,
     /// This node's address
     pub address: Address,
+    /// hx-mempool ingestion pipeline — parallel PQ-sig verification,
+    /// deduplication, and two-tier signature cache.
+    pipeline:    Arc<IngestionPipeline<PqCryptoVerifier>>,
 }
 
 impl ConsensusEngine {
     pub fn new(state: ChainState, keypair: HydraXKeypair) -> Self {
         let address = keypair.address();
+
+        let pool      = Arc::new(TxPool::new());
+        let sig_cache = Arc::new(
+            HydraXSigCache::new(SigCacheConfig::default(), Arc::clone(&pool))
+                .expect("sig cache init failed"),
+        );
+        let pipeline = Arc::new(
+            IngestionPipeline::new(pool, sig_cache, Arc::new(PqCryptoVerifier), 0)
+                .expect("ingestion pipeline init failed"),
+        );
+
         ConsensusEngine {
             state:   Arc::new(RwLock::new(state)),
             mempool: Arc::new(RwLock::new(Vec::new())),
             keypair: Arc::new(keypair),
             address,
+            pipeline,
         }
     }
 
@@ -67,13 +89,35 @@ impl ConsensusEngine {
         Some(state.validators[idx].address.clone())
     }
 
-    /// Add a transaction to the mempool after basic validation.
+    /// Add a transaction to the mempool after pipeline validation.
+    ///
+    /// The hx-mempool `IngestionPipeline` performs:
+    ///   1. Duplicate check (fast path against `TxPool`)
+    ///   2. Address derivation: BLAKE3(ml_pk || slh_pk) == sender
+    ///   3. Parallel ML-DSA-87 + SLH-DSA-256s verification via rayon
+    ///   4. Signature caching in the two-tier hot/cold cache
+    ///
+    /// On `Accepted`, the transaction is also pushed to the `Vec` mempool
+    /// so `propose_block()` can drain it into the next block.
+    /// On `Duplicate`, the existing hash is returned without re-queuing.
     pub fn submit_tx(&self, tx: Transaction) -> Result<TxHash, ConsensusError> {
-        tx.verify()
-            .map_err(|e| ConsensusError::InvalidTx(e.to_string()))?;
-        let hash = tx.hash();
-        self.mempool.write().push(tx);
-        Ok(hash)
+        let item = adapter::to_ingest_item(&tx)?;
+
+        match self.pipeline.ingest_one(item) {
+            IngestResult::Accepted { hash } => {
+                self.mempool.write().push(tx);
+                Ok(adapter::hx_hash_to_qtrc(hash))
+            }
+            IngestResult::Duplicate { hash } => Ok(adapter::hx_hash_to_qtrc(hash)),
+            IngestResult::Rejected { reason } => {
+                Err(ConsensusError::InvalidTx(reason.to_string()))
+            }
+        }
+    }
+
+    /// Expose ingestion metrics for monitoring.
+    pub fn pipeline_metrics(&self) -> &hx_mempool::metrics::IngestionMetrics {
+        self.pipeline.metrics()
     }
 
     /// Propose a new block if this node is the current proposer.
