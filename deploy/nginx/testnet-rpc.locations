@@ -13,7 +13,7 @@ location = /status {
     proxy_pass http://127.0.0.1:8545/status;
 }
 
-location ~ ^/rpc/account/([0-9a-fA-F]{64})$ {
+location ~ "^/rpc/account/([0-9a-fA-F]{64})$" {
     limit_req zone=qtr_read burst=20 nodelay;
     proxy_pass http://127.0.0.1:8545/account/$1;
 }
