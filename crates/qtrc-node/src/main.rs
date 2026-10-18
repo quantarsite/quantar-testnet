@@ -136,25 +136,62 @@ async fn cmd_start(rpc_addr: String, data_dir: String, key_file: Option<String>)
     let address = keypair.address();
     info!("Node address: {} ({address})", address.as_hex());
 
-    // Load or create genesis
-    let genesis    = Genesis::testnet();
-    let init_state = genesis.initial_state();
+    // Open the chain store first: an existing data directory decides the
+    // genesis, so a restart can never silently start a different chain.
+    let store = Arc::new(store::BlockStore::open(&data_dir)?);
+    let env_genesis = Genesis::testnet();
+    let genesis = match store.genesis()? {
+        Some(saved) => {
+            if serde_json::to_value(&saved)? != serde_json::to_value(&env_genesis)? {
+                warn!(
+                    "QTR_FAUCET_ADDRESS differs from the genesis saved in {data_dir}; \
+                     keeping the saved genesis (start with a new --data-dir for a new chain)"
+                );
+            }
+            saved
+        }
+        None => {
+            store.save_genesis(&env_genesis)?;
+            info!("New data directory: genesis saved to {data_dir}");
+            env_genesis
+        }
+    };
 
+    if genesis.chain_id != qtrc_common::tx::CHAIN_ID {
+        anyhow::bail!(
+            "data directory belongs to chain {}, this binary runs {}. Use a new --data-dir.",
+            genesis.chain_id,
+            qtrc_common::tx::CHAIN_ID
+        );
+    }
+
+    let init_state = genesis.initial_state();
     info!(
         chain_id  = %genesis.chain_id,
-        height    = init_state.height,
         accounts  = init_state.accounts.len(),
         "Genesis state loaded"
     );
     if genesis.allocations.is_empty() {
-        warn!("QTR_FAUCET_ADDRESS not set or invalid: genesis has no faucet allocation");
+        warn!("genesis has no faucet allocation (QTR_FAUCET_ADDRESS was not set when this chain was created)");
     }
 
-    // Open persistent store
-    let _store = store::BlockStore::open(&data_dir)?;
+    // Build consensus engine with durable block storage
+    let engine = Arc::new(ConsensusEngine::new(init_state, keypair).with_sink(store.clone()));
 
-    // Build consensus engine
-    let engine = Arc::new(ConsensusEngine::new(init_state, keypair));
+    // Rebuild state by re-verifying and re-applying every stored block
+    let mut replayed = 0u64;
+    for block in store.blocks() {
+        let block = block?;
+        let height = block.header.height;
+        engine
+            .replay_block(block)
+            .map_err(|e| anyhow::anyhow!("stored block {height} failed replay: {e}"))?;
+        replayed += 1;
+    }
+    {
+        let state = engine.state.read();
+        info!(height = state.height, replayed, "Chain state restored from disk");
+    }
 
     // Spawn block producer
     let engine_clone = engine.clone();

@@ -1,7 +1,7 @@
 //! # qtrc-faucet
 //!
 //! HTTP faucet for the Quantar testnet.
-//! Sends 100 QTR per request, once per address and once per IP per hour,
+//! Sends 50 QTR per request, once per address and once per IP per hour,
 //! with a global cap per hour.
 //!
 //! POST /faucet
@@ -31,11 +31,11 @@ use std::{
 };
 use tracing::{info, warn};
 
-/// 100 QTR drip per request
-const DRIP_AMOUNT: u64 = 100 * MICRO_QTR;
+/// 50 QTR drip per request
+const DRIP_AMOUNT: u64 = 50 * MICRO_QTR;
 /// Minimum seconds between drips to the same address, and from the same IP
 const RATE_LIMIT_SECS: i64 = 3600;
-/// Hard cap on drips across all clients per rolling hour (10.000 QTR/h).
+/// Hard cap on drips across all clients per rolling hour (5.000 QTR/h).
 /// Even a botnet with many IPs cannot drain faster than this.
 const GLOBAL_MAX_PER_HOUR: usize = 100;
 /// How often stale rate-limit entries are purged from memory
@@ -212,7 +212,7 @@ async fn handle_faucet(
     Ok(Json(FaucetResponse {
         tx_hash,
         amount:  DRIP_AMOUNT,
-        message: format!("Sent {} µQTR (100 QTR) to {}", DRIP_AMOUNT, req.address),
+        message: format!("Sent {} µQTR ({} QTR) to {}", DRIP_AMOUNT, DRIP_AMOUNT / MICRO_QTR, req.address),
     }))
 }
 

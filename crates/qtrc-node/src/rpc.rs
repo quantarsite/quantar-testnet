@@ -15,7 +15,7 @@ use axum::{
 };
 use qtrc_common::tx::Transaction;
 use qtrc_consensus::ConsensusEngine;
-use serde::{Deserialize, Serialize};
+use serde::Serialize;
 use std::{net::SocketAddr, sync::Arc};
 use tower_http::cors::{Any, CorsLayer};
 use tracing::info;
