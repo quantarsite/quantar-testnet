@@ -11,7 +11,8 @@
 //! qtrc-wallet address                 show your address
 //! qtrc-wallet faucet                  ask the testnet faucet for QTR
 //! qtrc-wallet balance [ADDRESS]       show a balance
-//! qtrc-wallet send <TO> <AMOUNT>      send QTR (amount in QTR, e.g. 12.5)
+//! qtrc-wallet send <TO> <AMOUNT>      send QTR (amount in QTR, e.g. 12.5;
+//!                                     a 0.01 QTR network fee is burned)
 //! qtrc-wallet status                  show the network status
 //! ```
 //!
@@ -65,7 +66,8 @@ enum Command {
     Faucet,
     /// Show the balance of your wallet, or of any address
     Balance { address: Option<String> },
-    /// Send QTR. AMOUNT is in QTR and accepts up to 6 decimals (e.g. 12.5)
+    /// Send QTR. AMOUNT is in QTR (up to 6 decimals, e.g. 12.5). The network
+    /// fee (0.01 QTR, burned) is charged on top
     Send { to: String, amount: String },
     /// Show the network status
     Status,
@@ -110,6 +112,12 @@ fn run(cli: Cli) -> Result<()> {
             println!("height  : {}", s["height"]);
             println!("tip     : {}", s["block_hash"].as_str().unwrap_or("?"));
             println!("version : {}", s["version"].as_str().unwrap_or("?"));
+            if let Some(fee) = s["fee"].as_u64() {
+                println!("fee     : {} QTR per transaction (burned)", format_qtr(fee));
+            }
+            if let Some(burned) = s["burned"].as_u64() {
+                println!("burned  : {} QTR so far", format_qtr(burned));
+            }
             Ok(())
         }
     }
@@ -183,9 +191,22 @@ fn cmd_send(http: &Client, rpc: &str, key_path: &PathBuf, to: &str, amount: &str
         bail!("node is on {network}, this wallet signs for {CHAIN_ID}. Update the wallet.");
     }
 
+    // Nodes before v2.0.2 report no fee and charge none.
+    let fee = status["fee"].as_u64().unwrap_or(0);
     let acct = get_json(http, &format!("{rpc}/account/{}", from.as_hex()))?;
     let balance = acct["balance"].as_u64().unwrap_or(0);
-    if balance < micro {
+    let total = micro.checked_add(fee).ok_or_else(|| anyhow!("amount too large"))?;
+    if balance < total {
+        if fee > 0 && balance >= micro {
+            bail!(
+                "not enough QTR for the fee: you have {}, sending {} plus the {} QTR fee needs {}. The most you can send is {}.",
+                format_qtr(balance),
+                format_qtr(micro),
+                format_qtr(fee),
+                format_qtr(total),
+                format_qtr(balance.saturating_sub(fee))
+            );
+        }
         bail!(
             "not enough QTR: you have {}, tried to send {}",
             format_qtr(balance),
@@ -217,6 +238,9 @@ fn cmd_send(http: &Client, rpc: &str, key_path: &PathBuf, to: &str, amount: &str
     }
 
     println!("Sent {} QTR to {}", format_qtr(micro), to.as_hex());
+    if fee > 0 {
+        println!("fee: {} QTR (burned)", format_qtr(fee));
+    }
     println!("tx: {}", body["tx_hash"].as_str().unwrap_or("?"));
     println!("Signed with ML-DSA-87 AND SLH-DSA-SHA2-256s.");
     Ok(())

@@ -185,11 +185,17 @@ impl ConsensusEngine {
                 tx.nonce
             )));
         }
-        let balance = self.state.read().account(&tx.from).balance;
-        let needed = pending_out.saturating_add(tx.amount);
+        let (balance, fee) = {
+            let st = self.state.read();
+            (st.account(&tx.from).balance, st.fee_at(st.height + 1))
+        };
+        // Every pending tx and this one each pay the fee on top of the amount.
+        let needed = pending_out
+            .saturating_add(tx.amount)
+            .saturating_add(fee.saturating_mul(pending_count as u64 + 1));
         if balance < needed {
             return Err(ConsensusError::InvalidTx(format!(
-                "insufficient balance: have {balance} µQTR, pending plus this tx need {needed} µQTR"
+                "insufficient balance: have {balance} µQTR, pending txs plus this one (fee {fee} µQTR each) need {needed} µQTR"
             )));
         }
         if pending_count >= MAX_PENDING_PER_SENDER {

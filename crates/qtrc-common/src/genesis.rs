@@ -92,6 +92,8 @@ impl Genesis {
             block_hash: BlockHash::zero(),
             accounts,
             validators,
+            fee_from_height: 1,
+            burned: 0,
         }
     }
 

@@ -14,6 +14,7 @@ use qtrc_consensus::BlockSink;
 use sled::{Db, Tree};
 
 const GENESIS_KEY: &[u8] = b"genesis";
+const FEE_FROM_KEY: &[u8] = b"fee_from_height";
 
 pub struct BlockStore {
     db:     Db,
@@ -43,6 +44,22 @@ impl BlockStore {
         self.meta.insert(GENESIS_KEY, serde_json::to_vec(genesis)?)?;
         self.db.flush()?;
         Ok(())
+    }
+
+    /// First height that charges the protocol fee, fixed once per data dir.
+    ///
+    /// A new chain charges fees from block 1. A chain that already has
+    /// blocks from before fees existed starts charging at the next block,
+    /// so its stored blocks still replay to the same state.
+    pub fn fee_from_height(&self) -> Result<u64> {
+        if let Some(v) = self.meta.get(FEE_FROM_KEY)? {
+            let buf: [u8; 8] = v.as_ref().try_into().context("corrupt fee_from_height")?;
+            return Ok(u64::from_be_bytes(buf));
+        }
+        let from = self.latest_height()?.map_or(1, |h| h + 1);
+        self.meta.insert(FEE_FROM_KEY, &from.to_be_bytes())?;
+        self.db.flush()?;
+        Ok(from)
     }
 
     pub fn put_block(&self, block: &Block) -> Result<()> {
@@ -167,6 +184,21 @@ mod tests {
         assert_eq!(all.len(), 1);
         assert_eq!(all[0].hash(), block.hash());
         assert_eq!(s.latest_height().unwrap(), Some(1));
+        // Pasta que já tinha blocos: a taxa começa no bloco seguinte, e fica fixa.
+        assert_eq!(s.fee_from_height().unwrap(), 2);
+        drop(s);
+        let s = BlockStore::open(dir.to_str().unwrap()).unwrap();
+        assert_eq!(s.fee_from_height().unwrap(), 2, "valor gravado, nao recalculado");
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn new_chain_charges_fees_from_block_one() {
+        let dir = std::env::temp_dir().join(format!("qtrc-fee-test-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        let s = BlockStore::open(dir.to_str().unwrap()).unwrap();
+        assert_eq!(s.fee_from_height().unwrap(), 1);
+        drop(s);
         let _ = std::fs::remove_dir_all(&dir);
     }
 

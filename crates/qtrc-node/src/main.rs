@@ -167,7 +167,13 @@ async fn cmd_start(rpc_addr: String, data_dir: String, key_file: Option<String>)
         );
     }
 
-    let init_state = genesis.initial_state();
+    let mut init_state = genesis.initial_state();
+    init_state.fee_from_height = store.fee_from_height()?;
+    info!(
+        fee_from_height = init_state.fee_from_height,
+        fee_micro_qtr = qtrc_common::tx::TX_FEE,
+        "Protocol fee (burned) active from this height"
+    );
     info!(
         chain_id  = %genesis.chain_id,
         accounts  = init_state.accounts.len(),
