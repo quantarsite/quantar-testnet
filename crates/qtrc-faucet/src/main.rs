@@ -111,13 +111,8 @@ async fn handle_faucet(
     Json(req): Json<FaucetRequest>,
 ) -> Result<Json<FaucetResponse>, (StatusCode, Json<ErrorResponse>)> {
     // Validate address
-    let to_addr = Address::from_hex(&req.address).map_err(|_| {
-        (
-            StatusCode::BAD_REQUEST,
-            Json(ErrorResponse {
-                error: "invalid address, expected 32-byte hex string".into(),
-            }),
-        )
+    let to_addr = parse_address(&req.address).map_err(|error| {
+        (StatusCode::BAD_REQUEST, Json(ErrorResponse { error }))
     })?;
 
     let addr_key = format!("addr:{}", to_addr.as_hex());
@@ -216,6 +211,28 @@ async fn handle_faucet(
     }))
 }
 
+/// Parse a full Quantar address, with a clear message for the usual mistakes.
+fn parse_address(input: &str) -> Result<Address, String> {
+    let a = input.trim();
+    if a.starts_with("qtr1") {
+        return Err("That is the short display form of an address (qtr1...), which is only half \
+                    of it. Paste the full 64-character address printed by `qtrc-node keygen`."
+            .into());
+    }
+    if a.starts_with("0x") || a.starts_with("bc1") || a.starts_with('1') && a.len() < 40 {
+        return Err("Quantar does not use ECDSA, so Ethereum, Bitcoin and Solana wallets cannot \
+                    receive QTR. Generate a post-quantum address with `qtrc-node keygen`."
+            .into());
+    }
+    let looks_hex = a.len() == 64 && a.bytes().all(|b| b.is_ascii_hexdigit());
+    if !looks_hex {
+        return Err("Invalid address. A Quantar address is 64 hex characters, as printed by \
+                    `qtrc-node keygen`."
+            .into());
+    }
+    Address::from_hex(&a.to_lowercase()).map_err(|_| "Invalid address.".to_string())
+}
+
 /// Real client IP. Behind nginx on the same host the TCP peer is loopback,
 /// so the proxy headers are trusted only in that case; a remote client
 /// cannot spoof its IP by sending X-Forwarded-For itself.
@@ -256,6 +273,69 @@ async fn fetch_nonce(state: &FaucetState) -> anyhow::Result<u64> {
         .json()
         .await?;
     v["nonce"].as_u64().ok_or_else(|| anyhow::anyhow!("account response without nonce"))
+}
+
+// ---------------------------------------------------------------------------
+// Website API (faucet.quantarnetwork.com/api/*)
+// ---------------------------------------------------------------------------
+//
+// The public page reads `success`, `message`, `amount` (in QTR) and `tx_hash`
+// from /api/claim, and `online`, `claim_amount`, `cooldown_hours`,
+// `total_claims`, `network` from /api/status.
+
+#[derive(Serialize)]
+struct ApiClaimResponse {
+    success: bool,
+    message: String,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    amount:  Option<u64>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    tx_hash: Option<String>,
+}
+
+async fn api_claim(
+    state: State<Arc<FaucetState>>,
+    peer: ConnectInfo<SocketAddr>,
+    headers: HeaderMap,
+    req: Json<FaucetRequest>,
+) -> (StatusCode, Json<ApiClaimResponse>) {
+    match handle_faucet(state, peer, headers, req).await {
+        Ok(Json(ok)) => (
+            StatusCode::OK,
+            Json(ApiClaimResponse {
+                success: true,
+                message: format!("Sent {} QTR.", ok.amount / MICRO_QTR),
+                amount:  Some(ok.amount / MICRO_QTR),
+                tx_hash: Some(ok.tx_hash),
+            }),
+        ),
+        Err((code, Json(err))) => (
+            code,
+            Json(ApiClaimResponse { success: false, message: err.error, amount: None, tx_hash: None }),
+        ),
+    }
+}
+
+#[derive(Serialize)]
+struct ApiStatusResponse {
+    online:         bool,
+    claim_amount:   u64,
+    cooldown_hours: i64,
+    /// Every claim is one signed transaction from the faucet wallet, so the
+    /// wallet's on-chain nonce is the claim count. Survives restarts.
+    total_claims:   u64,
+    network:        String,
+}
+
+async fn api_status(State(state): State<Arc<FaucetState>>) -> Json<ApiStatusResponse> {
+    let nonce = fetch_nonce(&state).await;
+    Json(ApiStatusResponse {
+        online:         nonce.is_ok(),
+        claim_amount:   DRIP_AMOUNT / MICRO_QTR,
+        cooldown_hours: RATE_LIMIT_SECS / 3600,
+        total_claims:   nonce.unwrap_or(0),
+        network:        qtrc_common::tx::CHAIN_ID.to_string(),
+    })
 }
 
 // ---------------------------------------------------------------------------
@@ -305,6 +385,8 @@ async fn main() -> anyhow::Result<()> {
 
     let app = Router::new()
         .route("/faucet", post(handle_faucet))
+        .route("/api/claim", post(api_claim))
+        .route("/api/status", axum::routing::get(api_status))
         .route("/health", axum::routing::get(health))
         .layer(
             tower_http::cors::CorsLayer::new()
