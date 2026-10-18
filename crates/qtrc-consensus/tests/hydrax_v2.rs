@@ -331,3 +331,78 @@ fn replay_rebuilds_same_state() {
     assert_eq!(sb.block_hash, sa.block_hash);
     assert_eq!(sb.account(&user).balance, 3 * MICRO_QTR);
 }
+
+#[test]
+fn fee_is_charged_on_top_and_burned() {
+    use qtrc_common::tx::TX_FEE;
+    let faucet = HydraXKeypair::generate();
+    let user = HydraXKeypair::generate();
+    let genesis = Genesis::testnet_with_faucet(Some(&faucet.address().as_hex()));
+    let engine = ConsensusEngine::new(genesis.initial_state(), HydraXKeypair::generate());
+    let start = engine.state.read().account(&faucet.address()).balance;
+
+    engine.submit_tx(transfer(&faucet, &user.address(), 50 * MICRO_QTR, 0)).expect("tx");
+    engine.commit_block(engine.propose_block().expect("propose")).expect("commit");
+
+    let st = engine.state.read();
+    assert_eq!(TX_FEE, MICRO_QTR / 100, "0,01 QTR");
+    assert_eq!(st.account(&user.address()).balance, 50 * MICRO_QTR, "destino recebe o valor cheio");
+    assert_eq!(st.account(&faucet.address()).balance, start - 50 * MICRO_QTR - TX_FEE);
+    assert_eq!(st.burned, TX_FEE, "taxa queimada");
+    let total: u64 = st.accounts.values().map(|a| a.balance).sum();
+    assert_eq!(total + st.burned, start, "supply + queimado = supply inicial");
+}
+
+#[test]
+fn whole_balance_cannot_be_sent_without_the_fee() {
+    use qtrc_common::tx::TX_FEE;
+    let faucet = HydraXKeypair::generate();
+    let user = HydraXKeypair::generate();
+    let other = HydraXKeypair::generate().address();
+    let genesis = Genesis::testnet_with_faucet(Some(&faucet.address().as_hex()));
+    let engine = ConsensusEngine::new(genesis.initial_state(), HydraXKeypair::generate());
+
+    engine.submit_tx(transfer(&faucet, &user.address(), 50 * MICRO_QTR, 0)).expect("abastece");
+    engine.commit_block(engine.propose_block().expect("p")).expect("c");
+
+    assert!(engine.submit_tx(transfer(&user, &other, 50 * MICRO_QTR, 0)).is_err(), "sem sobra para a taxa");
+    engine.submit_tx(transfer(&user, &other, 50 * MICRO_QTR - TX_FEE, 0)).expect("valor menos a taxa");
+    // A segunda pendente também precisa da própria taxa.
+    assert!(engine.submit_tx(transfer(&user, &other, 1, 1)).is_err());
+    engine.commit_block(engine.propose_block().expect("p2")).expect("c2");
+    assert_eq!(engine.state.read().account(&user.address()).balance, 0);
+}
+
+#[test]
+fn fee_activates_at_the_configured_height_and_replays_the_same() {
+    use qtrc_common::tx::TX_FEE;
+    let faucet = HydraXKeypair::generate();
+    let user = HydraXKeypair::generate().address();
+    let genesis = Genesis::testnet_with_faucet(Some(&faucet.address().as_hex()));
+    let node_key = HydraXKeypair::generate().to_bytes();
+
+    // Chain que já existia antes da taxa: taxa só a partir do bloco 3.
+    let mut st = genesis.initial_state();
+    st.fee_from_height = 3;
+    let a = ConsensusEngine::new(st.clone(), HydraXKeypair::from_bytes(&node_key).unwrap());
+    let mut blocks = vec![];
+    for n in 0..4 {
+        a.submit_tx(transfer(&faucet, &user, MICRO_QTR, n)).expect("tx");
+        let b = a.propose_block().expect("propose");
+        blocks.push(b.clone());
+        a.commit_block(b).expect("commit");
+    }
+    assert_eq!(a.state.read().burned, 2 * TX_FEE, "blocos 3 e 4 pagam, 1 e 2 não");
+
+    let b = ConsensusEngine::new(st, HydraXKeypair::from_bytes(&node_key).unwrap());
+    for blk in blocks {
+        b.replay_block(blk).expect("replay");
+    }
+    let (sa, sb) = (a.state.read(), b.state.read());
+    assert_eq!(sb.block_hash, sa.block_hash);
+    assert_eq!(sb.burned, sa.burned);
+    assert_eq!(
+        sb.account(&faucet.address()).balance,
+        sa.account(&faucet.address()).balance
+    );
+}

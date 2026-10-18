@@ -19,11 +19,19 @@ qtrc-wallet new          # create your wallet
 qtrc-wallet faucet       # get 50 testnet QTR (once per hour)
 qtrc-wallet balance      # check your balance
 qtrc-wallet send <ADDRESS> 10.5
-qtrc-wallet status       # network height and tip
+qtrc-wallet status       # network height, tip, fee and total burned
 ```
 
 On Windows, run it from PowerShell as `.\qtrc-wallet.exe new`. On macOS, if
 Gatekeeper blocks it, run `xattr -d com.apple.quarantine qtrc-wallet` once.
+
+## Network fee
+
+Every transaction pays 0.01 QTR on top of the amount sent. The fee is
+burned: it leaves the supply for good, nobody receives it. The recipient
+always gets the full amount. With 50 QTR from the faucet you can make
+thousands of transfers; the fee exists so that flooding the testnet costs
+something.
 
 ## Where the key lives
 

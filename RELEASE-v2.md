@@ -118,3 +118,17 @@ assinaturas. Todos corrigidos, com teste para cada um que foi reproduzido:
 Sem taxa, transferências seguem gratuitas, então um atacante paciente ainda
 consegue gerar volume. Os limites acima reduzem e contêm isso; a solução de
 verdade é uma taxa mínima, que é decisão de economia do token.
+
+## v2.0.2: taxa de 0,01 QTR por transação, queimada
+
+- Quem envia paga o valor mais 0,01 QTR; quem recebe ganha o valor cheio.
+  A taxa é queimada: sai do supply e ninguém recebe
+- É regra de consenso, não um campo da transação, então o formato e as
+  assinaturas não mudam e a carteira da v2.0.0 continua funcionando
+- A chain que já existia continua válida: a taxa começa no primeiro bloco
+  depois da atualização, e essa altura fica gravada na pasta de dados (como o
+  gênesis). Uma chain nova cobra desde o bloco 1
+- `/rpc/status` mostra `fee` (taxa do próximo bloco) e `burned` (total
+  queimado); a carteira mostra os dois e avisa quando falta saldo para a taxa
+- Com a taxa, gerar volume custa: os 50 QTR do faucet dão para 5.000
+  transferências, e o faucet entrega no máximo 5.000 QTR por hora

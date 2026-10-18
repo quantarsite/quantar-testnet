@@ -68,7 +68,7 @@
     <div class="card"><div class="k">Network</div><div class="v sm" id="network">…</div></div>
     <div class="card"><div class="k">Height</div><div class="v" id="height">…</div></div>
     <div class="card"><div class="k">Faucet claims</div><div class="v" id="claims">…</div></div>
-    <div class="card"><div class="k">Node version</div><div class="v" id="version">…</div></div>
+    <div class="card"><div class="k">QTR burned</div><div class="v" id="burned">…</div></div>
     <div class="card tip"><div class="k">Latest block</div><div class="v" id="tip">…</div></div>
   </div>
 
@@ -78,7 +78,7 @@
       <a class="btn" href="https://github.com/quantarsite/quantar-testnet/releases/latest" target="_blank" rel="noopener">Download qtrc-wallet</a></li>
     <li>Create your post-quantum wallet: <code>qtrc-wallet new</code><br>On Windows, in PowerShell: <code>.\qtrc-wallet.exe new</code></li>
     <li>Get 50 testnet QTR: <code>qtrc-wallet faucet</code>, or paste your address at <a href="https://faucet.quantarnetwork.com">faucet.quantarnetwork.com</a></li>
-    <li>Send some: <code>qtrc-wallet send &lt;address&gt; 10</code>. Your transaction is signed with ML-DSA-87 and SLH-DSA and lands in the next block.</li>
+    <li>Send some: <code>qtrc-wallet send &lt;address&gt; 10</code>. Your transaction is signed with ML-DSA-87 and SLH-DSA and lands in the next block. A 0.01 QTR fee is burned on every transfer.</li>
   </ol>
 
   <h2>What every signature costs</h2>
@@ -104,7 +104,7 @@
       const s = await getJson('/rpc/status');
       $('network').textContent = s.chain_id;
       $('height').textContent = Number(s.height).toLocaleString('en-US');
-      $('version').textContent = s.version;
+      $('burned').textContent = s.burned === undefined ? '0' : (s.burned / 1e6).toLocaleString('en-US', {maximumFractionDigits: 6});
       $('tip').textContent = s.height > 0 ? s.block_hash : 'genesis (no blocks yet)';
       $('dot').className = 'dot on'; $('state').textContent = 'online, live data';
     }catch(e){

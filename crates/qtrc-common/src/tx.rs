@@ -28,6 +28,11 @@ pub enum TxError {
     InvalidNonce { expected: u64, got: u64 },
 }
 
+/// Protocol fee per transaction, in micro-QTR: 0.01 QTR. It is burned
+/// (removed from supply), charged on top of the amount, and is a consensus
+/// rule, so it is not part of the signed payload.
+pub const TX_FEE: u64 = 10_000;
+
 /// Protocol tag prepended to every signed transaction payload (HYDRA-X v2).
 pub const SIGNING_DOMAIN: &[u8] = b"QTR-HYDRAX-V2";
 

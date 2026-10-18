@@ -33,6 +33,10 @@ struct StatusResponse {
     block_hash:   String,
     node_address: String,
     version:      &'static str,
+    /// Fee the next block charges per tx, in micro-QTR (burned)
+    fee:          u64,
+    /// Total micro-QTR burned in fees so far
+    burned:       u64,
 }
 
 #[derive(Serialize)]
@@ -67,6 +71,8 @@ async fn get_status(State(engine): State<AppState>) -> Json<StatusResponse> {
         block_hash:   state.block_hash.to_string(),
         node_address: engine.address.to_string(),
         version:      env!("CARGO_PKG_VERSION"),
+        fee:          state.fee_at(state.height + 1),
+        burned:       state.burned,
     })
 }
 
