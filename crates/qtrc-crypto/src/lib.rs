@@ -2,22 +2,30 @@
 //!
 //! Implements the HYDRA-X dual post-quantum signature protocol:
 //! a transaction is valid if and only if it carries a valid
-//! ML-DSA-87 (FIPS 204) signature AND a valid SLH-DSA (FIPS 205)
-//! signature under the same keypair.
+//! ML-DSA-87 (FIPS 204) signature AND a valid SLH-DSA-SHA2-256s
+//! (FIPS 205) signature under the same keypair.
 //!
 //! This is enforced at the consensus layer from genesis — there is
 //! no ECDSA fallback or legacy path.
+//!
+//! ML-DSA-87 is provided by `pqcrypto-mldsa` (the standardized FIPS 204
+//! scheme, 4627-byte signatures) and SLH-DSA-SHA2-256s by `fips205`.
+//! Neither is the pre-standard round-3 candidate (Dilithium5 /
+//! SPHINCS+), which they replace.
 
-use pqcrypto_dilithium::dilithium5::{self, PublicKey as DilithiumPk, SecretKey as DilithiumSk};
-use pqcrypto_sphincsplus::sphincssha2256ssimple::{
-    self, PublicKey as SphincsXPk, SecretKey as SphincsXSk,
-};
+use fips205::slh_dsa_sha2_256s;
+use fips205::traits::{SerDes, Signer, Verifier};
+use pqcrypto_mldsa::mldsa87::{self, PublicKey as MlDsaPk, SecretKey as MlDsaSk};
 use pqcrypto_traits::sign::{
     DetachedSignature, PublicKey as PqPublicKey, SecretKey as PqSecretKey,
 };
 use serde::{Deserialize, Serialize};
 use thiserror::Error;
 use zeroize::Zeroize;
+
+/// Empty FIPS 205 context string. HYDRA-X relies on consensus-level
+/// message canonicalization rather than an SLH-DSA context.
+const SLH_CTX: &[u8] = &[];
 
 // ---------------------------------------------------------------------------
 // Error type
@@ -50,7 +58,7 @@ impl Address {
     pub fn from_verifying_key(vk: &HydraXVerifyingKey) -> Self {
         let mut hasher = blake3::Hasher::new();
         hasher.update(vk.ml_dsa_pk.as_bytes());
-        hasher.update(vk.slh_dsa_pk.as_bytes());
+        hasher.update(&vk.slh_dsa_pk.clone().into_bytes());
         Address(*hasher.finalize().as_bytes())
     }
 
@@ -84,9 +92,9 @@ impl std::fmt::Display for Address {
 #[derive(Clone, Serialize, Deserialize)]
 pub struct HydraXVerifyingKey {
     #[serde(with = "pk_serde")]
-    pub ml_dsa_pk: DilithiumPk,
-    #[serde(with = "sphincs_pk_serde")]
-    pub slh_dsa_pk: SphincsXPk,
+    pub ml_dsa_pk: MlDsaPk,
+    #[serde(with = "slh_pk_serde")]
+    pub slh_dsa_pk: slh_dsa_sha2_256s::PublicKey,
 }
 
 impl std::fmt::Debug for HydraXVerifyingKey {
@@ -102,32 +110,30 @@ impl HydraXVerifyingKey {
 
     /// Raw bytes of the ML-DSA-87 public key (2592 bytes).
     pub fn ml_dsa_pk_bytes(&self) -> &[u8] {
-        use pqcrypto_traits::sign::PublicKey;
         self.ml_dsa_pk.as_bytes()
     }
 
     /// Raw bytes of the SLH-DSA-256s public key (64 bytes).
-    pub fn slh_dsa_pk_bytes(&self) -> &[u8] {
-        use pqcrypto_traits::sign::PublicKey;
-        self.slh_dsa_pk.as_bytes()
+    pub fn slh_dsa_pk_bytes(&self) -> Vec<u8> {
+        self.slh_dsa_pk.clone().into_bytes().to_vec()
     }
 }
 
 // ---------------------------------------------------------------------------
-// Signing key — zeroized on drop
+// Signing key — scrubbed on drop
 // ---------------------------------------------------------------------------
 
-/// HYDRA-X signing (secret) key — zeroized from memory on drop.
+/// HYDRA-X signing (secret) key.
 pub struct HydraXSigningKey {
-    ml_dsa_sk: DilithiumSk,
-    slh_dsa_sk: SphincsXSk,
+    ml_dsa_sk: MlDsaSk,
+    slh_dsa_sk: slh_dsa_sha2_256s::PrivateKey,
 }
 
 impl Drop for HydraXSigningKey {
     fn drop(&mut self) {
         let mut ml = self.ml_dsa_sk.as_bytes().to_vec();
         ml.zeroize();
-        let mut sl = self.slh_dsa_sk.as_bytes().to_vec();
+        let mut sl = self.slh_dsa_sk.clone().into_bytes().to_vec();
         sl.zeroize();
     }
 }
@@ -145,17 +151,18 @@ pub struct HydraXKeypair {
 impl HydraXKeypair {
     /// Generate a fresh HYDRA-X keypair using OS randomness.
     pub fn generate() -> Self {
-        let (ml_pk, ml_sk) = dilithium5::keypair();
-        let (sl_pk, sl_sk) = sphincssha2256ssimple::keypair();
+        let (ml_pk, ml_sk) = mldsa87::keypair();
+        let (slh_pk, slh_sk) =
+            slh_dsa_sha2_256s::try_keygen().expect("OS RNG failure during SLH-DSA keygen");
 
         HydraXKeypair {
             signing_key: HydraXSigningKey {
                 ml_dsa_sk: ml_sk,
-                slh_dsa_sk: sl_sk,
+                slh_dsa_sk: slh_sk,
             },
             verifying_key: HydraXVerifyingKey {
                 ml_dsa_pk: ml_pk,
-                slh_dsa_pk: sl_pk,
+                slh_dsa_pk: slh_pk,
             },
         }
     }
@@ -167,12 +174,17 @@ impl HydraXKeypair {
 
     /// Sign a message with the AND-composition of ML-DSA-87 and SLH-DSA.
     pub fn sign(&self, message: &[u8]) -> HydraXSignature {
-        let ml_sig = dilithium5::detached_sign(message, &self.signing_key.ml_dsa_sk);
-        let sl_sig = sphincssha2256ssimple::detached_sign(message, &self.signing_key.slh_dsa_sk);
+        let ml_sig = mldsa87::detached_sign(message, &self.signing_key.ml_dsa_sk);
+        // Deterministic (non-hedged) SLH-DSA signature: no RNG, cannot fail.
+        let sl_sig = self
+            .signing_key
+            .slh_dsa_sk
+            .try_sign(message, SLH_CTX, false)
+            .expect("deterministic SLH-DSA signing cannot fail");
 
         HydraXSignature {
             ml_dsa_sig:    ml_sig.as_bytes().to_vec(),
-            slh_dsa_sig:   sl_sig.as_bytes().to_vec(),
+            slh_dsa_sig:   sl_sig.to_vec(),
             verifying_key: self.verifying_key.clone(),
         }
     }
@@ -193,21 +205,25 @@ pub struct HydraXSignature {
 impl HydraXSignature {
     /// Verify the AND-composition: BOTH components must be valid.
     pub fn verify(&self, message: &[u8]) -> Result<(), CryptoError> {
-        // — Component 1: ML-DSA-87 —
-        let ml_sig = dilithium5::DetachedSignature::from_bytes(&self.ml_dsa_sig)
+        // — Component 1: ML-DSA-87 (FIPS 204) —
+        let ml_sig = mldsa87::DetachedSignature::from_bytes(&self.ml_dsa_sig)
             .map_err(|_| CryptoError::MlDsaInvalid)?;
-        dilithium5::verify_detached_signature(&ml_sig, message, &self.verifying_key.ml_dsa_pk)
+        mldsa87::verify_detached_signature(&ml_sig, message, &self.verifying_key.ml_dsa_pk)
             .map_err(|_| CryptoError::MlDsaInvalid)?;
 
-        // — Component 2: SLH-DSA (SPHINCS+) —
-        let sl_sig = sphincssha2256ssimple::DetachedSignature::from_bytes(&self.slh_dsa_sig)
+        // — Component 2: SLH-DSA-SHA2-256s (FIPS 205) —
+        let sl_sig: [u8; slh_dsa_sha2_256s::SIG_LEN] = self
+            .slh_dsa_sig
+            .as_slice()
+            .try_into()
             .map_err(|_| CryptoError::SlhDsaInvalid)?;
-        sphincssha2256ssimple::verify_detached_signature(
-            &sl_sig,
-            message,
-            &self.verifying_key.slh_dsa_pk,
-        )
-        .map_err(|_| CryptoError::SlhDsaInvalid)?;
+        if !self
+            .verifying_key
+            .slh_dsa_pk
+            .verify(message, &sl_sig, SLH_CTX)
+        {
+            return Err(CryptoError::SlhDsaInvalid);
+        }
 
         Ok(())
     }
@@ -219,11 +235,11 @@ impl HydraXSignature {
 }
 
 // ---------------------------------------------------------------------------
-// Serde helpers for pqcrypto types
+// Serde helpers
 // ---------------------------------------------------------------------------
 
 mod pk_serde {
-    use pqcrypto_dilithium::dilithium5::PublicKey;
+    use pqcrypto_mldsa::mldsa87::PublicKey;
     use pqcrypto_traits::sign::PublicKey as Trait;
     use serde::{Deserializer, Serializer};
 
@@ -234,23 +250,28 @@ mod pk_serde {
     pub fn deserialize<'de, D: Deserializer<'de>>(d: D) -> Result<PublicKey, D::Error> {
         let bytes: Vec<u8> = serde_bytes::deserialize(d)?;
         PublicKey::from_bytes(&bytes)
-            .map_err(|e| serde::de::Error::custom(format!("dilithium pk: {e:?}")))
+            .map_err(|e| serde::de::Error::custom(format!("ml-dsa pk: {e:?}")))
     }
 }
 
-mod sphincs_pk_serde {
-    use pqcrypto_sphincsplus::sphincssha2256ssimple::PublicKey;
-    use pqcrypto_traits::sign::PublicKey as Trait;
+mod slh_pk_serde {
+    use fips205::slh_dsa_sha2_256s::{PublicKey, PK_LEN};
+    use fips205::traits::SerDes;
     use serde::{Deserializer, Serializer};
 
     pub fn serialize<S: Serializer>(pk: &PublicKey, s: S) -> Result<S::Ok, S::Error> {
-        serde_bytes::serialize(pk.as_bytes(), s)
+        let bytes = pk.clone().into_bytes();
+        serde_bytes::serialize(&bytes[..], s)
     }
 
     pub fn deserialize<'de, D: Deserializer<'de>>(d: D) -> Result<PublicKey, D::Error> {
         let bytes: Vec<u8> = serde_bytes::deserialize(d)?;
-        PublicKey::from_bytes(&bytes)
-            .map_err(|e| serde::de::Error::custom(format!("sphincs pk: {e:?}")))
+        let arr: [u8; PK_LEN] = bytes
+            .as_slice()
+            .try_into()
+            .map_err(|_| serde::de::Error::custom("slh-dsa pk: wrong length"))?;
+        PublicKey::try_from_bytes(&arr)
+            .map_err(|e| serde::de::Error::custom(format!("slh-dsa pk: {e}")))
     }
 }
 
@@ -288,5 +309,38 @@ mod tests {
         let keypair = HydraXKeypair::generate();
         let sig = keypair.sign(b"test");
         assert_eq!(sig.signer_address(), keypair.address());
+    }
+
+    #[test]
+    fn test_fips_signature_sizes() {
+        // ML-DSA-87 (FIPS 204): 4627 bytes, not the round-3 value 4595.
+        // SLH-DSA-SHA2-256s (FIPS 205): 29792 bytes.
+        let keypair = HydraXKeypair::generate();
+        let sig = keypair.sign(b"size check");
+        assert_eq!(sig.ml_dsa_sig.len(), 4627);
+        assert_eq!(sig.slh_dsa_sig.len(), slh_dsa_sha2_256s::SIG_LEN);
+        assert_eq!(sig.slh_dsa_sig.len(), 29792);
+    }
+
+    #[test]
+    fn test_one_leg_tampered_fails() {
+        // Flipping a byte in only the SLH-DSA leg must still fail:
+        // the AND-composition requires both.
+        let keypair = HydraXKeypair::generate();
+        let msg = b"and composition";
+        let mut sig = keypair.sign(msg);
+        sig.slh_dsa_sig[0] ^= 0xFF;
+        assert!(matches!(sig.verify(msg), Err(CryptoError::SlhDsaInvalid)));
+    }
+
+    #[test]
+    fn test_serde_roundtrip() {
+        let keypair = HydraXKeypair::generate();
+        let msg = b"serde";
+        let sig = keypair.sign(msg);
+        let encoded = bincode::serialize(&sig).expect("serialize");
+        let decoded: HydraXSignature = bincode::deserialize(&encoded).expect("deserialize");
+        assert!(decoded.verify(msg).is_ok());
+        assert_eq!(decoded.signer_address(), keypair.address());
     }
 }

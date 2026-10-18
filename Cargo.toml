@@ -18,8 +18,8 @@ repository  = "https://github.com/quantarsite/quantar-testnet"
 
 [workspace.dependencies]
 # Post-quantum crypto (HYDRA-X)
-pqcrypto-dilithium  = "0.5"      # Dilithium5 = ML-DSA-87 (FIPS 204)
-pqcrypto-sphincsplus = "0.7"     # SPHINCS+-SHA2-256s = SLH-DSA (FIPS 205)
+pqcrypto-mldsa      = "0.1"      # ML-DSA-87 (FIPS 204)
+fips205             = "0.4"      # SLH-DSA-SHA2-256s (FIPS 205)
 pqcrypto-traits     = "0.3"
 serde_bytes = "0.11"
 

@@ -8,8 +8,8 @@ license.workspace    = true
 repository.workspace = true
 
 [dependencies]
-pqcrypto-dilithium.workspace   = true
-pqcrypto-sphincsplus.workspace = true
+pqcrypto-mldsa.workspace       = true
+fips205.workspace              = true
 pqcrypto-traits.workspace      = true
 blake3.workspace  = true
 serde.workspace   = true
@@ -18,3 +18,6 @@ thiserror.workspace = true
 rand.workspace    = true
 zeroize = { version = "1", features = ["derive"] }
 serde_bytes.workspace = true
+
+[dev-dependencies]
+bincode.workspace = true
