@@ -39,6 +39,18 @@ pub enum ConsensusError {
     InsufficientSigs { need: usize, got: usize },
     #[error("Block transactions invalid: {0}")]
     InvalidTx(String),
+    #[error("Block storage failed: {0}")]
+    Storage(String),
+}
+
+/// Durable storage for committed blocks.
+///
+/// `commit_block` calls `persist` after the block is validated and applied to
+/// a copy of the state, and before that copy replaces the live state. If
+/// `persist` fails, the block is not committed, so the in-memory chain never
+/// gets ahead of what is on disk.
+pub trait BlockSink: Send + Sync {
+    fn persist(&self, block: &Block) -> Result<(), String>;
 }
 
 /// The consensus engine — holds chain state, mempool, and ingestion pipeline.
@@ -54,6 +66,8 @@ pub struct ConsensusEngine {
     /// hx-mempool ingestion pipeline — parallel PQ-sig verification,
     /// deduplication, and two-tier signature cache.
     pipeline:    Arc<IngestionPipeline<PqCryptoVerifier>>,
+    /// Where committed blocks are written (None = memory only, e.g. tests)
+    sink:        Option<Arc<dyn BlockSink>>,
 }
 
 impl ConsensusEngine {
@@ -76,7 +90,14 @@ impl ConsensusEngine {
             keypair: Arc::new(keypair),
             address,
             pipeline,
+            sink: None,
         }
+    }
+
+    /// Attach durable block storage.
+    pub fn with_sink(mut self, sink: Arc<dyn BlockSink>) -> Self {
+        self.sink = Some(sink);
+        self
     }
 
     /// Return the validator that should propose at `height`.
@@ -179,8 +200,18 @@ impl ConsensusEngine {
         Ok(block)
     }
 
-    /// Commit a finalized block to the chain state.
+    /// Commit a finalized block: validate, apply, persist, then publish.
     pub fn commit_block(&self, block: Block) -> Result<(), ConsensusError> {
+        self.commit_inner(block, true)
+    }
+
+    /// Re-apply a block that is already on disk (node restart).
+    /// Runs every check `commit_block` runs, but does not write it again.
+    pub fn replay_block(&self, block: Block) -> Result<(), ConsensusError> {
+        self.commit_inner(block, false)
+    }
+
+    fn commit_inner(&self, block: Block, persist: bool) -> Result<(), ConsensusError> {
         {
             let state    = self.state.read();
             let expected = state.height + 1;
@@ -189,6 +220,11 @@ impl ConsensusEngine {
                     expected,
                     got: block.header.height,
                 });
+            }
+            if block.header.prev_hash != state.block_hash {
+                return Err(ConsensusError::InvalidTx(
+                    "block does not extend the current tip (prev_hash mismatch)".into(),
+                ));
             }
         }
 
@@ -200,17 +236,36 @@ impl ConsensusEngine {
 
         self.verify_proposer_sig(&block)?;
 
-        let mut state = self.state.write();
-        state
-            .apply_block(&block)
+        // Apply on a copy: a block either applies completely or not at all.
+        // (Applying in place left earlier txs applied when a later one failed.)
+        let mut next = self.state.read().clone();
+        next.apply_block(&block)
             .map_err(|e| ConsensusError::InvalidTx(e.to_string()))?;
 
-        info!(
-            height = block.header.height,
-            hash   = %block.hash(),
-            txs    = block.transactions.len(),
-            "✅ block committed"
-        );
+        if persist {
+            if let Some(sink) = &self.sink {
+                sink.persist(&block).map_err(ConsensusError::Storage)?;
+            }
+        }
+
+        let mut state = self.state.write();
+        if state.height + 1 != block.header.height {
+            // Another commit won the race between our read and this write.
+            return Err(ConsensusError::WrongHeight {
+                expected: state.height + 1,
+                got: block.header.height,
+            });
+        }
+        *state = next;
+
+        if persist {
+            info!(
+                height = block.header.height,
+                hash   = %block.hash(),
+                txs    = block.transactions.len(),
+                "✅ block committed"
+            );
+        }
 
         Ok(())
     }
@@ -225,10 +280,8 @@ impl ConsensusEngine {
                 return Ok(());
             }
         }
-        if block.validator_sigs.is_empty() {
-            warn!("block has no validator signatures — single-node mode");
-            return Ok(());
-        }
+        // A block without the proposer's HYDRA-X signature is never valid.
+        // (v1 accepted unsigned blocks as "single-node mode".)
         Err(ConsensusError::InvalidSig(
             "proposer signature not found".into(),
         ))
@@ -246,14 +299,25 @@ pub async fn run_block_producer(engine: Arc<ConsensusEngine>) {
     loop {
         interval.tick().await;
 
+        // No empty blocks: each block carries a ~37 KB HYDRA-X signature, so
+        // one empty block every 5 s would grow the disk by over 1 GB a day.
+        if engine.mempool.read().is_empty() {
+            continue;
+        }
+
         match engine.propose_block() {
             Ok(block) => {
+                let txs = block.transactions.clone();
                 if let Err(e) = engine.commit_block(block) {
-                    warn!("commit failed: {e}");
+                    warn!("commit failed, returning {} tx(s) to the mempool: {e}", txs.len());
+                    let mut pool = engine.mempool.write();
+                    let rest = std::mem::take(&mut *pool);
+                    *pool = txs;
+                    pool.extend(rest);
                 }
             }
             Err(ConsensusError::NotProposer { .. }) => {
-                debug!("not proposer this slot — waiting for block from peers");
+                debug!("not proposer this slot, waiting for block from peers");
             }
             Err(e) => {
                 warn!("propose error: {e}");

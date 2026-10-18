@@ -18,7 +18,7 @@ quantar-testnet/
 │   ├── qtrc-chain       # Chain storage and indexing
 │   ├── qtrc-consensus   # PoA round-robin consensus engine
 │   ├── qtrc-node        # Node binary + JSON-RPC
-│   └── qtrc-faucet      # Testnet faucet (100 QTR/hour per address)
+│   └── qtrc-faucet      # Testnet faucet (50 QTR/hour per address and per IP)
 ```
 
 ---
@@ -76,7 +76,7 @@ Address : qtr1<hex>
 | GET | `/status` | Node status, height, hash |
 | GET | `/account/:address` | Balance + nonce |
 | POST | `/tx` | Submit signed transaction |
-| POST | `/faucet` | Request 100 QTR (faucet only) |
+| POST | `/faucet` | Request 50 QTR (faucet only) |
 
 ### Example — query account
 
@@ -124,7 +124,7 @@ Academic paper: [ePrint 2026/108782](https://eprint.iacr.org/xxxx/108782)
 | Max tx/block | 500 |
 | Native token | QTR |
 | Micro unit | µQTR (1 QTR = 1,000,000 µQTR) |
-| Faucet drip | 100 QTR / hour / address |
+| Faucet drip | 50 QTR / hour / address and IP |
 
 ---
 

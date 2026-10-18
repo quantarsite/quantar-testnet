@@ -99,3 +99,64 @@ fn tx_id_is_not_malleable_and_matches_mempool() {
     let mempool_id = engine.submit_tx(tx).expect("submit");
     assert_eq!(mempool_id, id);
 }
+
+#[test]
+fn block_applies_all_or_nothing() {
+    let faucet = HydraXKeypair::generate();
+    let user = HydraXKeypair::generate().address();
+    let genesis = Genesis::testnet_with_faucet(Some(&faucet.address().as_hex()));
+    let engine = ConsensusEngine::new(genesis.initial_state(), HydraXKeypair::generate());
+
+    engine.submit_tx(transfer(&faucet, &user, 10 * MICRO_QTR, 0)).expect("tx 0");
+    // Nonce repetido: o bloco inteiro tem que ser recusado.
+    engine.submit_tx(transfer(&faucet, &user, 20 * MICRO_QTR, 0)).expect("tx dup nonce");
+
+    let block = engine.propose_block().expect("propose");
+    assert_eq!(block.transactions.len(), 2);
+    assert!(engine.commit_block(block).is_err());
+
+    let state = engine.state.read();
+    assert_eq!(state.height, 0, "altura nao pode avancar");
+    assert_eq!(state.account(&user).balance, 0, "primeira tx nao pode ter ficado aplicada");
+    assert_eq!(state.account(&faucet.address()).nonce, 0);
+}
+
+#[test]
+fn unsigned_block_is_rejected() {
+    let faucet = HydraXKeypair::generate();
+    let user = HydraXKeypair::generate().address();
+    let genesis = Genesis::testnet_with_faucet(Some(&faucet.address().as_hex()));
+    let engine = ConsensusEngine::new(genesis.initial_state(), HydraXKeypair::generate());
+
+    engine.submit_tx(transfer(&faucet, &user, MICRO_QTR, 0)).expect("tx");
+    let mut block = engine.propose_block().expect("propose");
+    block.validator_sigs.clear();
+    assert!(engine.commit_block(block).is_err(), "bloco sem assinatura do proponente");
+}
+
+#[test]
+fn replay_rebuilds_same_state() {
+    let faucet = HydraXKeypair::generate();
+    let user = HydraXKeypair::generate().address();
+    let genesis = Genesis::testnet_with_faucet(Some(&faucet.address().as_hex()));
+
+    let a = ConsensusEngine::new(genesis.initial_state(), HydraXKeypair::generate());
+    let mut blocks = vec![];
+    for n in 0..3 {
+        a.submit_tx(transfer(&faucet, &user, MICRO_QTR, n)).expect("tx");
+        let b = a.propose_block().expect("propose");
+        blocks.push(b.clone());
+        a.commit_block(b).expect("commit");
+    }
+
+    // Um node novo, mesmo gênesis, reaplicando os blocos gravados.
+    let b = ConsensusEngine::new(genesis.initial_state(), HydraXKeypair::generate());
+    for blk in blocks {
+        b.replay_block(blk).expect("replay");
+    }
+    let (sa, sb) = (a.state.read(), b.state.read());
+    assert_eq!(sa.height, 3);
+    assert_eq!(sb.height, sa.height);
+    assert_eq!(sb.block_hash, sa.block_hash);
+    assert_eq!(sb.account(&user).balance, 3 * MICRO_QTR);
+}

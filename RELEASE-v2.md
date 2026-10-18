@@ -25,8 +25,9 @@ testnet antiga não valem mais. Todo mundo começa do zero em `quantar-testnet-2
   assinado, o mesmo hash do mempool. Antes era o SHA3 do JSON inteiro, com o
   timestamp não assinado dentro, então qualquer um que repassasse a transação
   podia mudar o ID sem invalidar a assinatura
-- Faucet com limite por endereço, por IP (1 por hora cada) e teto global de
-  100 drips por hora. Entradas vencidas são limpas a cada 10 minutos. Os
+- Faucet entrega 50 QTR por pedido, com limite por endereço, por IP (1 por
+  hora cada) e teto global de 100 drips por hora, ou seja, no máximo
+  5.000 QTR por hora. Entradas vencidas são limpas a cada 10 minutos. Os
   cabeçalhos do nginx só são aceitos quando a conexão vem do próprio servidor
 - Chave secreta guardada em buffers que se apagam ao sair da memória. Antes o
   código copiava a chave e apagava só a cópia. Limite honesto: isso apaga as
@@ -34,10 +35,25 @@ testnet antiga não valem mais. Todo mundo começa do zero em `quantar-testnet-2
   PQClean possam deixar. Para mainnet, HSM
 - Versão 0.2.0 em todos os crates
 
+- A chain agora persiste em disco. Cada bloco é gravado (e sincronizado com o
+  disco) antes de ser considerado confirmado, e ao reiniciar o node verifica de
+  novo as assinaturas HYDRA-X de todos os blocos e reconstrói o estado. O
+  gênesis fica gravado na pasta de dados, então reiniciar sem
+  `QTR_FAUCET_ADDRESS` não cria uma chain diferente por acidente
+- Bloco aplica inteiro ou não aplica: antes, se a terceira transação de um
+  bloco falhasse, as duas primeiras já tinham mudado os saldos
+- Bloco sem a assinatura HYDRA-X do proponente é rejeitado (a v1 aceitava como
+  "modo de um node só")
+- Sem blocos vazios: cada bloco carrega uma assinatura de cerca de 37 KB, e um
+  bloco vazio a cada 5 segundos encheria o disco em mais de 1 GB por dia. A
+  altura da chain só sobe quando há transação
+- As chaves de bloco no disco são big-endian; em little-endian a ordem quebra
+  a partir do bloco 256
+
 ## O que ainda não mudou (não fingir que mudou)
 
-- O estado da chain ainda vive só em memória. O `BlockStore` abre, mas não é
-  usado, então reiniciar o node zera a chain. Próximo item da lista
+- Transações que estavam no mempool e ainda não entraram em bloco se perdem
+  num reinício. O faucet reenvia normalmente no próximo pedido
 - Ainda é um node só, sem P2P
 
 ## Passo a passo no servidor (droplet 164.90.145.184)
@@ -56,8 +72,10 @@ testnet antiga não valem mais. Todo mundo começa do zero em `quantar-testnet-2
    `./target/release/qtrc-node keygen --out /etc/quantar/faucet.key`
    Anote o `Address` completo (64 caracteres hex) do faucet
 
-5. Suba o node com o endereço do faucet no gênesis:
-   `QTR_FAUCET_ADDRESS=<endereco do faucet> ./target/release/qtrc-node start --key-file /etc/quantar/node.key`
+5. Suba o node com o endereço do faucet no gênesis, numa pasta de dados nova
+   e fora do container, para sobreviver a rebuild:
+   `QTR_FAUCET_ADDRESS=<endereco do faucet> ./target/release/qtrc-node start --key-file /etc/quantar/node.key --data-dir /var/lib/quantar`
+   Nos próximos reinícios use a mesma pasta. O gênesis já fica salvo nela
 
 6. No nginx do faucet, garanta `proxy_set_header X-Real-IP $remote_addr;`,
    senão todo mundo aparece com o IP do próprio servidor e o limite por IP

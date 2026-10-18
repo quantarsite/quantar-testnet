@@ -1,6 +1,6 @@
 [package]
 name        = "qtrc-faucet"
-description = "Quantar testnet faucet — drips 100 QTR to any valid address"
+description = "Quantar testnet faucet — drips 50 QTR to any valid address"
 version.workspace    = true
 edition.workspace    = true
 authors.workspace    = true
