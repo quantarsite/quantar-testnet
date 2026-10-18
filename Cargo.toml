@@ -63,3 +63,9 @@ chrono      = { version = "0.4", features = ["serde"] }
 uuid        = { version = "1", features = ["v4", "serde"] }
 dashmap     = "5"
 parking_lot = "0.12"
+
+# Dependencies (above all the PQ crypto: fips205 is pure Rust) are ~50x
+# slower unoptimized, which made `cargo test` in debug take many minutes.
+# Optimize them even in dev builds; our own crates stay fast to compile.
+[profile.dev.package."*"]
+opt-level = 3
