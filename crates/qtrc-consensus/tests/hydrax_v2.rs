@@ -101,34 +101,158 @@ fn tx_id_is_not_malleable_and_matches_mempool() {
 }
 
 #[test]
-fn invalid_tx_is_dropped_instead_of_halting_the_chain() {
+fn bad_txs_are_refused_at_the_door() {
     let faucet = HydraXKeypair::generate();
     let user = HydraXKeypair::generate().address();
     let genesis = Genesis::testnet_with_faucet(Some(&faucet.address().as_hex()));
     let engine = ConsensusEngine::new(genesis.initial_state(), HydraXKeypair::generate());
 
     engine.submit_tx(transfer(&faucet, &user, 10 * MICRO_QTR, 0)).expect("tx 0");
-    // Nonce repetido: tem que ser descartada, sem travar o bloco.
-    engine.submit_tx(transfer(&faucet, &user, 20 * MICRO_QTR, 0)).expect("tx dup nonce");
-    // Sem saldo: também descartada.
+    // Nonce repetido, nonce pulado, conta sem saldo: recusadas antes de custar CPU.
+    assert!(engine.submit_tx(transfer(&faucet, &user, 20 * MICRO_QTR, 0)).is_err(), "nonce repetido");
+    assert!(engine.submit_tx(transfer(&faucet, &user, MICRO_QTR, 5)).is_err(), "nonce pulado");
     let broke = HydraXKeypair::generate();
-    engine.submit_tx(transfer(&broke, &user, MICRO_QTR, 0)).expect("tx sem saldo");
+    assert!(engine.submit_tx(transfer(&broke, &user, MICRO_QTR, 0)).is_err(), "sem saldo");
+    assert_eq!(engine.mempool.read().len(), 1);
+
+    engine.commit_block(engine.propose_block().expect("propose")).expect("commit");
+    assert_eq!(engine.state.read().account(&user).balance, 10 * MICRO_QTR);
+}
+
+#[test]
+fn invalid_tx_that_slips_in_is_dropped_not_halting_the_chain() {
+    let faucet = HydraXKeypair::generate();
+    let user = HydraXKeypair::generate().address();
+    let genesis = Genesis::testnet_with_faucet(Some(&faucet.address().as_hex()));
+    let engine = ConsensusEngine::new(genesis.initial_state(), HydraXKeypair::generate());
+
+    engine.submit_tx(transfer(&faucet, &user, 10 * MICRO_QTR, 0)).expect("tx 0");
+    // Força uma tx inválida direto na fila (simula algo que escapou da entrada).
+    engine.mempool.write().push(transfer(&faucet, &user, 20 * MICRO_QTR, 0));
 
     let block = engine.propose_block().expect("propose");
     assert_eq!(block.transactions.len(), 1, "so a tx valida entra");
     engine.commit_block(block).expect("commit");
+    assert!(engine.mempool.read().is_empty());
 
-    let state = engine.state.read();
-    assert_eq!(state.height, 1);
-    assert_eq!(state.account(&user).balance, 10 * MICRO_QTR);
-    drop(state);
-    assert!(engine.mempool.read().is_empty(), "invalidas nao voltam para a fila");
-
-    // E a chain segue: o próximo bloco funciona normalmente.
-    assert_eq!(engine.next_nonce(&faucet.address()), 1);
     engine.submit_tx(transfer(&faucet, &user, MICRO_QTR, 1)).expect("tx 1");
     engine.commit_block(engine.propose_block().expect("propose 2")).expect("commit 2");
     assert_eq!(engine.state.read().height, 2);
+}
+
+#[test]
+fn nonce_stays_correct_while_a_block_is_being_built() {
+    // Revisão independente, achado H1: durante a montagem do bloco o faucet
+    // recebia um nonce já usado e a tx sumia em silêncio.
+    let faucet = HydraXKeypair::generate();
+    let user = HydraXKeypair::generate().address();
+    let genesis = Genesis::testnet_with_faucet(Some(&faucet.address().as_hex()));
+    let engine = ConsensusEngine::new(genesis.initial_state(), HydraXKeypair::generate());
+
+    engine.submit_tx(transfer(&faucet, &user, MICRO_QTR, 0)).expect("tx 0");
+    let block = engine.propose_block().expect("propose");
+    // Bloco montado, ainda não confirmado: a tx 0 continua contando.
+    assert_eq!(engine.next_nonce(&faucet.address()), 1);
+    // Uma tx diferente com o mesmo nonce 0 tem que ser recusada...
+    assert!(engine.submit_tx(transfer(&faucet, &user, 7 * MICRO_QTR, 0)).is_err(), "nonce 0 ja em uso");
+    // ...e reenviar a mesma tx é idempotente (mesmo ID, não duplica).
+    let again = engine.submit_tx(transfer(&faucet, &user, MICRO_QTR, 0)).expect("reenvio identico");
+    assert_eq!(again, block.transactions[0].hash());
+    assert!(engine.mempool.read().is_empty());
+    engine.submit_tx(transfer(&faucet, &user, MICRO_QTR, 1)).expect("tx 1 durante a montagem");
+
+    engine.commit_block(block).expect("commit");
+    engine.commit_block(engine.propose_block().expect("propose 2")).expect("commit 2");
+    assert_eq!(engine.state.read().account(&user).balance, 2 * MICRO_QTR);
+}
+
+#[test]
+fn failed_own_block_puts_txs_back_in_order() {
+    let faucet = HydraXKeypair::generate();
+    let user = HydraXKeypair::generate().address();
+    let genesis = Genesis::testnet_with_faucet(Some(&faucet.address().as_hex()));
+    let engine = ConsensusEngine::new(genesis.initial_state(), HydraXKeypair::generate());
+
+    engine.submit_tx(transfer(&faucet, &user, MICRO_QTR, 0)).expect("tx 0");
+    let mut block = engine.propose_block().expect("propose");
+    block.validator_sigs.clear(); // força a falha do commit
+    assert!(engine.commit_block(block).is_err());
+    assert_eq!(engine.mempool.read().len(), 1, "a tx volta para a fila");
+    engine.commit_block(engine.propose_block().expect("propose de novo")).expect("commit");
+    assert_eq!(engine.state.read().account(&user).balance, MICRO_QTR);
+}
+
+#[test]
+fn dropped_tx_can_be_resubmitted() {
+    // Achado M2: depois de descartada, a tx nunca mais entrava ("OK" falso).
+    let faucet = HydraXKeypair::generate();
+    let user = HydraXKeypair::generate().address();
+    let genesis = Genesis::testnet_with_faucet(Some(&faucet.address().as_hex()));
+    let engine = ConsensusEngine::new(genesis.initial_state(), HydraXKeypair::generate());
+
+    let tx = transfer(&faucet, &user, MICRO_QTR, 0);
+    engine.submit_tx(tx.clone()).expect("primeira vez");
+    engine.mempool.write().clear(); // some da fila, mas o hx-mempool ainda lembra
+    engine.submit_tx(tx).expect("reenvio");
+    assert_eq!(engine.mempool.read().len(), 1, "o reenvio tem que entrar de verdade");
+}
+
+#[test]
+fn per_sender_cap_and_disk_guard() {
+    let faucet = HydraXKeypair::generate();
+    let user = HydraXKeypair::generate().address();
+    let genesis = Genesis::testnet_with_faucet(Some(&faucet.address().as_hex()));
+    let engine = ConsensusEngine::new(genesis.initial_state(), HydraXKeypair::generate());
+
+    for n in 0..qtrc_consensus::MAX_PENDING_PER_SENDER as u64 {
+        engine.submit_tx(transfer(&faucet, &user, 1, n)).expect("dentro do limite");
+    }
+    let over = qtrc_consensus::MAX_PENDING_PER_SENDER as u64;
+    assert!(engine.submit_tx(transfer(&faucet, &user, 1, over)).is_err(), "passou do limite por conta");
+
+    let other = HydraXKeypair::generate();
+    let engine2 = ConsensusEngine::new(
+        Genesis::testnet_with_faucet(Some(&other.address().as_hex())).initial_state(),
+        HydraXKeypair::generate(),
+    );
+    engine2.set_accepting(false);
+    assert!(engine2.submit_tx(transfer(&other, &user, 1, 0)).is_err(), "disco cheio recusa");
+    engine2.set_accepting(true);
+    engine2.submit_tx(transfer(&other, &user, 1, 0)).expect("volta a aceitar");
+}
+
+#[test]
+fn block_from_a_different_key_is_rejected() {
+    // Achado M1: aceitava bloco assinado por qualquer chave.
+    use qtrc_common::block::ValidatorSig;
+    let faucet = HydraXKeypair::generate();
+    let user = HydraXKeypair::generate().address();
+    let genesis = Genesis::testnet_with_faucet(Some(&faucet.address().as_hex()));
+    let engine = ConsensusEngine::new(genesis.initial_state(), HydraXKeypair::generate());
+    let attacker = HydraXKeypair::generate();
+
+    engine.submit_tx(transfer(&faucet, &user, MICRO_QTR, 0)).expect("tx");
+    let honest = engine.propose_block().expect("propose");
+
+    // 1) atacante se declara proponente e assina com a própria chave
+    let mut b1 = honest.clone();
+    b1.header.proposer = attacker.address();
+    b1.validator_sigs = vec![ValidatorSig {
+        validator: attacker.address(),
+        signature: attacker.sign(&b1.header.signing_bytes()),
+    }];
+    assert!(engine.commit_block(b1).is_err(), "proponente errado");
+
+    // 2) atacante finge ser o node, mas assina com a chave dele
+    let mut b2 = honest.clone();
+    b2.validator_sigs = vec![ValidatorSig {
+        validator: engine.address.clone(),
+        signature: attacker.sign(&b2.header.signing_bytes()),
+    }];
+    assert!(engine.commit_block(b2).is_err(), "assinatura de outra chave");
+    assert_eq!(engine.state.read().height, 0);
+
+    engine.commit_block(honest).expect("o bloco honesto continua valido");
 }
 
 #[test]
@@ -185,7 +309,9 @@ fn replay_rebuilds_same_state() {
     let user = HydraXKeypair::generate().address();
     let genesis = Genesis::testnet_with_faucet(Some(&faucet.address().as_hex()));
 
-    let a = ConsensusEngine::new(genesis.initial_state(), HydraXKeypair::generate());
+    // O node reinicia com a mesma chave (arquivo de chave persistente).
+    let node_key = HydraXKeypair::generate().to_bytes();
+    let a = ConsensusEngine::new(genesis.initial_state(), HydraXKeypair::from_bytes(&node_key).unwrap());
     let mut blocks = vec![];
     for n in 0..3 {
         a.submit_tx(transfer(&faucet, &user, MICRO_QTR, n)).expect("tx");
@@ -195,7 +321,7 @@ fn replay_rebuilds_same_state() {
     }
 
     // Um node novo, mesmo gênesis, reaplicando os blocos gravados.
-    let b = ConsensusEngine::new(genesis.initial_state(), HydraXKeypair::generate());
+    let b = ConsensusEngine::new(genesis.initial_state(), HydraXKeypair::from_bytes(&node_key).unwrap());
     for blk in blocks {
         b.replay_block(blk).expect("replay");
     }

@@ -96,10 +96,24 @@ async fn post_tx(
     State(engine): State<AppState>,
     Json(tx): Json<Transaction>,
 ) -> Result<Json<TxResponse>, (StatusCode, Json<ErrorResponse>)> {
-    match engine.submit_tx(tx) {
+    // HYDRA-X verification is CPU work (~2.6 ms); run it off the async
+    // runtime so status and account queries stay fast under load.
+    let result = tokio::task::spawn_blocking(move || engine.submit_tx(tx))
+        .await
+        .map_err(|e| {
+            (
+                StatusCode::INTERNAL_SERVER_ERROR,
+                Json(ErrorResponse { error: format!("verification task failed: {e}") }),
+            )
+        })?;
+    match result {
         Ok(hash) => Ok(Json(TxResponse {
             tx_hash: hash.to_string(),
         })),
+        Err(e @ qtrc_consensus::ConsensusError::Busy(_)) => Err((
+            StatusCode::SERVICE_UNAVAILABLE,
+            Json(ErrorResponse { error: e.to_string() }),
+        )),
         Err(e) => Err((
             StatusCode::BAD_REQUEST,
             Json(ErrorResponse { error: e.to_string() }),

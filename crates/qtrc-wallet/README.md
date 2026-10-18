@@ -3,9 +3,14 @@
 Command-line wallet for the Quantar testnet (`quantar-testnet-2`).
 
 Every key is a HYDRA-X keypair: ML-DSA-87 (FIPS 204) and SLH-DSA-SHA2-256s
-(FIPS 205). Every transaction carries both signatures, and both must verify.
-There is no ECDSA anywhere, so Ethereum, Bitcoin and Solana wallets cannot hold
-QTR.
+(FIPS 205). Every transaction carries both signatures, and both must verify. No
+transaction or block is ever signed with ECDSA or any other classical scheme,
+so Ethereum, Bitcoin and Solana wallets cannot hold QTR.
+
+One honest caveat: the wallet reaches the node over ordinary HTTPS, and TLS,
+like on every website today, still uses classical key exchange. That protects
+the connection, not your funds; what authorizes a transfer is the HYDRA-X
+signature.
 
 ## Quick start
 
