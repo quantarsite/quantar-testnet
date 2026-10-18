@@ -1,0 +1,27 @@
+# /etc/quantar/testnet-rpc.locations
+# Incluido no server 443 de testnet.quantarnetwork.com.
+# Expoe so tres rotas do node (127.0.0.1:8545), nada mais.
+
+location = /rpc/status {
+    limit_req zone=qtr_read burst=20 nodelay;
+    proxy_pass http://127.0.0.1:8545/status;
+}
+
+# Alias usado pela pagina monitor do site principal
+location = /status {
+    limit_req zone=qtr_read burst=20 nodelay;
+    proxy_pass http://127.0.0.1:8545/status;
+}
+
+location ~ ^/rpc/account/([0-9a-fA-F]{64})$ {
+    limit_req zone=qtr_read burst=20 nodelay;
+    proxy_pass http://127.0.0.1:8545/account/$1;
+}
+
+location = /rpc/tx {
+    limit_except POST { deny all; }
+    limit_req zone=qtr_tx burst=5 nodelay;
+    # Uma tx HYDRA-X em JSON tem ~75 KB (as assinaturas vao em hex)
+    client_max_body_size 256k;
+    proxy_pass http://127.0.0.1:8545/tx;
+}

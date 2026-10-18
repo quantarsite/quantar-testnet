@@ -1,0 +1,23 @@
+[package]
+name        = "qtrc-wallet"
+description = "Quantar testnet wallet: post-quantum HYDRA-X keys, balance, send, faucet"
+version.workspace    = true
+edition.workspace    = true
+authors.workspace    = true
+license.workspace    = true
+repository.workspace = true
+
+[[bin]]
+name = "qtrc-wallet"
+path = "src/main.rs"
+
+[dependencies]
+qtrc-crypto.path = "../qtrc-crypto"
+qtrc-common.path = "../qtrc-common"
+clap = { workspace = true, features = ["env"] }
+serde_json.workspace = true
+anyhow.workspace     = true
+chrono.workspace     = true
+zeroize = "1"
+# rustls so the prebuilt Windows/macOS/Linux binaries need no OpenSSL
+reqwest = { version = "0.12", default-features = false, features = ["json", "blocking", "rustls-tls"] }

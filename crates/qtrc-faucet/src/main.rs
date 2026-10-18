@@ -147,7 +147,9 @@ async fn handle_faucet(
             }),
         )
     })?;
-    let nonce = chain_nonce.max(*next_nonce);
+    // The node counts our pending txs, so its answer is authoritative.
+    // (A local counter could run ahead of the chain if a tx were dropped.)
+    let nonce = chain_nonce;
 
     let payload = Transaction::signing_payload(&state.faucet_addr, &to_addr, DRIP_AMOUNT, nonce);
     let tx = Transaction {
@@ -262,7 +264,7 @@ fn limited(error: String) -> (StatusCode, Json<ErrorResponse>) {
     (StatusCode::TOO_MANY_REQUESTS, Json(ErrorResponse { error }))
 }
 
-/// Current on-chain nonce of the faucet wallet.
+/// Nonce for the faucet's next transaction (on-chain nonce plus pending).
 async fn fetch_nonce(state: &FaucetState) -> anyhow::Result<u64> {
     let v: serde_json::Value = state
         .http
@@ -272,7 +274,10 @@ async fn fetch_nonce(state: &FaucetState) -> anyhow::Result<u64> {
         .error_for_status()?
         .json()
         .await?;
-    v["nonce"].as_u64().ok_or_else(|| anyhow::anyhow!("account response without nonce"))
+    v["next_nonce"]
+        .as_u64()
+        .or_else(|| v["nonce"].as_u64())
+        .ok_or_else(|| anyhow::anyhow!("account response without nonce"))
 }
 
 // ---------------------------------------------------------------------------
