@@ -21,6 +21,17 @@ testnet antiga não valem mais. Todo mundo começa do zero em `quantar-testnet-2
 - Chave persistente: `qtrc-node keygen --out <arquivo>` grava a chave (modo
   0600, não sobrescreve) e `start --key-file` usa ela. Antes o node gerava uma
   chave nova a cada reinício
+- ID de transação sem maleabilidade: o ID agora é o BLAKE3 do payload
+  assinado, o mesmo hash do mempool. Antes era o SHA3 do JSON inteiro, com o
+  timestamp não assinado dentro, então qualquer um que repassasse a transação
+  podia mudar o ID sem invalidar a assinatura
+- Faucet com limite por endereço, por IP (1 por hora cada) e teto global de
+  100 drips por hora. Entradas vencidas são limpas a cada 10 minutos. Os
+  cabeçalhos do nginx só são aceitos quando a conexão vem do próprio servidor
+- Chave secreta guardada em buffers que se apagam ao sair da memória. Antes o
+  código copiava a chave e apagava só a cópia. Limite honesto: isso apaga as
+  cópias que o nosso código controla, não as que o compilador ou o código C do
+  PQClean possam deixar. Para mainnet, HSM
 - Versão 0.2.0 em todos os crates
 
 ## O que ainda não mudou (não fingir que mudou)
@@ -48,14 +59,18 @@ testnet antiga não valem mais. Todo mundo começa do zero em `quantar-testnet-2
 5. Suba o node com o endereço do faucet no gênesis:
    `QTR_FAUCET_ADDRESS=<endereco do faucet> ./target/release/qtrc-node start --key-file /etc/quantar/node.key`
 
-6. Suba o faucet com a chave dele:
+6. No nginx do faucet, garanta `proxy_set_header X-Real-IP $remote_addr;`,
+   senão todo mundo aparece com o IP do próprio servidor e o limite por IP
+   trava o faucet para todos depois do primeiro drip
+
+7. Suba o faucet com a chave dele:
    `./target/release/qtrc-faucet --key-file /etc/quantar/faucet.key --node-rpc http://127.0.0.1:8545`
 
-7. Confira:
+8. Confira:
    `curl localhost:8545/status` tem que mostrar `"chain_id":"quantar-testnet-2"` e `"version":"0.2.0"`
    `curl localhost:8545/account/<endereco do faucet>` tem que mostrar 10.000.000 QTR
 
-8. Se o faucet público em faucet.quantarnetwork.com é o serviço separado
+9. Se o faucet público em faucet.quantarnetwork.com é o serviço separado
    (quantar-faucet-service, com Redis), ele também precisa passar a assinar
    com a chave do faucet v2 antes de voltar ao ar
 

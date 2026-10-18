@@ -2,7 +2,6 @@
 
 use qtrc_crypto::{Address, HydraXSignature};
 use serde::{Deserialize, Serialize};
-use sha3::{Digest, Sha3_256};
 use thiserror::Error;
 
 /// 32-byte SHA3-256 hash of a serialized transaction.
@@ -64,7 +63,8 @@ pub struct Transaction {
     pub amount:    u64,
     /// Sender nonce — prevents replay attacks
     pub nonce:     u64,
-    /// Unix timestamp (seconds)
+    /// Unix timestamp (seconds). Informational only: it is NOT signed and
+    /// NOT part of the transaction ID, so consensus must never rely on it.
     pub timestamp: i64,
     /// HYDRA-X AND-composed signature over the canonical payload
     pub signature: HydraXSignature,
@@ -92,11 +92,16 @@ impl Transaction {
         buf
     }
 
-    /// Compute the SHA3-256 hash of this transaction.
+    /// Transaction ID: BLAKE3 of the signed payload.
+    ///
+    /// HYDRA-X v2: the ID covers exactly the bytes the sender signed, and
+    /// nothing else. Unsigned fields (`timestamp`) and the signature itself
+    /// are left out, so a relayer cannot change the ID of a valid
+    /// transaction (the malleability problem Bitcoin had before SegWit).
+    /// It is the same hash hx-mempool computes from `signing_bytes()`.
     pub fn hash(&self) -> TxHash {
-        let encoded = serde_json::to_vec(self).expect("tx serialization");
-        let digest: [u8; 32] = Sha3_256::digest(&encoded).into();
-        TxHash(digest)
+        let payload = Self::signing_payload(&self.from, &self.to, self.amount, self.nonce);
+        TxHash(*blake3::hash(&payload).as_bytes())
     }
 
     /// Verify the HYDRA-X AND-composed signature.

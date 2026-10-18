@@ -1,14 +1,16 @@
 //! # qtrc-faucet
 //!
 //! HTTP faucet for the Quantar testnet.
-//! Sends 100 QTR to any address — once per address per hour.
+//! Sends 100 QTR per request, once per address and once per IP per hour,
+//! with a global cap per hour.
 //!
 //! POST /faucet
 //!   Body: { "address": "<hex>" }
 //!   Response: { "tx_hash": "..." } | { "error": "..." }
 
 use axum::{
-    extract::State,
+    extract::{ConnectInfo, State},
+    http::HeaderMap,
     http::StatusCode,
     response::Json,
     routing::post,
@@ -22,13 +24,22 @@ use qtrc_common::tx::Transaction;
 use qtrc_crypto::{Address, HydraXKeypair};
 use reqwest::Client;
 use serde::{Deserialize, Serialize};
-use std::{net::SocketAddr, sync::Arc};
+use std::{
+    collections::VecDeque,
+    net::{IpAddr, SocketAddr},
+    sync::Arc,
+};
 use tracing::{info, warn};
 
 /// 100 QTR drip per request
 const DRIP_AMOUNT: u64 = 100 * MICRO_QTR;
-/// Minimum seconds between drips to the same address
+/// Minimum seconds between drips to the same address, and from the same IP
 const RATE_LIMIT_SECS: i64 = 3600;
+/// Hard cap on drips across all clients per rolling hour (10.000 QTR/h).
+/// Even a botnet with many IPs cannot drain faster than this.
+const GLOBAL_MAX_PER_HOUR: usize = 100;
+/// How often stale rate-limit entries are purged from memory
+const CLEANUP_EVERY_SECS: u64 = 600;
 
 // ---------------------------------------------------------------------------
 // CLI
@@ -56,8 +67,10 @@ struct Cli {
 // ---------------------------------------------------------------------------
 
 struct FaucetState {
-    /// address hex → last drip time
+    /// "addr:<hex>" or "ip:<ip>" → last drip time
     rate_limits: DashMap<String, DateTime<Utc>>,
+    /// Times of recent drips, for the global hourly cap
+    recent_drips: tokio::sync::Mutex<VecDeque<DateTime<Utc>>>,
     node_rpc:    String,
     keypair:     HydraXKeypair,
     faucet_addr: Address,
@@ -93,6 +106,8 @@ struct ErrorResponse {
 
 async fn handle_faucet(
     State(state): State<Arc<FaucetState>>,
+    ConnectInfo(peer): ConnectInfo<SocketAddr>,
+    headers: HeaderMap,
     Json(req): Json<FaucetRequest>,
 ) -> Result<Json<FaucetResponse>, (StatusCode, Json<ErrorResponse>)> {
     // Validate address
@@ -100,31 +115,34 @@ async fn handle_faucet(
         (
             StatusCode::BAD_REQUEST,
             Json(ErrorResponse {
-                error: "invalid address — expected 32-byte hex string".into(),
+                error: "invalid address, expected 32-byte hex string".into(),
             }),
         )
     })?;
 
-    let key = req.address.to_lowercase();
+    let addr_key = format!("addr:{}", to_addr.as_hex());
+    let ip_key = format!("ip:{}", client_ip(peer, &headers));
 
-    // Rate limit check
-    if let Some(last) = state.rate_limits.get(&key) {
-        let elapsed = Utc::now() - *last;
-        if elapsed < Duration::seconds(RATE_LIMIT_SECS) {
-            let wait = RATE_LIMIT_SECS - elapsed.num_seconds();
-            return Err((
-                StatusCode::TOO_MANY_REQUESTS,
-                Json(ErrorResponse {
-                    error: format!("rate limited — try again in {wait}s"),
-                }),
-            ));
+    // Every drip is serialized by the nonce lock, so the rate-limit checks
+    // below and the inserts after a successful submit cannot race.
+    let mut next_nonce = state.next_nonce.lock().await;
+    let now = Utc::now();
+
+    for key in [&addr_key, &ip_key] {
+        if let Some(wait) = seconds_left(&state.rate_limits, key, now) {
+            return Err(limited(format!("rate limited, try again in {wait}s")));
         }
     }
 
-    // Build and sign a real HYDRA-X transaction from the faucet wallet.
-    // The nonce lock covers fetch, sign and submit so drips stay ordered.
-    let mut next_nonce = state.next_nonce.lock().await;
+    let mut recent = state.recent_drips.lock().await;
+    while recent.front().is_some_and(|t| now - *t >= Duration::seconds(3600)) {
+        recent.pop_front();
+    }
+    if recent.len() >= GLOBAL_MAX_PER_HOUR {
+        return Err(limited("faucet is busy, hourly limit reached, try again later".into()));
+    }
 
+    // Build and sign a real HYDRA-X transaction from the faucet wallet.
     let chain_nonce = fetch_nonce(&state).await.map_err(|e| {
         warn!("node RPC error: {e}");
         (
@@ -183,8 +201,11 @@ async fn handle_faucet(
 
     let tx_hash = result["tx_hash"].as_str().unwrap_or("pending").to_string();
 
-    // Update rate limit
-    state.rate_limits.insert(key, Utc::now());
+    // Record the drip only after the node accepted it.
+    state.rate_limits.insert(addr_key, now);
+    state.rate_limits.insert(ip_key, now);
+    recent.push_back(now);
+    drop(recent);
 
     info!(to = %req.address, amount = DRIP_AMOUNT, "💧 drip sent");
 
@@ -193,6 +214,35 @@ async fn handle_faucet(
         amount:  DRIP_AMOUNT,
         message: format!("Sent {} µQTR (100 QTR) to {}", DRIP_AMOUNT, req.address),
     }))
+}
+
+/// Real client IP. Behind nginx on the same host the TCP peer is loopback,
+/// so the proxy headers are trusted only in that case; a remote client
+/// cannot spoof its IP by sending X-Forwarded-For itself.
+fn client_ip(peer: SocketAddr, headers: &HeaderMap) -> IpAddr {
+    if peer.ip().is_loopback() {
+        let from_header = headers
+            .get("x-real-ip")
+            .or_else(|| headers.get("x-forwarded-for"))
+            .and_then(|v| v.to_str().ok())
+            .and_then(|v| v.split(',').next())
+            .and_then(|v| v.trim().parse::<IpAddr>().ok());
+        if let Some(ip) = from_header {
+            return ip;
+        }
+    }
+    peer.ip()
+}
+
+/// Seconds until `key` may drip again, or None if it may drip now.
+fn seconds_left(map: &DashMap<String, DateTime<Utc>>, key: &str, now: DateTime<Utc>) -> Option<i64> {
+    let last = *map.get(key)?;
+    let elapsed = now - last;
+    (elapsed < Duration::seconds(RATE_LIMIT_SECS)).then(|| RATE_LIMIT_SECS - elapsed.num_seconds())
+}
+
+fn limited(error: String) -> (StatusCode, Json<ErrorResponse>) {
+    (StatusCode::TOO_MANY_REQUESTS, Json(ErrorResponse { error }))
 }
 
 /// Current on-chain nonce of the faucet wallet.
@@ -226,7 +276,7 @@ async fn main() -> anyhow::Result<()> {
 
     let cli = Cli::parse();
 
-    let bytes = std::fs::read(&cli.key_file)?;
+    let bytes = zeroize::Zeroizing::new(std::fs::read(&cli.key_file)?);
     let keypair = HydraXKeypair::from_bytes(&bytes)
         .map_err(|e| anyhow::anyhow!("invalid faucet key file {}: {e}", cli.key_file))?;
     let faucet_addr = keypair.address();
@@ -234,11 +284,23 @@ async fn main() -> anyhow::Result<()> {
 
     let state = Arc::new(FaucetState {
         rate_limits: DashMap::new(),
+        recent_drips: tokio::sync::Mutex::new(VecDeque::new()),
         node_rpc:    cli.node_rpc,
         keypair,
         faucet_addr,
         next_nonce:  tokio::sync::Mutex::new(0),
         http:        Client::new(),
+    });
+
+    // Purge expired rate-limit entries so the map cannot grow forever.
+    let cleaner = state.clone();
+    tokio::spawn(async move {
+        let mut tick = tokio::time::interval(std::time::Duration::from_secs(CLEANUP_EVERY_SECS));
+        loop {
+            tick.tick().await;
+            let cutoff = Utc::now() - Duration::seconds(RATE_LIMIT_SECS);
+            cleaner.rate_limits.retain(|_, t| *t > cutoff);
+        }
     });
 
     let app = Router::new()
@@ -256,7 +318,7 @@ async fn main() -> anyhow::Result<()> {
     info!("💧 Faucet listening on http://{addr}");
 
     let listener = tokio::net::TcpListener::bind(addr).await?;
-    axum::serve(listener, app).await?;
+    axum::serve(listener, app.into_make_service_with_connect_info::<SocketAddr>()).await?;
 
     Ok(())
 }

@@ -73,3 +73,29 @@ fn genesis_without_faucet_address_has_no_allocation() {
     assert!(Genesis::testnet_with_faucet(None).allocations.is_empty());
     assert!(Genesis::testnet_with_faucet(Some("nao-e-hex")).allocations.is_empty());
 }
+
+#[test]
+fn tx_id_is_not_malleable_and_matches_mempool() {
+    let faucet = HydraXKeypair::generate();
+    let user = HydraXKeypair::generate().address();
+    let genesis = Genesis::testnet_with_faucet(Some(&faucet.address().as_hex()));
+    let engine = ConsensusEngine::new(genesis.initial_state(), HydraXKeypair::generate());
+
+    let tx = transfer(&faucet, &user, MICRO_QTR, 0);
+    let id = tx.hash();
+
+    // Mudar o timestamp (campo não assinado) não pode mudar o ID.
+    let mut relayed = tx.clone();
+    relayed.timestamp += 12_345;
+    assert!(relayed.verify().is_ok(), "assinatura continua valida");
+    assert_eq!(relayed.hash(), id, "ID nao pode depender do timestamp");
+
+    // Uma segunda assinatura valida do mesmo payload também não muda o ID.
+    let mut resigned = tx.clone();
+    resigned.signature = faucet.sign(&Transaction::signing_payload(&tx.from, &tx.to, tx.amount, tx.nonce));
+    assert_eq!(resigned.hash(), id);
+
+    // O ID devolvido pelo mempool é o mesmo do núcleo.
+    let mempool_id = engine.submit_tx(tx).expect("submit");
+    assert_eq!(mempool_id, id);
+}

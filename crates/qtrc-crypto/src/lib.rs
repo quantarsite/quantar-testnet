@@ -21,7 +21,7 @@ use pqcrypto_traits::sign::{
 };
 use serde::{Deserialize, Serialize};
 use thiserror::Error;
-use zeroize::Zeroize;
+use zeroize::{Zeroize, Zeroizing};
 
 /// Empty FIPS 205 context string. HYDRA-X relies on consensus-level
 /// message canonicalization rather than an SLH-DSA context.
@@ -120,22 +120,30 @@ impl HydraXVerifyingKey {
 }
 
 // ---------------------------------------------------------------------------
-// Signing key — scrubbed on drop
+// Signing key: secret bytes live in zeroize-on-drop heap buffers
 // ---------------------------------------------------------------------------
 
 /// HYDRA-X signing (secret) key.
+///
+/// The ML-DSA secret key is kept as raw bytes in a `Zeroizing` heap buffer,
+/// because `pqcrypto_mldsa::SecretKey` is a `Copy` array type with no
+/// zeroization of its own. A `SecretKey` value is rebuilt only for the
+/// duration of one signature and wiped right after. The SLH-DSA key from
+/// `fips205` already implements `ZeroizeOnDrop`.
+///
+/// Limit, stated plainly: this wipes every copy this code owns. It cannot
+/// wipe copies the compiler may leave in registers or old stack frames, or
+/// copies made inside the C code of PQClean. For that you need an HSM.
 pub struct HydraXSigningKey {
-    ml_dsa_sk: MlDsaSk,
+    ml_dsa_sk: Zeroizing<Vec<u8>>,
     slh_dsa_sk: slh_dsa_sha2_256s::PrivateKey,
 }
 
-impl Drop for HydraXSigningKey {
-    fn drop(&mut self) {
-        let mut ml = self.ml_dsa_sk.as_bytes().to_vec();
-        ml.zeroize();
-        let mut sl = self.slh_dsa_sk.clone().into_bytes().to_vec();
-        sl.zeroize();
-    }
+/// Overwrite a `pqcrypto_mldsa::SecretKey` in place.
+fn wipe_ml_sk(sk: &mut MlDsaSk) {
+    // SAFETY: `SecretKey` is a plain `[u8; N]` newtype with no pointers,
+    // no Drop and no invalid bit patterns, so all-zero bytes are valid.
+    unsafe { zeroize::zeroize_flat_type(sk as *mut MlDsaSk) }
 }
 
 // ---------------------------------------------------------------------------
@@ -151,13 +159,16 @@ pub struct HydraXKeypair {
 impl HydraXKeypair {
     /// Generate a fresh HYDRA-X keypair using OS randomness.
     pub fn generate() -> Self {
-        let (ml_pk, ml_sk) = mldsa87::keypair();
+        let (ml_pk, mut ml_sk) = mldsa87::keypair();
+        let ml_bytes = Zeroizing::new(ml_sk.as_bytes().to_vec());
+        wipe_ml_sk(&mut ml_sk);
+
         let (slh_pk, slh_sk) =
             slh_dsa_sha2_256s::try_keygen().expect("OS RNG failure during SLH-DSA keygen");
 
         HydraXKeypair {
             signing_key: HydraXSigningKey {
-                ml_dsa_sk: ml_sk,
+                ml_dsa_sk: ml_bytes,
                 slh_dsa_sk: slh_sk,
             },
             verifying_key: HydraXVerifyingKey {
@@ -174,7 +185,10 @@ impl HydraXKeypair {
 
     /// Sign a message with the AND-composition of ML-DSA-87 and SLH-DSA.
     pub fn sign(&self, message: &[u8]) -> HydraXSignature {
-        let ml_sig = mldsa87::detached_sign(message, &self.signing_key.ml_dsa_sk);
+        let mut ml_sk = MlDsaSk::from_bytes(&self.signing_key.ml_dsa_sk)
+            .expect("ML-DSA secret key length is validated at construction");
+        let ml_sig = mldsa87::detached_sign(message, &ml_sk);
+        wipe_ml_sk(&mut ml_sk);
         // Deterministic (non-hedged) SLH-DSA signature: no RNG, cannot fail.
         let sl_sig = self
             .signing_key
@@ -201,15 +215,26 @@ impl HydraXKeypair {
     /// Serialize the full keypair:
     /// `KEYFILE_MAGIC || ml_pk || ml_sk || slh_pk || slh_sk` (fixed widths).
     ///
-    /// The output contains secret key material. Write it only to a file with
-    /// owner-only permissions.
-    pub fn to_bytes(&self) -> Vec<u8> {
-        let mut out = Vec::new();
+    /// The output contains secret key material, so it comes back in a buffer
+    /// that wipes itself on drop. Write it only to a file with owner-only
+    /// permissions.
+    pub fn to_bytes(&self) -> Zeroizing<Vec<u8>> {
+        let ml_pk_len = mldsa87::public_key_bytes();
+        let total = KEYFILE_MAGIC.len()
+            + ml_pk_len
+            + self.signing_key.ml_dsa_sk.len()
+            + slh_dsa_sha2_256s::PK_LEN
+            + slh_dsa_sha2_256s::SK_LEN;
+        // Reserve once so the buffer never reallocates and leaves a stale copy.
+        let mut out = Zeroizing::new(Vec::with_capacity(total));
         out.extend_from_slice(KEYFILE_MAGIC);
         out.extend_from_slice(self.verifying_key.ml_dsa_pk.as_bytes());
-        out.extend_from_slice(self.signing_key.ml_dsa_sk.as_bytes());
+        out.extend_from_slice(&self.signing_key.ml_dsa_sk);
         out.extend_from_slice(&self.verifying_key.slh_dsa_pk.clone().into_bytes());
-        out.extend_from_slice(&self.signing_key.slh_dsa_sk.clone().into_bytes());
+        let mut slh_sk = Zeroizing::new(self.signing_key.slh_dsa_sk.clone().into_bytes());
+        out.extend_from_slice(&slh_sk[..]);
+        slh_sk.zeroize();
+        debug_assert_eq!(out.len(), total);
         out
     }
 
@@ -246,16 +271,21 @@ impl HydraXKeypair {
 
         let ml_dsa_pk = MlDsaPk::from_bytes(ml_pk_b)
             .map_err(|e| CryptoError::Serialization(format!("ML-DSA pk: {e}")))?;
-        let ml_dsa_sk = MlDsaSk::from_bytes(ml_sk_b)
+        // Validate the length/format, then keep only the raw bytes.
+        let mut probe_sk = MlDsaSk::from_bytes(ml_sk_b)
             .map_err(|e| CryptoError::Serialization(format!("ML-DSA sk: {e}")))?;
+        wipe_ml_sk(&mut probe_sk);
+        let ml_dsa_sk = Zeroizing::new(ml_sk_b.to_vec());
 
         let slh_pk_arr: [u8; slh_dsa_sha2_256s::PK_LEN] = slh_pk_b.try_into().expect("length checked");
-        let slh_sk_arr: [u8; slh_dsa_sha2_256s::SK_LEN] = slh_sk_b.try_into().expect("length checked");
+        let mut slh_sk_arr: Zeroizing<[u8; slh_dsa_sha2_256s::SK_LEN]> =
+            Zeroizing::new(slh_sk_b.try_into().expect("length checked"));
         let slh_dsa_pk = slh_dsa_sha2_256s::PublicKey::try_from_bytes(&slh_pk_arr)
             .map_err(|e| CryptoError::Serialization(format!("SLH-DSA pk: {e}")))?;
-        let slh_dsa_sk = slh_dsa_sha2_256s::PrivateKey::try_from_bytes(&slh_sk_arr)
+        let slh_dsa_sk = slh_dsa_sha2_256s::PrivateKey::try_from_bytes(&*slh_sk_arr)
             .map_err(|e| CryptoError::Serialization(format!("SLH-DSA sk: {e}")))?;
 
+        slh_sk_arr.zeroize();
         if slh_dsa_sk.get_public_key().into_bytes() != slh_pk_arr {
             return Err(CryptoError::Serialization(
                 "SLH-DSA public key does not match secret key".into(),

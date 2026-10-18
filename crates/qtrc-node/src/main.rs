@@ -112,7 +112,9 @@ fn write_secret_file(path: &str, bytes: &[u8]) -> Result<()> {
 }
 
 fn load_keypair(path: &str) -> Result<HydraXKeypair> {
-    let bytes = std::fs::read(path).map_err(|e| anyhow::anyhow!("cannot read key file {path}: {e}"))?;
+    let bytes = zeroize::Zeroizing::new(
+        std::fs::read(path).map_err(|e| anyhow::anyhow!("cannot read key file {path}: {e}"))?,
+    );
     HydraXKeypair::from_bytes(&bytes).map_err(|e| anyhow::anyhow!("invalid key file {path}: {e}"))
 }
 
