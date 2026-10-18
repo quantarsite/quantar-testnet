@@ -1,0 +1,46 @@
+name: CI
+
+# Compila e testa o workspace a cada push e pull request.
+# Serve de rede de seguranca: pega coisas como codigo quebrado
+# commitado na main antes que vire problema.
+
+on:
+  push:
+  pull_request:
+
+env:
+  CARGO_TERM_COLOR: always
+
+jobs:
+  build-and-test:
+    runs-on: ubuntu-latest
+    steps:
+      # O workspace tem uma dependencia de path para ../hx-mempool
+      # (crates/qtrc-consensus), entao os dois repos precisam estar
+      # lado a lado, como pastas irmas.
+      - name: Checkout quantar-testnet
+        uses: actions/checkout@v4
+        with:
+          path: quantar-testnet
+
+      - name: Checkout hx-mempool (dependencia de path)
+        uses: actions/checkout@v4
+        with:
+          repository: quantarsite/hx-mempool
+          path: hx-mempool
+
+      - name: Instala Rust estavel
+        uses: dtolnay/rust-toolchain@stable
+
+      - name: Cache de build
+        uses: Swatinem/rust-cache@v2
+        with:
+          workspaces: quantar-testnet
+
+      - name: Build do workspace
+        working-directory: quantar-testnet
+        run: cargo build --workspace --verbose
+
+      - name: Testes do workspace
+        working-directory: quantar-testnet
+        run: cargo test --workspace --verbose
