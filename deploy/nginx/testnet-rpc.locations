@@ -21,7 +21,8 @@ location ~ "^/rpc/account/([0-9a-fA-F]{64})$" {
 location = /rpc/tx {
     limit_except POST { deny all; }
     limit_req zone=qtr_tx burst=5 nodelay;
-    # Uma tx HYDRA-X em JSON tem ~75 KB (as assinaturas vao em hex)
+    # Uma tx HYDRA-X em JSON tem ~132 KB: os bytes das assinaturas vao
+    # como lista de numeros. 256k cobre com folga.
     client_max_body_size 256k;
     proxy_pass http://127.0.0.1:8545/tx;
 }

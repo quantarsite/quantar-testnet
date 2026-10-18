@@ -41,7 +41,9 @@ enum Command {
     /// Start the node
     Start {
         /// JSON-RPC listen address
-        #[arg(long, default_value = "0.0.0.0:8545")]
+        /// Local by default: expose it through a reverse proxy with limits
+        /// (see deploy/nginx), never directly on 0.0.0.0
+        #[arg(long, default_value = "127.0.0.1:8545")]
         rpc: String,
         /// Data directory
         #[arg(long, default_value = "./qtrc-data")]
@@ -192,6 +194,32 @@ async fn cmd_start(rpc_addr: String, data_dir: String, key_file: Option<String>)
         let state = engine.state.read();
         info!(height = state.height, replayed, "Chain state restored from disk");
     }
+
+    // Stop accepting transactions before the disk fills up, so a spam wave
+    // stalls the testnet instead of breaking the server and its other sites.
+    let guard_engine = engine.clone();
+    let guard_dir = data_dir.clone();
+    tokio::spawn(async move {
+        const MIN_FREE: u64 = 2 * 1024 * 1024 * 1024; // 2 GiB
+        let mut tick = tokio::time::interval(std::time::Duration::from_secs(30));
+        loop {
+            tick.tick().await;
+            match fs2::available_space(&guard_dir) {
+                Ok(free) => {
+                    let ok = free >= MIN_FREE;
+                    if ok != guard_engine.is_accepting() {
+                        if ok {
+                            info!(free_mib = free / 1_048_576, "disk space recovered: accepting transactions again");
+                        } else {
+                            warn!(free_mib = free / 1_048_576, "low disk space: refusing new transactions");
+                        }
+                        guard_engine.set_accepting(ok);
+                    }
+                }
+                Err(e) => warn!("could not check free disk space: {e}"),
+            }
+        }
+    });
 
     // Spawn block producer
     let engine_clone = engine.clone();

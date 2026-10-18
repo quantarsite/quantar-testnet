@@ -49,7 +49,7 @@ const CLEANUP_EVERY_SECS: u64 = 600;
 #[command(name = "qtrc-faucet", about = "Quantar testnet faucet")]
 struct Cli {
     /// Faucet HTTP listen address
-    #[arg(long, default_value = "0.0.0.0:8546")]
+    #[arg(long, default_value = "127.0.0.1:8546")]
     listen: String,
 
     /// Node RPC URL to submit transactions
@@ -235,22 +235,33 @@ fn parse_address(input: &str) -> Result<Address, String> {
     Address::from_hex(&a.to_lowercase()).map_err(|_| "Invalid address.".to_string())
 }
 
-/// Real client IP. Behind nginx on the same host the TCP peer is loopback,
-/// so the proxy headers are trusted only in that case; a remote client
-/// cannot spoof its IP by sending X-Forwarded-For itself.
-fn client_ip(peer: SocketAddr, headers: &HeaderMap) -> IpAddr {
-    if peer.ip().is_loopback() {
-        let from_header = headers
+/// Rate-limit key for the client. Behind nginx on the same host the TCP
+/// peer is loopback, so only `X-Real-IP` (which nginx overwrites with
+/// $remote_addr) is trusted, and only in that case. `X-Forwarded-For` is
+/// ignored: its first entry is whatever the client chose to send.
+/// IPv6 clients are keyed by their /64, since one subscriber usually holds
+/// a whole /64 and could otherwise rotate addresses for free.
+fn client_ip(peer: SocketAddr, headers: &HeaderMap) -> String {
+    let mut ip = peer.ip();
+    if ip.is_loopback() {
+        if let Some(real) = headers
             .get("x-real-ip")
-            .or_else(|| headers.get("x-forwarded-for"))
             .and_then(|v| v.to_str().ok())
-            .and_then(|v| v.split(',').next())
-            .and_then(|v| v.trim().parse::<IpAddr>().ok());
-        if let Some(ip) = from_header {
-            return ip;
+            .and_then(|v| v.trim().parse::<IpAddr>().ok())
+        {
+            ip = real;
         }
     }
-    peer.ip()
+    match ip {
+        IpAddr::V4(v4) => v4.to_string(),
+        IpAddr::V6(v6) => match v6.to_ipv4_mapped() {
+            Some(v4) => v4.to_string(),
+            None => {
+                let s = v6.segments();
+                format!("{:x}:{:x}:{:x}:{:x}::/64", s[0], s[1], s[2], s[3])
+            }
+        },
+    }
 }
 
 /// Seconds until `key` may drip again, or None if it may drip now.
@@ -374,7 +385,9 @@ async fn main() -> anyhow::Result<()> {
         keypair,
         faucet_addr,
         next_nonce:  tokio::sync::Mutex::new(0),
-        http:        Client::new(),
+        // Bounded: a hung node must not freeze the faucet while it holds
+        // the nonce lock.
+        http:        Client::builder().timeout(std::time::Duration::from_secs(10)).build()?,
     });
 
     // Purge expired rate-limit entries so the map cannot grow forever.
@@ -408,4 +421,36 @@ async fn main() -> anyhow::Result<()> {
     axum::serve(listener, app.into_make_service_with_connect_info::<SocketAddr>()).await?;
 
     Ok(())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn h(name: &'static str, val: &str) -> HeaderMap {
+        let mut m = HeaderMap::new();
+        m.insert(name, val.parse().unwrap());
+        m
+    }
+
+    #[test]
+    fn only_x_real_ip_from_local_nginx_is_trusted() {
+        let local: SocketAddr = "127.0.0.1:5000".parse().unwrap();
+        let remote: SocketAddr = "203.0.113.7:5000".parse().unwrap();
+        assert_eq!(client_ip(local, &h("x-real-ip", "198.51.100.9")), "198.51.100.9");
+        // X-Forwarded-For is client-controlled: ignored
+        assert_eq!(client_ip(local, &h("x-forwarded-for", "1.2.3.4")), "127.0.0.1");
+        // A remote client cannot set its own X-Real-IP
+        assert_eq!(client_ip(remote, &h("x-real-ip", "1.2.3.4")), "203.0.113.7");
+    }
+
+    #[test]
+    fn ipv6_is_keyed_by_its_64() {
+        let local: SocketAddr = "127.0.0.1:5000".parse().unwrap();
+        let a = client_ip(local, &h("x-real-ip", "2001:db8:1:2:aaaa::1"));
+        let b = client_ip(local, &h("x-real-ip", "2001:db8:1:2:bbbb::9"));
+        let c = client_ip(local, &h("x-real-ip", "2001:db8:1:3::1"));
+        assert_eq!(a, b, "mesmo /64, mesma chave");
+        assert_ne!(a, c);
+    }
 }

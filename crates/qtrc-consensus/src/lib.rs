@@ -13,19 +13,28 @@ use hx_mempool::{
     pool::TxPool,
     sig_cache::{HydraXSigCache, SigCacheConfig},
 };
-use parking_lot::RwLock;
+use parking_lot::{Mutex, RwLock};
 use qtrc_common::{
     block::{Block, BlockHeader, ValidatorSig},
     state::ChainState,
     tx::{Transaction, TxHash},
 };
 use qtrc_crypto::{Address, HydraXKeypair};
-use std::sync::Arc;
+use std::sync::{
+    atomic::{AtomicBool, Ordering},
+    Arc,
+};
 use thiserror::Error;
 use tracing::{debug, info, warn};
 
 /// Block time in seconds.
 pub const BLOCK_TIME_SECS: u64 = 5;
+/// Most transactions one block may carry.
+pub const MAX_TXS_PER_BLOCK: usize = 500;
+/// Most transactions waiting in the mempool, across all senders.
+pub const MAX_MEMPOOL: usize = 5_000;
+/// Most transactions one sender may have waiting at once.
+pub const MAX_PENDING_PER_SENDER: usize = 16;
 
 #[derive(Debug, Error)]
 pub enum ConsensusError {
@@ -41,6 +50,8 @@ pub enum ConsensusError {
     InvalidTx(String),
     #[error("Block storage failed: {0}")]
     Storage(String),
+    #[error("Node busy: {0}")]
+    Busy(String),
 }
 
 /// Durable storage for committed blocks.
@@ -68,6 +79,18 @@ pub struct ConsensusEngine {
     pipeline:    Arc<IngestionPipeline<PqCryptoVerifier>>,
     /// Where committed blocks are written (None = memory only, e.g. tests)
     sink:        Option<Arc<dyn BlockSink>>,
+    /// hx-mempool pool and signature cache, pruned when txs leave the
+    /// mempool so they never linger (and a dropped tx can be resubmitted)
+    hx_pool:     Arc<TxPool>,
+    sig_cache:   Arc<HydraXSigCache>,
+    /// Transactions taken out of the mempool for the block being built.
+    /// They still count as pending until that block commits or fails, so
+    /// `next_nonce` never hands out a nonce that is already in use.
+    inflight:    RwLock<Vec<Transaction>>,
+    /// Serializes the admission checks so two submits can't both pass them
+    submit_lock: Mutex<()>,
+    /// Cleared by the node when disk space runs low
+    accepting:   AtomicBool,
 }
 
 impl ConsensusEngine {
@@ -80,8 +103,13 @@ impl ConsensusEngine {
                 .expect("sig cache init failed"),
         );
         let pipeline = Arc::new(
-            IngestionPipeline::new(pool, sig_cache, Arc::new(PqCryptoVerifier), 0)
-                .expect("ingestion pipeline init failed"),
+            IngestionPipeline::new(
+                Arc::clone(&pool),
+                Arc::clone(&sig_cache),
+                Arc::new(PqCryptoVerifier),
+                0,
+            )
+            .expect("ingestion pipeline init failed"),
         );
 
         ConsensusEngine {
@@ -91,7 +119,21 @@ impl ConsensusEngine {
             address,
             pipeline,
             sink: None,
+            hx_pool: pool,
+            sig_cache,
+            inflight: RwLock::new(Vec::new()),
+            submit_lock: Mutex::new(()),
+            accepting: AtomicBool::new(true),
         }
+    }
+
+    /// Stop (false) or resume (true) accepting new transactions.
+    pub fn set_accepting(&self, on: bool) {
+        self.accepting.store(on, Ordering::SeqCst);
+    }
+
+    pub fn is_accepting(&self) -> bool {
+        self.accepting.load(Ordering::SeqCst)
     }
 
     /// Attach durable block storage.
@@ -122,17 +164,110 @@ impl ConsensusEngine {
     /// so `propose_block()` can drain it into the next block.
     /// On `Duplicate`, the existing hash is returned without re-queuing.
     pub fn submit_tx(&self, tx: Transaction) -> Result<TxHash, ConsensusError> {
-        let item = adapter::to_ingest_item(&tx)?;
+        if !self.is_accepting() {
+            return Err(ConsensusError::Busy(
+                "node is not accepting transactions right now (low disk space)".into(),
+            ));
+        }
 
+        // Cheap admission checks first, so unfunded or out-of-order spam is
+        // refused before it costs a full HYDRA-X verification.
+        let _guard = self.submit_lock.lock();
+        let hash = tx.hash();
+        let (pending_count, pending_out) = self.pending_for(&tx.from);
+        if self.is_pending(&hash) {
+            return Ok(hash);
+        }
+        let expected = self.state.read().account(&tx.from).nonce + pending_count as u64;
+        if tx.nonce != expected {
+            return Err(ConsensusError::InvalidTx(format!(
+                "invalid nonce: expected {expected}, got {}",
+                tx.nonce
+            )));
+        }
+        let balance = self.state.read().account(&tx.from).balance;
+        let needed = pending_out.saturating_add(tx.amount);
+        if balance < needed {
+            return Err(ConsensusError::InvalidTx(format!(
+                "insufficient balance: have {balance} µQTR, pending plus this tx need {needed} µQTR"
+            )));
+        }
+        if pending_count >= MAX_PENDING_PER_SENDER {
+            return Err(ConsensusError::Busy(format!(
+                "this account already has {MAX_PENDING_PER_SENDER} transactions waiting; try after the next block"
+            )));
+        }
+        if self.mempool.read().len() >= MAX_MEMPOOL {
+            return Err(ConsensusError::Busy("mempool full, try again shortly".into()));
+        }
+
+        let item = adapter::to_ingest_item(&tx)?;
         match self.pipeline.ingest_one(item) {
-            IngestResult::Accepted { hash } => {
+            IngestResult::Accepted { hash: h } => {
                 self.mempool.write().push(tx);
-                Ok(adapter::hx_hash_to_qtrc(hash))
+                Ok(adapter::hx_hash_to_qtrc(h))
             }
-            IngestResult::Duplicate { hash } => Ok(adapter::hx_hash_to_qtrc(hash)),
+            // Known to hx-mempool but not queued here (left over from a drop):
+            // forget it and admit this copy, which just passed every check.
+            IngestResult::Duplicate { hash: h } => {
+                self.forget(&[hash.clone()]);
+                match self.pipeline.ingest_one(adapter::to_ingest_item(&tx)?) {
+                    IngestResult::Accepted { .. } => {
+                        self.mempool.write().push(tx);
+                        Ok(adapter::hx_hash_to_qtrc(h))
+                    }
+                    other => Err(ConsensusError::InvalidTx(format!(
+                        "transaction could not be queued: {other:?}"
+                    ))),
+                }
+            }
             IngestResult::Rejected { reason } => {
                 Err(ConsensusError::InvalidTx(reason.to_string()))
             }
+        }
+    }
+
+    /// (count, total amount) of `addr`'s txs in the mempool or in flight.
+    fn pending_for(&self, addr: &Address) -> (usize, u64) {
+        let pool = self.mempool.read();
+        let inflight = self.inflight.read();
+        pool.iter()
+            .chain(inflight.iter())
+            .filter(|t| &t.from == addr)
+            .fold((0, 0u64), |(n, sum), t| (n + 1, sum.saturating_add(t.amount)))
+    }
+
+    fn is_pending(&self, hash: &TxHash) -> bool {
+        let pool = self.mempool.read();
+        let inflight = self.inflight.read();
+        pool.iter().chain(inflight.iter()).any(|t| &t.hash() == hash)
+    }
+
+    /// Drop transactions from hx-mempool's pool and signature cache.
+    fn forget(&self, hashes: &[TxHash]) {
+        let raw: Vec<[u8; 32]> = hashes.iter().map(|h| h.0).collect();
+        for h in &raw {
+            self.hx_pool.remove(h);
+        }
+        self.sig_cache.on_block_finalized(&raw);
+    }
+
+    /// End the in-flight phase. `requeue` puts the txs back at the front of
+    /// the mempool (the block failed); otherwise they are done (committed).
+    /// Both locks are held together, so no submit ever sees a gap.
+    fn release_inflight(&self, requeue: bool) {
+        let mut pool = self.mempool.write();
+        let mut inflight = self.inflight.write();
+        let txs = std::mem::take(&mut *inflight);
+        if requeue {
+            let rest = std::mem::take(&mut *pool);
+            *pool = txs;
+            pool.extend(rest);
+        } else {
+            drop(pool);
+            drop(inflight);
+            let hashes: Vec<TxHash> = txs.iter().map(|t| t.hash()).collect();
+            self.forget(&hashes);
         }
     }
 
@@ -140,8 +275,7 @@ impl ConsensusEngine {
     /// plus that sender's transactions still waiting in the mempool.
     pub fn next_nonce(&self, addr: &Address) -> u64 {
         let chain = self.state.read().account(addr).nonce;
-        let pending = self.mempool.read().iter().filter(|t| &t.from == addr).count() as u64;
-        chain + pending
+        chain + self.pending_for(addr).0 as u64
     }
 
     /// Expose ingestion metrics for monitoring.
@@ -171,20 +305,37 @@ impl ConsensusEngine {
         // enough balance) is dropped here instead of poisoning the block:
         // since blocks apply all-or-nothing, one bad tx would otherwise make
         // every block fail and halt the chain.
+        // Move candidates from the mempool to in-flight under both locks,
+        // so they never stop counting as pending.
         let candidates: Vec<Transaction> = {
             let mut pool = self.mempool.write();
-            let n = pool.len().min(500);
-            pool.drain(..n).collect()
+            let mut inflight = self.inflight.write();
+            if !inflight.is_empty() {
+                return Err(ConsensusError::Busy("a block is already being built".into()));
+            }
+            let n = pool.len().min(MAX_TXS_PER_BLOCK);
+            let c: Vec<Transaction> = pool.drain(..n).collect();
+            *inflight = c.clone();
+            c
         };
         let mut scratch = self.state.read().clone();
         let mut txs = Vec::with_capacity(candidates.len());
+        let mut dropped = Vec::new();
         for tx in candidates {
             match scratch.apply_tx(&tx) {
                 Ok(()) => txs.push(tx),
-                Err(e) => warn!(tx = %tx.hash(), "dropping invalid tx from block: {e}"),
+                Err(e) => {
+                    warn!(tx = %tx.hash(), "dropping invalid tx from block: {e}");
+                    dropped.push(tx.hash());
+                }
             }
         }
+        if !dropped.is_empty() {
+            self.inflight.write().retain(|t| !dropped.contains(&t.hash()));
+            self.forget(&dropped);
+        }
         if txs.is_empty() {
+            self.release_inflight(false);
             return Err(ConsensusError::InvalidTx("no valid transactions to propose".into()));
         }
 
@@ -225,7 +376,19 @@ impl ConsensusEngine {
 
     /// Commit a finalized block: validate, apply, persist, then publish.
     pub fn commit_block(&self, block: Block) -> Result<(), ConsensusError> {
-        self.commit_inner(block, true)
+        let own = {
+            let inflight = self.inflight.read();
+            !inflight.is_empty()
+                && inflight.len() == block.transactions.len()
+                && inflight.iter().zip(&block.transactions).all(|(a, b)| a.hash() == b.hash())
+        };
+        let result = self.commit_inner(block, true);
+        if own {
+            // Our own proposal: on success the txs are done; on failure they
+            // go back to the front of the mempool for the next attempt.
+            self.release_inflight(result.is_err());
+        }
+        result
     }
 
     /// Re-apply a block that is already on disk (node restart).
@@ -299,21 +462,34 @@ impl ConsensusEngine {
         Ok(())
     }
 
+    /// The block must be proposed by the expected proposer and carry that
+    /// proposer's HYDRA-X signature over the header. With no validator set
+    /// (single-node testnet) the expected proposer is this node's own key.
     fn verify_proposer_sig(&self, block: &Block) -> Result<(), ConsensusError> {
-        let header_bytes = block.header.signing_bytes();
-        for vs in &block.validator_sigs {
-            if vs.validator == block.header.proposer {
-                vs.signature
-                    .verify(&header_bytes)
-                    .map_err(|e| ConsensusError::InvalidSig(e.to_string()))?;
-                return Ok(());
-            }
+        let expected = self
+            .proposer_at(block.header.height)
+            .unwrap_or_else(|| self.address.clone());
+        if block.header.proposer != expected {
+            return Err(ConsensusError::InvalidSig(format!(
+                "block proposer {} is not the expected proposer {}",
+                block.header.proposer, expected
+            )));
         }
-        // A block without the proposer's HYDRA-X signature is never valid.
-        // (v1 accepted unsigned blocks as "single-node mode".)
-        Err(ConsensusError::InvalidSig(
-            "proposer signature not found".into(),
-        ))
+        let header_bytes = block.header.signing_bytes();
+        let vs = block
+            .validator_sigs
+            .iter()
+            .find(|vs| vs.validator == expected)
+            .ok_or_else(|| ConsensusError::InvalidSig("proposer signature not found".into()))?;
+        // The key that signed must be the proposer's key, not just any key.
+        if vs.signature.signer_address() != expected {
+            return Err(ConsensusError::InvalidSig(
+                "proposer signature was made by a different key".into(),
+            ));
+        }
+        vs.signature
+            .verify(&header_bytes)
+            .map_err(|e| ConsensusError::InvalidSig(e.to_string()))
     }
 }
 
@@ -334,23 +510,21 @@ pub async fn run_block_producer(engine: Arc<ConsensusEngine>) {
             continue;
         }
 
-        match engine.propose_block() {
-            Ok(block) => {
-                let txs = block.transactions.clone();
-                if let Err(e) = engine.commit_block(block) {
-                    warn!("commit failed, returning {} tx(s) to the mempool: {e}", txs.len());
-                    let mut pool = engine.mempool.write();
-                    let rest = std::mem::take(&mut *pool);
-                    *pool = txs;
-                    pool.extend(rest);
-                }
-            }
-            Err(ConsensusError::NotProposer { .. }) => {
+        // Signing and verifying take hundreds of milliseconds; keep that off
+        // the async runtime so the RPC stays responsive.
+        let e = engine.clone();
+        let outcome = tokio::task::spawn_blocking(move || {
+            e.propose_block().and_then(|block| e.commit_block(block))
+        })
+        .await;
+
+        match outcome {
+            Ok(Ok(())) => {}
+            Ok(Err(ConsensusError::NotProposer { .. })) => {
                 debug!("not proposer this slot, waiting for block from peers");
             }
-            Err(e) => {
-                warn!("propose error: {e}");
-            }
+            Ok(Err(e)) => warn!("block production: {e}"),
+            Err(e) => warn!("block production task failed: {e}"),
         }
     }
 }

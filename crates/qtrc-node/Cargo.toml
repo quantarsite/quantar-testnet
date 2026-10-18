@@ -31,5 +31,7 @@ zeroize = "1"
 anyhow.workspace         = true
 hex.workspace            = true
 sled.workspace           = true
+bincode.workspace        = true
+fs2                      = "0.4"
 tokio-util.workspace     = true
 bytes.workspace          = true

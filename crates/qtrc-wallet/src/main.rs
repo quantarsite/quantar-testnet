@@ -3,8 +3,8 @@
 //! Command-line wallet for the Quantar testnet (`quantar-testnet-2`).
 //!
 //! Every key is a HYDRA-X keypair (ML-DSA-87, FIPS 204, AND SLH-DSA-SHA2-256s,
-//! FIPS 205) and every transaction carries both signatures. There is no ECDSA
-//! anywhere.
+//! FIPS 205) and every transaction carries both signatures. Nothing is ever
+//! signed with ECDSA.
 //!
 //! ```text
 //! qtrc-wallet new                     create a wallet
@@ -36,7 +36,7 @@ const DEFAULT_FAUCET: &str = "https://faucet.quantarnetwork.com";
 #[command(
     name = "qtrc-wallet",
     version,
-    about = "Quantar testnet wallet. Post-quantum only: ML-DSA-87 + SLH-DSA (HYDRA-X), no ECDSA."
+    about = "Quantar testnet wallet. Every transfer is signed with ML-DSA-87 + SLH-DSA (HYDRA-X); no ECDSA signatures."
 )]
 struct Cli {
     /// Key file (default: ~/.quantar/wallet.key)
