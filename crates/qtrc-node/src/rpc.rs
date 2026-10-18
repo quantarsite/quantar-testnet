@@ -39,7 +39,10 @@ struct StatusResponse {
 struct AccountResponse {
     address: String,
     balance: u64,
+    /// Nonce of the last confirmed state
     nonce:   u64,
+    /// Nonce the next transaction must use (counts pending txs too)
+    next_nonce: u64,
 }
 
 #[derive(Serialize)]
@@ -78,13 +81,14 @@ async fn get_account(
         )
     })?;
 
-    let state = engine.state.read();
-    let acct  = state.account(&addr);
+    let acct = engine.state.read().account(&addr);
+    let next_nonce = engine.next_nonce(&addr);
 
     Ok(Json(AccountResponse {
-        address: address,
+        address: addr.as_hex(),
         balance: acct.balance,
         nonce:   acct.nonce,
+        next_nonce,
     }))
 }
 

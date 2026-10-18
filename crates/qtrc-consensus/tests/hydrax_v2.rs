@@ -101,24 +101,69 @@ fn tx_id_is_not_malleable_and_matches_mempool() {
 }
 
 #[test]
-fn block_applies_all_or_nothing() {
+fn invalid_tx_is_dropped_instead_of_halting_the_chain() {
     let faucet = HydraXKeypair::generate();
     let user = HydraXKeypair::generate().address();
     let genesis = Genesis::testnet_with_faucet(Some(&faucet.address().as_hex()));
     let engine = ConsensusEngine::new(genesis.initial_state(), HydraXKeypair::generate());
 
     engine.submit_tx(transfer(&faucet, &user, 10 * MICRO_QTR, 0)).expect("tx 0");
-    // Nonce repetido: o bloco inteiro tem que ser recusado.
+    // Nonce repetido: tem que ser descartada, sem travar o bloco.
     engine.submit_tx(transfer(&faucet, &user, 20 * MICRO_QTR, 0)).expect("tx dup nonce");
+    // Sem saldo: também descartada.
+    let broke = HydraXKeypair::generate();
+    engine.submit_tx(transfer(&broke, &user, MICRO_QTR, 0)).expect("tx sem saldo");
 
     let block = engine.propose_block().expect("propose");
-    assert_eq!(block.transactions.len(), 2);
+    assert_eq!(block.transactions.len(), 1, "so a tx valida entra");
+    engine.commit_block(block).expect("commit");
+
+    let state = engine.state.read();
+    assert_eq!(state.height, 1);
+    assert_eq!(state.account(&user).balance, 10 * MICRO_QTR);
+    drop(state);
+    assert!(engine.mempool.read().is_empty(), "invalidas nao voltam para a fila");
+
+    // E a chain segue: o próximo bloco funciona normalmente.
+    assert_eq!(engine.next_nonce(&faucet.address()), 1);
+    engine.submit_tx(transfer(&faucet, &user, MICRO_QTR, 1)).expect("tx 1");
+    engine.commit_block(engine.propose_block().expect("propose 2")).expect("commit 2");
+    assert_eq!(engine.state.read().height, 2);
+}
+
+#[test]
+fn tampered_block_is_rejected_and_state_untouched() {
+    let faucet = HydraXKeypair::generate();
+    let user = HydraXKeypair::generate().address();
+    let genesis = Genesis::testnet_with_faucet(Some(&faucet.address().as_hex()));
+    let engine = ConsensusEngine::new(genesis.initial_state(), HydraXKeypair::generate());
+
+    engine.submit_tx(transfer(&faucet, &user, MICRO_QTR, 0)).expect("tx");
+    let mut block = engine.propose_block().expect("propose");
+    // Enfia uma tx depois da assinatura do proponente: a raiz Merkle não bate.
+    block.transactions.push(transfer(&faucet, &user, 5 * MICRO_QTR, 1));
     assert!(engine.commit_block(block).is_err());
 
     let state = engine.state.read();
-    assert_eq!(state.height, 0, "altura nao pode avancar");
-    assert_eq!(state.account(&user).balance, 0, "primeira tx nao pode ter ficado aplicada");
-    assert_eq!(state.account(&faucet.address()).nonce, 0);
+    assert_eq!(state.height, 0);
+    assert_eq!(state.account(&user).balance, 0);
+}
+
+#[test]
+fn next_nonce_counts_pending_transactions() {
+    let faucet = HydraXKeypair::generate();
+    let user = HydraXKeypair::generate().address();
+    let genesis = Genesis::testnet_with_faucet(Some(&faucet.address().as_hex()));
+    let engine = ConsensusEngine::new(genesis.initial_state(), HydraXKeypair::generate());
+
+    assert_eq!(engine.next_nonce(&faucet.address()), 0);
+    engine.submit_tx(transfer(&faucet, &user, MICRO_QTR, 0)).expect("tx 0");
+    engine.submit_tx(transfer(&faucet, &user, MICRO_QTR, 1)).expect("tx 1");
+    assert_eq!(engine.next_nonce(&faucet.address()), 2);
+
+    engine.commit_block(engine.propose_block().expect("propose")).expect("commit");
+    assert_eq!(engine.next_nonce(&faucet.address()), 2);
+    assert_eq!(engine.state.read().account(&user).balance, 2 * MICRO_QTR);
 }
 
 #[test]

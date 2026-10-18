@@ -136,6 +136,14 @@ impl ConsensusEngine {
         }
     }
 
+    /// Nonce the next transaction from `addr` must use: the on-chain nonce
+    /// plus that sender's transactions still waiting in the mempool.
+    pub fn next_nonce(&self, addr: &Address) -> u64 {
+        let chain = self.state.read().account(addr).nonce;
+        let pending = self.mempool.read().iter().filter(|t| &t.from == addr).count() as u64;
+        chain + pending
+    }
+
     /// Expose ingestion metrics for monitoring.
     pub fn pipeline_metrics(&self) -> &hx_mempool::metrics::IngestionMetrics {
         self.pipeline.metrics()
@@ -158,12 +166,27 @@ impl ConsensusEngine {
             }
         }
 
-        // Compute len first to avoid simultaneous mutable + immutable borrow
-        let txs: Vec<Transaction> = {
+        // Take up to 500 pending txs and keep only those that apply, in order,
+        // on top of the current state. An invalid tx (reused nonce, not
+        // enough balance) is dropped here instead of poisoning the block:
+        // since blocks apply all-or-nothing, one bad tx would otherwise make
+        // every block fail and halt the chain.
+        let candidates: Vec<Transaction> = {
             let mut pool = self.mempool.write();
             let n = pool.len().min(500);
             pool.drain(..n).collect()
         };
+        let mut scratch = self.state.read().clone();
+        let mut txs = Vec::with_capacity(candidates.len());
+        for tx in candidates {
+            match scratch.apply_tx(&tx) {
+                Ok(()) => txs.push(tx),
+                Err(e) => warn!(tx = %tx.hash(), "dropping invalid tx from block: {e}"),
+            }
+        }
+        if txs.is_empty() {
+            return Err(ConsensusError::InvalidTx("no valid transactions to propose".into()));
+        }
 
         let merkle_root = Block::compute_merkle_root(&txs);
         let prev_hash = {
@@ -226,6 +249,12 @@ impl ConsensusEngine {
                     "block does not extend the current tip (prev_hash mismatch)".into(),
                 ));
             }
+        }
+
+        if block.header.merkle_root != Block::compute_merkle_root(&block.transactions) {
+            return Err(ConsensusError::InvalidTx(
+                "merkle root does not match the block's transactions".into(),
+            ));
         }
 
         if !block.verify_transactions() {

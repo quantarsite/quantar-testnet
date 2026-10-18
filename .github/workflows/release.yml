@@ -1,0 +1,97 @@
+name: Release
+
+# Quando um Release e publicado no GitHub (com a tag vX.Y.Z), compila a
+# carteira qtrc-wallet para Linux, Windows e macOS e anexa os binarios,
+# junto com o SHA256SUMS, ao proprio Release.
+
+on:
+  release:
+    types: [published]
+  workflow_dispatch:
+    inputs:
+      tag:
+        description: "Tag do Release que vai receber os binarios (ex.: v2.0.0)"
+        required: true
+
+permissions:
+  contents: write
+
+env:
+  CARGO_TERM_COLOR: always
+  TAG: ${{ github.event.release.tag_name || inputs.tag }}
+
+jobs:
+  build:
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - os: ubuntu-latest
+            name: linux-x86_64
+            bin: qtrc-wallet
+          - os: windows-latest
+            name: windows-x86_64
+            bin: qtrc-wallet.exe
+          - os: macos-latest
+            name: macos-arm64
+            bin: qtrc-wallet
+    runs-on: ${{ matrix.os }}
+    steps:
+      - name: Checkout quantar-testnet
+        uses: actions/checkout@v4
+        with:
+          path: quantar-testnet
+          ref: ${{ env.TAG }}
+
+      # O workspace referencia ../hx-mempool por caminho, entao precisa existir
+      - name: Checkout hx-mempool
+        uses: actions/checkout@v4
+        with:
+          repository: quantarsite/hx-mempool
+          path: hx-mempool
+
+      - uses: dtolnay/rust-toolchain@stable
+
+      - name: Build da carteira
+        working-directory: quantar-testnet
+        run: cargo build --release -p qtrc-wallet
+
+      - name: Empacota
+        shell: bash
+        run: |
+          set -euo pipefail
+          out="qtrc-wallet-${TAG}-${{ matrix.name }}"
+          mkdir -p "dist/$out"
+          cp "quantar-testnet/target/release/${{ matrix.bin }}" "dist/$out/"
+          cp quantar-testnet/crates/qtrc-wallet/README.md "dist/$out/" 2>/dev/null || true
+          cd dist
+          if [ "${{ runner.os }}" = "Windows" ]; then
+            7z a "$out.zip" "$out" > /dev/null
+          else
+            tar czf "$out.tar.gz" "$out"
+          fi
+          rm -rf "$out"
+          ls -l
+
+      - uses: actions/upload-artifact@v4
+        with:
+          name: ${{ matrix.name }}
+          path: dist/*
+
+  publish:
+    needs: build
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/download-artifact@v4
+        with:
+          path: dist
+          merge-multiple: true
+
+      - name: Checksums
+        working-directory: dist
+        run: sha256sum * > SHA256SUMS && cat SHA256SUMS
+
+      - name: Anexa ao Release
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: gh release upload "$TAG" dist/* --clobber --repo "${{ github.repository }}"
