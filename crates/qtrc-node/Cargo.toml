@@ -27,6 +27,7 @@ tracing-subscriber.workspace = true
 clap.workspace           = true
 chrono.workspace         = true
 parking_lot.workspace    = true
+zeroize = "1"
 anyhow.workspace         = true
 hex.workspace            = true
 sled.workspace           = true

@@ -59,7 +59,7 @@ struct ErrorResponse {
 async fn get_status(State(engine): State<AppState>) -> Json<StatusResponse> {
     let state = engine.state.read();
     Json(StatusResponse {
-        chain_id:     "quantar-testnet-1",
+        chain_id:     qtrc_common::tx::CHAIN_ID,
         height:       state.height,
         block_hash:   state.block_hash.to_string(),
         node_address: engine.address.to_string(),

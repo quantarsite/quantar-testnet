@@ -38,8 +38,14 @@ pub struct BlockHeader {
 
 impl BlockHeader {
     /// Canonical bytes signed by the proposer.
+    ///
+    /// HYDRA-X v2: `domain_prefix || b"BLK" || json(header)`, so a validator
+    /// signature is bound to this chain and can never be read as a tx.
     pub fn signing_bytes(&self) -> Vec<u8> {
-        serde_json::to_vec(self).expect("header serialization")
+        let mut buf = crate::tx::signing_domain_prefix();
+        buf.extend_from_slice(b"BLK");
+        buf.extend_from_slice(&serde_json::to_vec(self).expect("header serialization"));
+        buf
     }
 
     /// SHA3-256 hash of the header.

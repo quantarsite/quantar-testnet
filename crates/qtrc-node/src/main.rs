@@ -13,7 +13,7 @@ use qtrc_common::genesis::Genesis;
 use qtrc_consensus::{run_block_producer, ConsensusEngine};
 use qtrc_crypto::HydraXKeypair;
 use std::sync::Arc;
-use tracing::info;
+use tracing::{info, warn};
 
 // ---------------------------------------------------------------------------
 // CLI
@@ -22,7 +22,7 @@ use tracing::info;
 #[derive(Parser, Debug)]
 #[command(
     name    = "qtrc-node",
-    version = "0.1.0",
+    version,
     about   = "Quantar Network testnet node — HYDRA-X post-quantum consensus"
 )]
 struct Cli {
@@ -32,8 +32,12 @@ struct Cli {
 
 #[derive(Subcommand, Debug)]
 enum Command {
-    /// Generate a new HYDRA-X keypair and print the address
-    Keygen,
+    /// Generate a new HYDRA-X keypair, save it to a key file and print the address
+    Keygen {
+        /// Where to write the key file (created with owner-only permissions)
+        #[arg(long)]
+        out: String,
+    },
     /// Start the node
     Start {
         /// JSON-RPC listen address
@@ -42,6 +46,10 @@ enum Command {
         /// Data directory
         #[arg(long, default_value = "./qtrc-data")]
         data_dir: String,
+        /// Validator key file from `qtrc-node keygen --out`. Without it the
+        /// node generates a throwaway key and its address changes on restart.
+        #[arg(long)]
+        key_file: Option<String>,
     },
 }
 
@@ -61,8 +69,8 @@ async fn main() -> Result<()> {
     let cli = Cli::parse();
 
     match cli.command {
-        Command::Keygen => cmd_keygen(),
-        Command::Start { rpc, data_dir } => cmd_start(rpc, data_dir).await?,
+        Command::Keygen { out } => cmd_keygen(&out)?,
+        Command::Start { rpc, data_dir, key_file } => cmd_start(rpc, data_dir, key_file).await?,
     }
 
     Ok(())
@@ -72,27 +80,61 @@ async fn main() -> Result<()> {
 // keygen
 // ---------------------------------------------------------------------------
 
-fn cmd_keygen() {
+fn cmd_keygen(out: &str) -> Result<()> {
     let keypair = HydraXKeypair::generate();
     let address = keypair.address();
-    println!("HYDRA-X keypair generated");
-    println!("Address : {address}");
+    write_secret_file(out, &keypair.to_bytes())?;
+    println!("HYDRA-X v2 keypair generated");
+    println!("Address : {}", address.as_hex());
+    println!("Short   : {address}");
+    println!("Key file: {out}");
     println!();
-    println!("⚠️  Save the verifying key bytes to disk before exiting.");
-    println!("   Production key management coming in a future release.");
+    println!("Keep this file secret and backed up. Anyone with it can sign as this address.");
+    Ok(())
+}
+
+/// Write `bytes` to `path`, refusing to overwrite, with mode 0600 on Unix.
+fn write_secret_file(path: &str, bytes: &[u8]) -> Result<()> {
+    use std::io::Write;
+    let mut opts = std::fs::OpenOptions::new();
+    opts.write(true).create_new(true);
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::OpenOptionsExt;
+        opts.mode(0o600);
+    }
+    let mut f = opts
+        .open(path)
+        .map_err(|e| anyhow::anyhow!("cannot create key file {path}: {e} (it will not overwrite an existing file)"))?;
+    f.write_all(bytes)?;
+    f.sync_all()?;
+    Ok(())
+}
+
+fn load_keypair(path: &str) -> Result<HydraXKeypair> {
+    let bytes = zeroize::Zeroizing::new(
+        std::fs::read(path).map_err(|e| anyhow::anyhow!("cannot read key file {path}: {e}"))?,
+    );
+    HydraXKeypair::from_bytes(&bytes).map_err(|e| anyhow::anyhow!("invalid key file {path}: {e}"))
 }
 
 // ---------------------------------------------------------------------------
 // start
 // ---------------------------------------------------------------------------
 
-async fn cmd_start(rpc_addr: String, data_dir: String) -> Result<()> {
-    info!("🔑 Generating ephemeral HYDRA-X keypair for this node...");
-    info!("   (persistent key storage coming in next release)");
-
-    let keypair = HydraXKeypair::generate();
+async fn cmd_start(rpc_addr: String, data_dir: String, key_file: Option<String>) -> Result<()> {
+    let keypair = match key_file {
+        Some(path) => {
+            info!("🔑 Loading HYDRA-X validator key from {path}");
+            load_keypair(&path)?
+        }
+        None => {
+            warn!("🔑 No --key-file given: generating a throwaway HYDRA-X key for this run");
+            HydraXKeypair::generate()
+        }
+    };
     let address = keypair.address();
-    info!("Node address: {address}");
+    info!("Node address: {} ({address})", address.as_hex());
 
     // Load or create genesis
     let genesis    = Genesis::testnet();
@@ -104,6 +146,9 @@ async fn cmd_start(rpc_addr: String, data_dir: String) -> Result<()> {
         accounts  = init_state.accounts.len(),
         "Genesis state loaded"
     );
+    if genesis.allocations.is_empty() {
+        warn!("QTR_FAUCET_ADDRESS not set or invalid: genesis has no faucet allocation");
+    }
 
     // Open persistent store
     let _store = store::BlockStore::open(&data_dir)?;

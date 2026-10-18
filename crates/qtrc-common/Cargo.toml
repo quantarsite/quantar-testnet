@@ -12,6 +12,7 @@ qtrc-crypto  = { path = "../qtrc-crypto" }
 serde.workspace      = true
 serde_json.workspace = true
 sha3.workspace       = true
+blake3.workspace     = true
 digest.workspace     = true
 hex.workspace        = true
 thiserror.workspace  = true
