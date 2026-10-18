@@ -29,6 +29,26 @@ pub enum TxError {
     InvalidNonce { expected: u64, got: u64 },
 }
 
+/// Protocol tag prepended to every signed transaction payload (HYDRA-X v2).
+pub const SIGNING_DOMAIN: &[u8] = b"QTR-HYDRAX-V2";
+
+/// Network every signature is bound to.
+pub const CHAIN_ID: &str = "quantar-testnet-2";
+
+/// `SIGNING_DOMAIN || len(CHAIN_ID) as u8 || CHAIN_ID`
+///
+/// Binds a signature to the protocol version and the network, so a
+/// signature made for v1 or for another chain never verifies here.
+/// Must stay byte-identical to `hx_mempool::types::signing_domain_prefix`
+/// (checked by a test in qtrc-consensus).
+pub fn signing_domain_prefix() -> Vec<u8> {
+    let mut p = Vec::with_capacity(SIGNING_DOMAIN.len() + 1 + CHAIN_ID.len());
+    p.extend_from_slice(SIGNING_DOMAIN);
+    p.push(CHAIN_ID.len() as u8);
+    p.extend_from_slice(CHAIN_ID.as_bytes());
+    p
+}
+
 /// A Quantar Network transfer transaction.
 ///
 /// Every transaction carries a HYDRA-X AND-composed signature.
@@ -55,11 +75,13 @@ impl Transaction {
     ///
     /// Layout matches hx-mempool `RawTransaction::signing_bytes()` with
     /// fixed sentinel values for fee_per_gas=0, gas_limit=21_000, data=[]:
-    ///   nonce(8) || sender(32) || recipient(32) || value(16)
+    ///   domain_prefix || nonce(8) || sender(32) || recipient(32) || value(16)
     ///   || fee_per_gas(8) || gas_limit(8) || data_len(8)
     pub fn signing_payload(from: &Address, to: &Address, amount: u64, nonce: u64) -> Vec<u8> {
         const GAS_LIMIT: u64 = 21_000;
-        let mut buf = Vec::with_capacity(8 + 32 + 32 + 16 + 8 + 8 + 8);
+        let prefix = signing_domain_prefix();
+        let mut buf = Vec::with_capacity(prefix.len() + 8 + 32 + 32 + 16 + 8 + 8 + 8);
+        buf.extend_from_slice(&prefix);
         buf.extend_from_slice(&nonce.to_le_bytes());
         buf.extend_from_slice(&from.0);
         buf.extend_from_slice(&to.0);

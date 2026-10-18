@@ -5,7 +5,7 @@
 //!
 //! Layout contract:
 //!   `RawTransaction::signing_bytes()` in hx-mempool uses:
-//!     nonce(8) || sender(32) || recipient(32) || value(16)
+//!     domain_prefix || nonce(8) || sender(32) || recipient(32) || value(16)
 //!     || fee_per_gas(8) || gas_limit(8) || data_len(8) || data
 //!
 //!   `Transaction::signing_payload()` in qtrc-common uses the same layout
@@ -26,7 +26,7 @@ use crate::ConsensusError;
 /// # Errors
 ///
 /// Returns `ConsensusError::InvalidTx` if the signature byte lengths don't
-/// match hx-mempool's expected constants (ML-DSA-87: 4595 bytes,
+/// match hx-mempool's expected constants (ML-DSA-87: 4627 bytes,
 /// SLH-DSA-256s: 29792 bytes).  A correctly signed qtrc transaction will
 /// always have the right lengths.
 pub fn to_ingest_item(tx: &Transaction) -> Result<IngestItem, ConsensusError> {

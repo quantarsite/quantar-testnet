@@ -33,18 +33,32 @@ pub struct GenesisValidator {
 }
 
 impl Genesis {
-    /// Quantar Testnet genesis configuration.
+    /// Quantar Testnet v2 genesis configuration.
+    ///
+    /// The faucet allocation goes to the address in `QTR_FAUCET_ADDRESS`
+    /// (the address printed by `qtrc-node keygen --out <file>` for the faucet
+    /// key). Without it the chain starts with no faucet funds.
     pub fn testnet() -> Self {
-        Genesis {
-            chain_id:  "quantar-testnet-1".into(),
-            timestamp: 1_745_000_000, // fixed genesis time
-            allocations: vec![
-                // Faucet wallet — 10M QTR for testnet distribution
+        Self::testnet_with_faucet(std::env::var("QTR_FAUCET_ADDRESS").ok().as_deref())
+    }
+
+    /// Same as [`Genesis::testnet`] with the faucet address passed in.
+    pub fn testnet_with_faucet(faucet_address: Option<&str>) -> Self {
+        let allocations = match faucet_address {
+            Some(addr) if Address::from_hex(addr.trim()).is_ok() => vec![
+                // Faucet wallet: 10M QTR for testnet distribution
                 GenesisAlloc {
-                    address: "faucet_placeholder_replace_with_real_address".into(),
+                    address: addr.trim().to_lowercase(),
                     balance: 10_000_000 * MICRO_QTR,
                 },
             ],
+            _ => vec![],
+        };
+
+        Genesis {
+            chain_id:  crate::tx::CHAIN_ID.into(),
+            timestamp: 1_792_281_600, // 2026-10-18 00:00:00 UTC, HYDRA-X v2 genesis
+            allocations,
             validators: vec![],
         }
     }

@@ -191,6 +191,93 @@ impl HydraXKeypair {
 }
 
 // ---------------------------------------------------------------------------
+// Key file encoding (HYDRA-X v2)
+// ---------------------------------------------------------------------------
+
+/// Magic header of a serialized HYDRA-X v2 keypair.
+pub const KEYFILE_MAGIC: &[u8; 8] = b"QTRKEY02";
+
+impl HydraXKeypair {
+    /// Serialize the full keypair:
+    /// `KEYFILE_MAGIC || ml_pk || ml_sk || slh_pk || slh_sk` (fixed widths).
+    ///
+    /// The output contains secret key material. Write it only to a file with
+    /// owner-only permissions.
+    pub fn to_bytes(&self) -> Vec<u8> {
+        let mut out = Vec::new();
+        out.extend_from_slice(KEYFILE_MAGIC);
+        out.extend_from_slice(self.verifying_key.ml_dsa_pk.as_bytes());
+        out.extend_from_slice(self.signing_key.ml_dsa_sk.as_bytes());
+        out.extend_from_slice(&self.verifying_key.slh_dsa_pk.clone().into_bytes());
+        out.extend_from_slice(&self.signing_key.slh_dsa_sk.clone().into_bytes());
+        out
+    }
+
+    /// Restore a keypair written by [`HydraXKeypair::to_bytes`].
+    ///
+    /// Fails on a wrong header, wrong length, or an SLH-DSA public key that
+    /// does not belong to the SLH-DSA secret key.
+    pub fn from_bytes(bytes: &[u8]) -> Result<Self, CryptoError> {
+        let ml_pk_len = mldsa87::public_key_bytes();
+        let ml_sk_len = mldsa87::secret_key_bytes();
+        let slh_pk_len = slh_dsa_sha2_256s::PK_LEN;
+        let slh_sk_len = slh_dsa_sha2_256s::SK_LEN;
+        let expected = KEYFILE_MAGIC.len() + ml_pk_len + ml_sk_len + slh_pk_len + slh_sk_len;
+
+        if bytes.len() != expected {
+            return Err(CryptoError::InvalidKeyLength { expected, got: bytes.len() });
+        }
+        if &bytes[..KEYFILE_MAGIC.len()] != KEYFILE_MAGIC {
+            return Err(CryptoError::Serialization(
+                "not a HYDRA-X v2 key file (bad header)".into(),
+            ));
+        }
+
+        let mut off = KEYFILE_MAGIC.len();
+        let mut take = |n: usize| {
+            let part = &bytes[off..off + n];
+            off += n;
+            part
+        };
+        let ml_pk_b = take(ml_pk_len);
+        let ml_sk_b = take(ml_sk_len);
+        let slh_pk_b = take(slh_pk_len);
+        let slh_sk_b = take(slh_sk_len);
+
+        let ml_dsa_pk = MlDsaPk::from_bytes(ml_pk_b)
+            .map_err(|e| CryptoError::Serialization(format!("ML-DSA pk: {e}")))?;
+        let ml_dsa_sk = MlDsaSk::from_bytes(ml_sk_b)
+            .map_err(|e| CryptoError::Serialization(format!("ML-DSA sk: {e}")))?;
+
+        let slh_pk_arr: [u8; slh_dsa_sha2_256s::PK_LEN] = slh_pk_b.try_into().expect("length checked");
+        let slh_sk_arr: [u8; slh_dsa_sha2_256s::SK_LEN] = slh_sk_b.try_into().expect("length checked");
+        let slh_dsa_pk = slh_dsa_sha2_256s::PublicKey::try_from_bytes(&slh_pk_arr)
+            .map_err(|e| CryptoError::Serialization(format!("SLH-DSA pk: {e}")))?;
+        let slh_dsa_sk = slh_dsa_sha2_256s::PrivateKey::try_from_bytes(&slh_sk_arr)
+            .map_err(|e| CryptoError::Serialization(format!("SLH-DSA sk: {e}")))?;
+
+        if slh_dsa_sk.get_public_key().into_bytes() != slh_pk_arr {
+            return Err(CryptoError::Serialization(
+                "SLH-DSA public key does not match secret key".into(),
+            ));
+        }
+
+        let kp = HydraXKeypair {
+            signing_key: HydraXSigningKey { ml_dsa_sk, slh_dsa_sk },
+            verifying_key: HydraXVerifyingKey { ml_dsa_pk, slh_dsa_pk },
+        };
+
+        // ML-DSA has no cheap pk-from-sk check here, so prove the pair works.
+        let probe = b"QTR-HYDRAX-V2 key file self-check";
+        kp.sign(probe)
+            .verify(probe)
+            .map_err(|_| CryptoError::Serialization("key file self-check failed".into()))?;
+
+        Ok(kp)
+    }
+}
+
+// ---------------------------------------------------------------------------
 // Signature
 // ---------------------------------------------------------------------------
 
@@ -343,4 +430,23 @@ mod tests {
         assert!(decoded.verify(msg).is_ok());
         assert_eq!(decoded.signer_address(), keypair.address());
     }
+
+    #[test]
+    fn keypair_roundtrips_through_key_file_bytes() {
+        let kp = HydraXKeypair::generate();
+        let restored = HydraXKeypair::from_bytes(&kp.to_bytes()).expect("roundtrip");
+        assert_eq!(kp.address(), restored.address());
+
+        let msg = b"assinado pela chave restaurada";
+        restored.sign(msg).verify(msg).expect("restored key signs");
+    }
+
+    #[test]
+    fn key_file_rejects_bad_header_and_length() {
+        let mut bytes = HydraXKeypair::generate().to_bytes();
+        assert!(HydraXKeypair::from_bytes(&bytes[..bytes.len() - 1]).is_err());
+        bytes[0] ^= 0xff;
+        assert!(HydraXKeypair::from_bytes(&bytes).is_err());
+    }
+
 }

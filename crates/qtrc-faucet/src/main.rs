@@ -18,7 +18,8 @@ use chrono::{DateTime, Duration, Utc};
 use clap::Parser;
 use dashmap::DashMap;
 use qtrc_common::genesis::MICRO_QTR;
-use qtrc_crypto::Address;
+use qtrc_common::tx::Transaction;
+use qtrc_crypto::{Address, HydraXKeypair};
 use reqwest::Client;
 use serde::{Deserialize, Serialize};
 use std::{net::SocketAddr, sync::Arc};
@@ -44,9 +45,10 @@ struct Cli {
     #[arg(long, default_value = "http://127.0.0.1:8545")]
     node_rpc: String,
 
-    /// Faucet wallet address (must be funded in genesis)
+    /// Faucet key file from `qtrc-node keygen --out`. Its address must be
+    /// the one funded in genesis (QTR_FAUCET_ADDRESS on the node).
     #[arg(long)]
-    faucet_address: String,
+    key_file: String,
 }
 
 // ---------------------------------------------------------------------------
@@ -57,7 +59,10 @@ struct FaucetState {
     /// address hex → last drip time
     rate_limits: DashMap<String, DateTime<Utc>>,
     node_rpc:    String,
-    faucet_addr: String,
+    keypair:     HydraXKeypair,
+    faucet_addr: Address,
+    /// Next nonce to use; guarded so concurrent drips never reuse a nonce.
+    next_nonce:  tokio::sync::Mutex<u64>,
     http:        Client,
 }
 
@@ -91,7 +96,7 @@ async fn handle_faucet(
     Json(req): Json<FaucetRequest>,
 ) -> Result<Json<FaucetResponse>, (StatusCode, Json<ErrorResponse>)> {
     // Validate address
-    let _addr = Address::from_hex(&req.address).map_err(|_| {
+    let to_addr = Address::from_hex(&req.address).map_err(|_| {
         (
             StatusCode::BAD_REQUEST,
             Json(ErrorResponse {
@@ -116,19 +121,35 @@ async fn handle_faucet(
         }
     }
 
-    // Forward drip request to node RPC
-    // (In a full impl the faucet would sign a tx with its keypair
-    //  and POST to /tx. For testnet v1 we call a dedicated faucet endpoint.)
-    let drip_payload = serde_json::json!({
-        "from":      state.faucet_addr,
-        "to":        req.address,
-        "amount":    DRIP_AMOUNT,
-    });
+    // Build and sign a real HYDRA-X transaction from the faucet wallet.
+    // The nonce lock covers fetch, sign and submit so drips stay ordered.
+    let mut next_nonce = state.next_nonce.lock().await;
+
+    let chain_nonce = fetch_nonce(&state).await.map_err(|e| {
+        warn!("node RPC error: {e}");
+        (
+            StatusCode::BAD_GATEWAY,
+            Json(ErrorResponse {
+                error: "node unreachable, try again later".into(),
+            }),
+        )
+    })?;
+    let nonce = chain_nonce.max(*next_nonce);
+
+    let payload = Transaction::signing_payload(&state.faucet_addr, &to_addr, DRIP_AMOUNT, nonce);
+    let tx = Transaction {
+        from:      state.faucet_addr.clone(),
+        to:        to_addr,
+        amount:    DRIP_AMOUNT,
+        nonce,
+        timestamp: Utc::now().timestamp(),
+        signature: state.keypair.sign(&payload),
+    };
 
     let resp = state
         .http
-        .post(format!("{}/faucet/drip", state.node_rpc))
-        .json(&drip_payload)
+        .post(format!("{}/tx", state.node_rpc))
+        .json(&tx)
         .send()
         .await
         .map_err(|e| {
@@ -136,7 +157,7 @@ async fn handle_faucet(
             (
                 StatusCode::BAD_GATEWAY,
                 Json(ErrorResponse {
-                    error: "node unreachable — try again later".into(),
+                    error: "node unreachable, try again later".into(),
                 }),
             )
         })?;
@@ -150,6 +171,8 @@ async fn handle_faucet(
             }),
         ));
     }
+    *next_nonce = nonce + 1;
+    drop(next_nonce);
 
     let result: serde_json::Value = resp.json().await.map_err(|_| {
         (
@@ -172,6 +195,19 @@ async fn handle_faucet(
     }))
 }
 
+/// Current on-chain nonce of the faucet wallet.
+async fn fetch_nonce(state: &FaucetState) -> anyhow::Result<u64> {
+    let v: serde_json::Value = state
+        .http
+        .get(format!("{}/account/{}", state.node_rpc, state.faucet_addr.as_hex()))
+        .send()
+        .await?
+        .error_for_status()?
+        .json()
+        .await?;
+    v["nonce"].as_u64().ok_or_else(|| anyhow::anyhow!("account response without nonce"))
+}
+
 // ---------------------------------------------------------------------------
 // Health check
 // ---------------------------------------------------------------------------
@@ -190,10 +226,18 @@ async fn main() -> anyhow::Result<()> {
 
     let cli = Cli::parse();
 
+    let bytes = std::fs::read(&cli.key_file)?;
+    let keypair = HydraXKeypair::from_bytes(&bytes)
+        .map_err(|e| anyhow::anyhow!("invalid faucet key file {}: {e}", cli.key_file))?;
+    let faucet_addr = keypair.address();
+    info!("💧 Faucet wallet: {}", faucet_addr.as_hex());
+
     let state = Arc::new(FaucetState {
         rate_limits: DashMap::new(),
         node_rpc:    cli.node_rpc,
-        faucet_addr: cli.faucet_address,
+        keypair,
+        faucet_addr,
+        next_nonce:  tokio::sync::Mutex::new(0),
         http:        Client::new(),
     });
 
