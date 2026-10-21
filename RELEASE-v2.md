@@ -161,3 +161,31 @@ Deploy no droplet:
 Volta atrás: enquanto nenhum bloco tiver operação Sentinel, o binário
 anterior roda no mesmo data dir. Depois disso, só restaurando o backup.
 Release com `overflow-checks = true`: overflow aritmético para o node.
+
+## v2.2.0: watchtower como serviço
+
+`qtrc-watchtower` vigia contas com guardião pela RPC do node e envia o
+resgate sozinho quando aparece algo hostil (transferência grande para
+endereço desconhecido, roubo fatiado, fila inundada, troca de guardião não
+anunciada). A decisão é o `watchtower::tick` auditado, rodado numa cópia do
+cofre. Ele não guarda chave de nenhuma conta protegida: só o kit de cada
+uma e uma carteira própria que paga as taxas. Comprometido, o máximo que
+consegue é mandar o saldo para a carteira fria do próprio dono.
+
+Deploy no droplet:
+
+1. `cargo build --release` e `install -m 755 target/release/qtrc-watchtower /usr/local/bin/`
+2. Carteira das taxas: `qtrc-wallet --key /etc/quantar/watchtower.key new`,
+   depois `qtrc-wallet --key /etc/quantar/watchtower.key faucet`
+3. `mkdir -p /etc/quantar/kits`, copie o `.kit.json` de cada conta protegida
+   para lá (`chmod 600`)
+4. `/etc/quantar/watchtower.json` a partir de `deploy/watchtower.example.json`
+5. `cp deploy/systemd/quantar-watchtower.service /etc/systemd/system/`,
+   `systemctl daemon-reload && systemctl enable --now quantar-watchtower`
+6. `journalctl -u quantar-watchtower -f`
+
+O config é relido a cada ciclo: incluir conta ou trocar kit não precisa de
+restart. Depois de um `guardian rotate`, troque o kit pelo novo assim que a
+rotação finalizar; até lá o watchtower avisa que está desarmado. O
+`webhook` (opcional) recebe cada alerta como JSON `{"text","content"}`,
+formato aceito por Slack e Discord.

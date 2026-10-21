@@ -1,0 +1,23 @@
+[package]
+name        = "qtrc-watchtower"
+description = "Sentinel watchtower service: watches guarded accounts and submits recoveries automatically"
+version.workspace    = true
+edition.workspace    = true
+authors.workspace    = true
+license.workspace    = true
+repository.workspace = true
+
+[dependencies]
+qtrc-crypto.path   = "../qtrc-crypto"
+qtrc-common.path   = "../qtrc-common"
+qtrc-sentinel.path = "../qtrc-sentinel"
+serde.workspace      = true
+serde_json.workspace = true
+anyhow.workspace     = true
+hex.workspace        = true
+chrono.workspace     = true
+clap = { workspace = true, features = ["env"] }
+tracing.workspace            = true
+tracing-subscriber.workspace = true
+zeroize = "1"
+reqwest = { version = "0.12", default-features = false, features = ["json", "blocking", "rustls-tls"] }
