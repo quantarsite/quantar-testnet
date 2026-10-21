@@ -70,3 +70,8 @@ parking_lot = "0.12"
 # Optimize them even in dev builds; our own crates stay fast to compile.
 [profile.dev.package."*"]
 opt-level = 3
+
+# Consensus code must never wrap silently: an overflow in release would
+# mint coins instead of failing. Panicking is the safe outcome.
+[profile.release]
+overflow-checks = true
