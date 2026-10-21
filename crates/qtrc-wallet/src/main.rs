@@ -443,7 +443,17 @@ fn cmd_guardian(
         },
         None => SentinelOp::RotateGuardian { commitment },
     };
-    let body = submit(http, rpc, &wallet, &account, 0, op.encode())?;
+    // The key and kit are written first so they can never be lost after
+    // the commitment is on chain. If the node refuses the transaction, the
+    // commitment never existed: remove them so a retry starts clean.
+    let body = match submit(http, rpc, &wallet, &account, 0, op.encode()) {
+        Ok(b) => b,
+        Err(e) => {
+            let _ = std::fs::remove_file(&rec_path);
+            let _ = std::fs::remove_file(&kit_path);
+            return Err(e.context("nothing was set up (the recovery key and kit files were removed)"));
+        }
+    };
 
     match setup {
         Some((delay, allowance)) => {
