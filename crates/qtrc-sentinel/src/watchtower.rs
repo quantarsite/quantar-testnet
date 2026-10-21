@@ -12,24 +12,36 @@
 //! recovery at any moment, which is terminal for the account (later
 //! credits are forwarded to `cold_dest`). Treat the kit as sensitive.
 //!
-//! A kit stops working when the guardian is rotated. Every tick checks it
-//! and reports [`Action::KitStale`] so the owner can issue a new one.
+//! A kit stops working when the guardian is rotated (the recovery message
+//! includes the rotation epoch, so returning to an old commitment does not
+//! revive old kits). Every tick checks it and reports [`Action::KitStale`]
+//! so the owner can issue a new one.
 //!
 //! ## Detection
 //!
-//! Untrusted value is summed across all pending transfers and all
-//! allowance outflows still inside the window, so splitting a theft into
-//! parts below `recover_at` does not avoid the veto. Allowance outflows to
-//! untrusted destinations always produce at least an alert. Set
-//! `recover_at <= allowance_per_window` to veto on any untrusted outflow.
+//! Untrusted value is summed across pending transfers, allowance outflows
+//! still inside the window, and transfers finalized in the last
+//! `HISTORY_WINDOWS * delay_blocks` blocks. Splitting a theft into parallel
+//! parts, or running it one transfer at a time, therefore still reaches
+//! `recover_at`. The residual rate an attacker can sustain without a veto
+//! is below `recover_at` per `HISTORY_WINDOWS * delay_blocks` blocks, and
+//! every such outflow raises an alert. Set
+//! `recover_at <= allowance_per_window` to veto on any untrusted outflow
+//! (the owner's own payments to untrusted addresses then count too).
+//!
+//! [`FLOOD_PENDING`] or more untrusted pending transfers are treated as
+//! hostile regardless of value: they exist to exhaust the queue.
 //!
 //! Operations become final at exactly `unlock_height`, so the useful
 //! reaction window is `delay_blocks` minus inclusion latency. Findings are
 //! sorted by severity, then by fewest blocks left.
 
-use crate::{Hash, PendingKind, RecoveryProof, Vault};
+use crate::{Hash, PendingKind, RecoveryProof, Vault, MAX_PENDING};
 use qtrc_crypto::Address;
 use std::cmp::Reverse;
+
+/// Untrusted pending transfers at or above this count trigger recovery.
+pub const FLOOD_PENDING: usize = MAX_PENDING / 2;
 
 /// What the owner considers normal.
 #[derive(Clone, Debug, Default)]
@@ -67,7 +79,8 @@ pub enum Severity {
 pub enum Subject {
     /// A queued operation, by id.
     Pending(u64),
-    /// An allowance outflow that already settled at this height.
+    /// An outflow that already left the vault at this height, either under
+    /// the allowance or by finalizing a time-locked transfer.
     Settled { height: u64, to: Address, amount: u64 },
 }
 
@@ -80,8 +93,8 @@ pub struct Finding {
     pub reason: &'static str,
 }
 
-/// Total untrusted value in flight: pending transfers plus allowance
-/// outflows still inside the window.
+/// Untrusted value pending or recently gone: pending transfers, allowance
+/// outflows inside the window, and recently finalized transfers.
 #[must_use]
 pub fn untrusted_total(vault: &Vault, policy: &WatchPolicy, height: u64) -> u64 {
     let pending = vault.pending().iter().filter_map(|p| match &p.kind {
@@ -90,15 +103,25 @@ pub fn untrusted_total(vault: &Vault, policy: &WatchPolicy, height: u64) -> u64 
     });
     let settled = vault
         .recent_outflows(height)
+        .chain(vault.finalized_outflows(height))
         .filter(|o| !policy.trusted.contains(&o.to))
         .map(|o| o.amount);
     pending.chain(settled).fold(0, u64::saturating_add)
 }
 
+fn untrusted_pending_count(vault: &Vault, policy: &WatchPolicy) -> usize {
+    vault
+        .pending()
+        .iter()
+        .filter(|p| matches!(&p.kind, PendingKind::Transfer { to, .. } if !policy.trusted.contains(to)))
+        .count()
+}
+
 /// Classify vault activity, most urgent first.
 #[must_use]
 pub fn inspect(vault: &Vault, policy: &WatchPolicy, height: u64) -> Vec<Finding> {
-    let escalate = untrusted_total(vault, policy, height) >= policy.recover_at;
+    let escalate = untrusted_total(vault, policy, height) >= policy.recover_at
+        || untrusted_pending_count(vault, policy) >= FLOOD_PENDING;
     let untrusted = if escalate { Severity::Recover } else { Severity::Alert };
 
     let mut out: Vec<Finding> = vault
@@ -121,14 +144,30 @@ pub fn inspect(vault: &Vault, policy: &WatchPolicy, height: u64) -> Vec<Finding>
         })
         .collect();
 
-    out.extend(vault.recent_outflows(height).filter(|o| !policy.trusted.contains(&o.to)).map(|o| Finding {
-        subject: Subject::Settled { height: o.height, to: o.to.clone(), amount: o.amount },
-        severity: untrusted,
-        blocks_left: 0,
-        reason: "allowance outflow to unknown destination",
-    }));
+    let settled = |reason: &'static str| {
+        move |o: &crate::Outflow| Finding {
+            subject: Subject::Settled { height: o.height, to: o.to.clone(), amount: o.amount },
+            severity: untrusted,
+            blocks_left: 0,
+            reason,
+        }
+    };
+    out.extend(
+        vault
+            .recent_outflows(height)
+            .filter(|o| !policy.trusted.contains(&o.to))
+            .map(settled("allowance outflow to unknown destination")),
+    );
+    out.extend(
+        vault
+            .finalized_outflows(height)
+            .filter(|o| !policy.trusted.contains(&o.to))
+            .map(settled("finalized transfer to unknown destination")),
+    );
 
-    out.sort_by_key(|f| (Reverse(f.severity), f.blocks_left));
+    // Severity first; on a tie, pending operations (still preventable)
+    // before settled ones, then the most urgent first.
+    out.sort_by_key(|f| (Reverse(f.severity), matches!(f.subject, Subject::Settled { .. }), f.blocks_left));
     out
 }
 
@@ -136,6 +175,8 @@ pub fn inspect(vault: &Vault, policy: &WatchPolicy, height: u64) -> Vec<Finding>
 pub enum Action {
     /// Nothing to report.
     Idle,
+    /// The vault has no guardian: nothing can be vetoed.
+    NoGuardian,
     /// Suspicious activity, below the veto threshold.
     Notify(Vec<Finding>),
     /// The kit no longer opens the vault's commitment or its signature is
@@ -158,6 +199,9 @@ pub fn tick<P: RecoveryProof>(
 ) -> Action {
     if vault.is_recovered() {
         return Action::Idle;
+    }
+    if vault.commitment().is_none() {
+        return Action::NoGuardian;
     }
     let findings = inspect(vault, policy, height);
     if vault.check_recovery(chain_id, &kit.cold_dest, &kit.salt, &kit.proof).is_err() {
@@ -262,7 +306,7 @@ mod tests {
         assert_eq!(f[0].severity, Severity::Recover);
 
         // With a fresh kit for the new guardian, the veto works again.
-        let fresh = RecoveryKit { cold_dest: cold(), salt: [3u8; 32], proof: proof_for(&new_c) };
+        let fresh = RecoveryKit { cold_dest: cold(), salt: [3u8; 32], proof: proof_for(&new_c, 1) };
         assert!(matches!(tick(&mut v, &p, &fresh, CHAIN, 202), Action::Recovered { .. }));
     }
 
@@ -338,4 +382,70 @@ mod tests {
         v.recover(CHAIN, &cold(), &SALT, &rec_proof()).unwrap();
         assert_eq!(tick(&mut v, &wpol(), &kit(), CHAIN, 99), Action::Idle);
     }
+
+    /// Regression N1: a theft run one transfer at a time is vetoed.
+    #[test]
+    fn serial_theft_is_vetoed() {
+        let mut v = Vault::new(me(), 10_000, Some(commit(&SALT)), policy());
+        let (id, u) = queued(v.transfer(10, thief(), 199).unwrap());
+        assert!(matches!(tick(&mut v, &wpol(), &kit(), CHAIN, 11), Action::Notify(_)));
+        v.finalize(u, id).unwrap();
+        v.transfer(u, thief(), 199).unwrap();
+        let a = tick(&mut v, &wpol(), &kit(), CHAIN, u + 1);
+        assert!(matches!(a, Action::Recovered { amount: 9_801, .. }), "{a:?}");
+    }
+
+    #[test]
+    fn finalized_theft_alerts_even_below_threshold() {
+        let mut v = Vault::new(me(), 10_000, Some(commit(&SALT)), policy());
+        let (id, u) = queued(v.transfer(10, thief(), 150).unwrap());
+        v.finalize(u, id).unwrap();
+        let Action::Notify(f) = tick(&mut v, &wpol(), &kit(), CHAIN, u + 1) else { panic!() };
+        assert_eq!(f[0].reason, "finalized transfer to unknown destination");
+    }
+
+    /// Regression N4: dust flooding the queue is hostile regardless of value.
+    #[test]
+    fn queue_flood_is_vetoed() {
+        let mut v = Vault::new(me(), 10_000, Some(commit(&SALT)), Policy::new(100, 0).unwrap());
+        let p = WatchPolicy { recover_at: 1_000_000, ..wpol() };
+        for i in 0..(FLOOD_PENDING as u64 - 1) {
+            v.transfer(10 + i, thief(), 1).unwrap();
+        }
+        assert!(matches!(tick(&mut v, &p, &kit(), CHAIN, 50), Action::Notify(_)));
+        v.transfer(60, thief(), 1).unwrap();
+        assert!(matches!(tick(&mut v, &p, &kit(), CHAIN, 61), Action::Recovered { .. }));
+    }
+
+    /// N5: a thief replacing the owner's rotation is itself an unexpected
+    /// rotation, so the watchtower recovers.
+    #[test]
+    fn rotation_ping_pong_is_vetoed() {
+        let mut v = vault();
+        let mine = commit(&[3u8; 32]);
+        let p = WatchPolicy { expected_rotation: Some(mine), ..wpol() };
+        v.request_rotation(10, mine).unwrap();
+        assert_eq!(tick(&mut v, &p, &kit(), CHAIN, 11), Action::Idle);
+        v.request_rotation(12, recovery_commitment(CHAIN, &me(), &thief(), &thief(), &SALT)).unwrap();
+        assert!(matches!(tick(&mut v, &p, &kit(), CHAIN, 13), Action::Recovered { .. }));
+    }
+
+    /// Regression N8.
+    #[test]
+    fn vault_without_guardian_is_reported() {
+        let mut v = Vault::new(me(), 1_000, None, policy());
+        assert_eq!(tick(&mut v, &wpol(), &kit(), CHAIN, 10), Action::NoGuardian);
+    }
+
+    /// Regression N9: the cause points at the pending transfer the
+    /// recovery actually prevents, not at money already gone.
+    #[test]
+    fn cause_prefers_preventable_pending() {
+        let mut v = vault();
+        v.transfer(10, thief(), 50).unwrap(); // settled
+        let (id, _) = queued(v.transfer(11, thief(), 300).unwrap());
+        let Action::Recovered { cause, .. } = tick(&mut v, &wpol(), &kit(), CHAIN, 12) else { panic!() };
+        assert_eq!(cause.subject, Subject::Pending(id));
+    }
 }
+

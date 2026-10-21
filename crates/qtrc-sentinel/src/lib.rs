@@ -44,12 +44,23 @@
 //! ## Integration notes
 //!
 //! The state machine is pure and deterministic. Consensus integration
-//! needs: transaction types for set-guardian, rotation, recovery and
-//! finalize; a call to [`Vault::charge_fee`] for every transaction's fee;
-//! routing credits through [`Vault::credit`]; [`Vault::validate`] on every
-//! state load; and `overflow-checks = true` in release builds.
+//! needs:
+//!
+//! * transaction types for set-guardian, rotation, recovery and finalize;
+//! * [`Vault::charge_fee`] for the fee of every transaction the account
+//!   itself sends, **except recovery**: the recovery fee must be paid by
+//!   whoever submits it (owner's other wallet or watchtower), otherwise a
+//!   thief who reserves the whole balance blocks the recovery;
+//! * credits routed through [`Vault::credit`], forwarding **at most one
+//!   hop**: if the forward target is itself recovered, keep the credit
+//!   there instead of following the chain (two vaults pointing at each
+//!   other would otherwise loop);
+//! * [`Vault::validate`] on every state load;
+//! * `overflow-checks = true` in release builds.
+//!
 //! `finalize` takes no authorization on purpose: once a time lock expires,
-//! anyone may settle it.
+//! anyone may settle it. There is no policy-change API; one added later
+//! must be time-locked too.
 
 pub mod watchtower;
 
@@ -72,6 +83,11 @@ pub const MAX_PENDING: usize = 64;
 /// Maximum allowance outflows remembered per window. Once full, further
 /// outflows are queued instead of settling.
 pub const MAX_RECENT: usize = 64;
+/// How many `delay_blocks` windows of finalized outflows are remembered,
+/// so watchtowers can see thefts carried out one transfer at a time.
+pub const HISTORY_WINDOWS: u64 = 4;
+/// Maximum finalized outflows remembered (oldest dropped first).
+pub const MAX_HISTORY: usize = 256;
 
 /// Length-prefixed absorb, so `"ab"||"c"` and `"a"||"bc"` never collide.
 fn absorb(h: &mut Sha3_256, field: &[u8]) {
@@ -100,16 +116,19 @@ pub fn recovery_commitment(
     h.finalize().into()
 }
 
-/// Message the recovery key signs. Bound to the chain, the account and the
-/// current commitment, so a recovery signature dies when the guardian is
-/// rotated and never replays across networks or accounts.
+/// Message the recovery key signs. Bound to the chain, the account, the
+/// current commitment and the guardian epoch (number of finalized
+/// rotations), so a recovery signature dies when the guardian is rotated,
+/// even if a later rotation returns to the same commitment, and never
+/// replays across networks or accounts.
 #[must_use]
-pub fn recovery_message(chain_id: &[u8], account: &Address, commitment: &Hash) -> Hash {
+pub fn recovery_message(chain_id: &[u8], account: &Address, commitment: &Hash, epoch: u64) -> Hash {
     let mut h = Sha3_256::new();
     absorb(&mut h, DOM_RECOVER);
     absorb(&mut h, chain_id);
     absorb(&mut h, &account.0);
     absorb(&mut h, commitment);
+    h.update(epoch.to_le_bytes());
     h.finalize().into()
 }
 
@@ -213,6 +232,8 @@ pub enum SentinelError {
     TooManyPending,
     #[error("policy parameters out of range")]
     InvalidPolicy,
+    #[error("cold_dest must differ from the account")]
+    SelfRecovery,
     #[error("vault state violates an invariant")]
     InvalidState,
     #[error("arithmetic overflow")]
@@ -241,8 +262,10 @@ pub enum Credit {
 /// Per-account Sentinel state.
 ///
 /// Invariants, checked by [`Vault::validate`]:
-/// `reserved == sum of pending transfers`, `reserved <= balance`,
-/// at most [`MAX_PENDING`] pending and one pending rotation.
+/// `reserved == sum of pending transfers <= balance`, at most
+/// [`MAX_PENDING`] pending transfers plus one pending rotation (the
+/// rotation has its own slot, so a flood of transfers cannot block it),
+/// consistent unlock heights, and a clean state after recovery.
 #[derive(Clone, Debug, Serialize, Deserialize)]
 pub struct Vault {
     address: Address,
@@ -251,9 +274,11 @@ pub struct Vault {
     commitment: Option<Hash>,
     pending: Vec<Pending>,
     recent: Vec<Outflow>,
+    finalized: Vec<Outflow>,
     recovered_to: Option<Address>,
     policy: Policy,
     next_id: u64,
+    epoch: u64,
 }
 
 impl Vault {
@@ -266,9 +291,11 @@ impl Vault {
             commitment,
             pending: Vec::new(),
             recent: Vec::new(),
+            finalized: Vec::new(),
             recovered_to: None,
             policy,
             next_id: 0,
+            epoch: 0,
         }
     }
 
@@ -296,6 +323,11 @@ impl Vault {
     pub fn policy(&self) -> Policy {
         self.policy
     }
+    /// Number of finalized guardian rotations. Part of the recovery message.
+    #[must_use]
+    pub fn epoch(&self) -> u64 {
+        self.epoch
+    }
     #[must_use]
     pub fn is_recovered(&self) -> bool {
         self.recovered_to.is_some()
@@ -317,6 +349,21 @@ impl Vault {
         self.recent.iter().filter(move |o| o.height.saturating_add(delay) > height)
     }
 
+    /// Finalized (time-locked) outflows within the last
+    /// `HISTORY_WINDOWS * delay_blocks` blocks before `height`.
+    pub fn finalized_outflows(&self, height: u64) -> impl Iterator<Item = &Outflow> {
+        let span = self.history_span();
+        self.finalized.iter().filter(move |o| o.height.saturating_add(span) > height)
+    }
+
+    fn history_span(&self) -> u64 {
+        self.policy.delay_blocks.saturating_mul(HISTORY_WINDOWS)
+    }
+
+    fn pending_transfers(&self) -> usize {
+        self.pending.iter().filter(|p| matches!(p.kind, PendingKind::Transfer { .. })).count()
+    }
+
     fn ensure_active(&self) -> Result<(), SentinelError> {
         if self.is_recovered() { Err(SentinelError::Recovered) } else { Ok(()) }
     }
@@ -324,6 +371,8 @@ impl Vault {
     fn prune_recent(&mut self, height: u64) {
         let delay = self.policy.delay_blocks;
         self.recent.retain(|o| o.height.saturating_add(delay) > height);
+        let span = self.history_span();
+        self.finalized.retain(|o| o.height.saturating_add(span) > height);
     }
 
     fn next_unlock(&self, height: u64) -> Result<u64, SentinelError> {
@@ -385,7 +434,7 @@ impl Vault {
             return Ok(Outcome::Settled { to, amount });
         }
         // Compute everything fallible before mutating.
-        if self.pending.len() >= MAX_PENDING {
+        if self.pending_transfers() >= MAX_PENDING {
             return Err(SentinelError::TooManyPending);
         }
         let unlock_height = self.next_unlock(height)?;
@@ -403,20 +452,20 @@ impl Vault {
 
     /// Replace the recovery commitment. Delayed whenever a guardian already
     /// exists, so the current guardian can veto a hostile swap. A new
-    /// request replaces any rotation already pending.
+    /// request replaces any rotation already pending and restarts the
+    /// delay. Repeated replacement means the main key is compromised; the
+    /// correct response is recovery, which watchtowers do automatically
+    /// for any rotation they were not told to expect.
     ///
     /// # Errors
-    /// Recovered, too many pending, overflow.
+    /// Recovered, overflow.
     pub fn request_rotation(&mut self, height: u64, new_commitment: Hash) -> Result<Outcome, SentinelError> {
         self.ensure_active()?;
         if self.commitment.is_none() {
             self.commitment = Some(new_commitment);
             return Ok(Outcome::CommitmentSet);
         }
-        let had_rotation = self.pending.iter().any(|p| matches!(p.kind, PendingKind::RotateCommitment { .. }));
-        if !had_rotation && self.pending.len() >= MAX_PENDING {
-            return Err(SentinelError::TooManyPending);
-        }
+        // The rotation has its own slot, outside MAX_PENDING.
         let unlock_height = self.next_unlock(height)?;
         self.pending.retain(|p| !matches!(p.kind, PendingKind::RotateCommitment { .. }));
         let id = self.next_id;
@@ -450,11 +499,17 @@ impl Vault {
                 self.pending.remove(idx);
                 self.reserved = reserved;
                 self.balance = balance;
+                self.prune_recent(height);
+                if self.finalized.len() >= MAX_HISTORY {
+                    self.finalized.remove(0);
+                }
+                self.finalized.push(Outflow { height, to: to.clone(), amount });
                 Ok(Some((to, amount)))
             }
             PendingKind::RotateCommitment { new_commitment } => {
                 self.commitment = Some(*new_commitment);
                 self.pending.remove(idx);
+                self.epoch += 1;
                 Ok(None)
             }
         }
@@ -464,7 +519,7 @@ impl Vault {
     /// detect a stale kit before they need it).
     ///
     /// # Errors
-    /// Recovered, no commitment, mismatch, bad signature.
+    /// Recovered, no commitment, self recovery, mismatch, bad signature.
     pub fn check_recovery<P: RecoveryProof>(
         &self,
         chain_id: &[u8],
@@ -474,11 +529,15 @@ impl Vault {
     ) -> Result<(), SentinelError> {
         self.ensure_active()?;
         let expected = self.commitment.ok_or(SentinelError::NoCommitment)?;
+        // A vault forwarding to itself would make credits loop forever.
+        if *cold_dest == self.address {
+            return Err(SentinelError::SelfRecovery);
+        }
         let opened = recovery_commitment(chain_id, &self.address, &proof.signer(), cold_dest, salt);
         if expected != opened {
             return Err(SentinelError::CommitmentMismatch);
         }
-        let msg = recovery_message(chain_id, &self.address, &expected);
+        let msg = recovery_message(chain_id, &self.address, &expected, self.epoch);
         if !proof.verify(&msg) {
             return Err(SentinelError::BadRecoverySignature);
         }
@@ -501,6 +560,7 @@ impl Vault {
         self.check_recovery(chain_id, cold_dest, salt, proof)?;
         self.pending.clear();
         self.recent.clear();
+        self.finalized.clear();
         self.reserved = 0;
         let amount = self.balance;
         self.balance = 0;
@@ -520,7 +580,11 @@ impl Vault {
         let mut sum: u64 = 0;
         let mut rotations = 0;
         for (i, p) in self.pending.iter().enumerate() {
-            if p.id >= self.next_id || self.pending[..i].iter().any(|q| q.id == p.id) {
+            let expected_unlock = p.created_height.checked_add(self.policy.delay_blocks);
+            if p.id >= self.next_id
+                || self.pending[..i].iter().any(|q| q.id == p.id)
+                || expected_unlock != Some(p.unlock_height)
+            {
                 return Err(bad);
             }
             match p.kind {
@@ -530,13 +594,22 @@ impl Vault {
                 PendingKind::RotateCommitment { .. } => rotations += 1,
             }
         }
+        let recent_sum = self.recent.iter().try_fold(0u64, |a, o| a.checked_add(o.amount));
         let ok = sum == self.reserved
             && self.reserved <= self.balance
-            && self.pending.len() <= MAX_PENDING
-            && self.recent.len() <= MAX_RECENT
+            && self.pending.len() - rotations <= MAX_PENDING
             && rotations <= 1
-            && (self.commitment.is_some() || self.pending.is_empty())
-            && (!self.is_recovered() || (self.balance == 0 && self.pending.is_empty()));
+            && self.recent.len() <= MAX_RECENT
+            && self.finalized.len() <= MAX_HISTORY
+            && recent_sum.is_some_and(|s| s <= self.policy.allowance_per_window)
+            && self.recent.iter().chain(&self.finalized).all(|o| o.amount > 0)
+            && (self.commitment.is_some() || (self.pending.is_empty() && self.recent.is_empty()))
+            && (!self.is_recovered()
+                || (self.balance == 0
+                    && self.commitment.is_none()
+                    && self.pending.is_empty()
+                    && self.recent.is_empty()
+                    && self.finalized.is_empty()));
         if ok { Ok(()) } else { Err(bad) }
     }
 }
@@ -590,13 +663,13 @@ pub(crate) mod testutil {
         Vault::new(me(), 1_000, Some(commit(&SALT)), policy())
     }
 
-    /// Recovery proof for whatever commitment the vault holds now.
-    pub fn proof_for(c: &Hash) -> MockProof {
-        MockProof::sign(&rec_key(), &recovery_message(CHAIN, &me(), c))
+    /// Recovery proof for a given commitment and guardian epoch.
+    pub fn proof_for(c: &Hash, epoch: u64) -> MockProof {
+        MockProof::sign(&rec_key(), &recovery_message(CHAIN, &me(), c, epoch))
     }
 
     pub fn rec_proof() -> MockProof {
-        proof_for(&commit(&SALT))
+        proof_for(&commit(&SALT), 0)
     }
 
     pub fn queued(o: Outcome) -> (u64, u64) {
@@ -789,7 +862,7 @@ mod tests {
     fn wrong_recovery_key_rejected() {
         let mut v = vault();
         let c = commit(&SALT);
-        let other = MockProof::sign(&thief(), &recovery_message(CHAIN, &me(), &c));
+        let other = MockProof::sign(&thief(), &recovery_message(CHAIN, &me(), &c, 0));
         assert_eq!(v.recover(CHAIN, &cold(), &SALT, &other), Err(SentinelError::CommitmentMismatch));
     }
 
@@ -804,7 +877,7 @@ mod tests {
     #[test]
     fn cross_chain_replay_rejected() {
         let mut v = vault();
-        let p = MockProof::sign(&rec_key(), &recovery_message(b"quantar-mainnet", &me(), &commit(&SALT)));
+        let p = MockProof::sign(&rec_key(), &recovery_message(b"quantar-mainnet", &me(), &commit(&SALT), 0));
         assert_eq!(v.recover(CHAIN, &cold(), &SALT, &p), Err(SentinelError::BadRecoverySignature));
     }
 
@@ -877,7 +950,7 @@ mod tests {
         let (id, unlock) = queued(v.request_rotation(10, commit(&new_salt)).unwrap());
         v.finalize(unlock, id).unwrap();
         assert_eq!(v.recover(CHAIN, &cold(), &new_salt, &old), Err(SentinelError::BadRecoverySignature));
-        assert!(v.recover(CHAIN, &cold(), &new_salt, &proof_for(&commit(&new_salt))).is_ok());
+        assert!(v.recover(CHAIN, &cold(), &new_salt, &proof_for(&commit(&new_salt), 1)).is_ok());
     }
 
     // ---- encoding and persistence -----------------------------------------
@@ -896,7 +969,7 @@ mod tests {
     #[test]
     fn commit_and_recover_domains_are_separate() {
         let c = commit(&SALT);
-        assert_ne!(c, recovery_message(CHAIN, &me(), &c));
+        assert_ne!(c, recovery_message(CHAIN, &me(), &c, 0));
     }
 
     #[test]
@@ -950,6 +1023,135 @@ mod tests {
         }
     }
 
+    // ---- audit round 2 ----------------------------------------------------
+
+    /// Regression N2: a vault must not forward credits to itself.
+    #[test]
+    fn self_recovery_rejected() {
+        let c = recovery_commitment(CHAIN, &me(), &rec_key(), &me(), &SALT);
+        let mut v = Vault::new(me(), 1_000, Some(c), policy());
+        let p = proof_for(&c, 0);
+        assert_eq!(v.recover(CHAIN, &me(), &SALT, &p), Err(SentinelError::SelfRecovery));
+        assert!(!v.is_recovered());
+    }
+
+    /// Regression N4: a flood of transfers cannot block the guardian rotation.
+    #[test]
+    fn rotation_has_reserved_slot() {
+        let mut v = Vault::new(me(), 1_000_000, Some(commit(&SALT)), Policy::new(100, 0).unwrap());
+        for i in 0..MAX_PENDING as u64 {
+            v.transfer(10 + i, thief(), 1).unwrap();
+        }
+        assert_eq!(v.transfer(99, thief(), 1), Err(SentinelError::TooManyPending));
+        assert!(matches!(v.request_rotation(99, commit(&[3u8; 32])).unwrap(), Outcome::Queued { .. }));
+        v.validate().unwrap();
+    }
+
+    /// Regression N6: returning to an old commitment does not revive old proofs.
+    #[test]
+    fn epoch_kills_proofs_after_round_trip() {
+        let mut v = vault();
+        let old = rec_proof();
+        let (a, ua) = queued(v.request_rotation(10, commit(&[3u8; 32])).unwrap());
+        v.finalize(ua, a).unwrap();
+        let (b, ub) = queued(v.request_rotation(ua, commit(&SALT)).unwrap());
+        v.finalize(ub, b).unwrap();
+        assert_eq!(v.commitment(), Some(&commit(&SALT)));
+        assert_eq!(v.epoch(), 2);
+        assert_eq!(v.recover(CHAIN, &cold(), &SALT, &old), Err(SentinelError::BadRecoverySignature));
+        assert!(v.recover(CHAIN, &cold(), &SALT, &proof_for(&commit(&SALT), 2)).is_ok());
+    }
+
+    #[test]
+    fn finalized_transfers_are_remembered_then_expire() {
+        let mut v = vault();
+        let (id, u) = queued(v.transfer(10, thief(), 300).unwrap());
+        v.finalize(u, id).unwrap();
+        assert_eq!(v.finalized_outflows(u).count(), 1);
+        let span = 100 * HISTORY_WINDOWS;
+        assert_eq!(v.finalized_outflows(u + span - 1).count(), 1);
+        assert_eq!(v.finalized_outflows(u + span).count(), 0);
+    }
+
+    #[test]
+    fn finalized_history_is_bounded() {
+        let mut v = Vault::new(me(), 1_000_000, Some(commit(&SALT)), Policy::new(100, 0).unwrap());
+        for _ in 0..(MAX_HISTORY + 10) {
+            let (id, u) = queued(v.transfer(10, thief(), 1).unwrap());
+            v.finalize(u, id).unwrap();
+        }
+        assert_eq!(v.finalized_outflows(110).count(), MAX_HISTORY);
+        v.validate().unwrap();
+    }
+
+    /// Regression N7: validate catches tampered unlock heights and a dirty
+    /// recovered state.
+    #[test]
+    fn validate_catches_more_tampering() {
+        let mut v = vault();
+        v.transfer(10, thief(), 500).unwrap();
+        let json = serde_json::to_string(&v).unwrap().replace("\"unlock_height\":110", "\"unlock_height\":0");
+        let bad: Vault = serde_json::from_str(&json).unwrap();
+        assert_eq!(bad.validate(), Err(SentinelError::InvalidState));
+
+        let mut r = vault();
+        r.transfer(10, thief(), 30).unwrap();
+        r.recover(CHAIN, &cold(), &SALT, &rec_proof()).unwrap();
+        let c = hex_bytes(&commit(&SALT));
+        let json = serde_json::to_string(&r).unwrap().replace("\"commitment\":null", &format!("\"commitment\":{c}"));
+        let bad: Vault = serde_json::from_str(&json).unwrap();
+        assert_eq!(bad.validate(), Err(SentinelError::InvalidState));
+    }
+
+    fn hex_bytes(h: &Hash) -> String {
+        serde_json::to_string(h).unwrap()
+    }
+
+    #[test]
+    fn invariants_hold_with_recovery_in_the_mix() {
+        let mut recoveries = 0;
+        let mut seed: u64 = 0xD1B5_4A32_D192_ED03;
+        let mut next = || {
+            seed ^= seed << 13;
+            seed ^= seed >> 7;
+            seed ^= seed << 17;
+            seed
+        };
+        for _ in 0..200 {
+            let mut v = Vault::new(me(), 10_000, Some(commit(&SALT)), Policy::new(20, 300).unwrap());
+            let mut h = 0u64;
+            for _ in 0..200 {
+                h += next() % 5;
+                let ids: Vec<u64> = v.pending().iter().map(|p| p.id).collect();
+                match next() % 8 {
+                    0 | 1 => { let _ = v.transfer(h, thief(), next() % 700); }
+                    2 => { let _ = v.charge_fee(next() % 50); }
+                    3 => {
+                        let before = v.balance();
+                        match v.credit(next() % 400) {
+                            Ok(Credit::Forward(to)) => { assert_eq!(to, cold()); assert_eq!(v.balance(), before); }
+                            Ok(Credit::Held) | Err(_) => {}
+                        }
+                    }
+                    4 if !ids.is_empty() => { let _ = v.finalize(h, ids[usize::try_from(next() % ids.len() as u64).unwrap()]); }
+                    5 => { let _ = v.request_rotation(h, commit(&[(next() % 3) as u8; 32])); }
+                    6 if next() % 20 == 0 => {
+                        if let Some(c) = v.commitment().copied() {
+                            // Commitments in play: SALT, or [b; 32] for b in 0..3.
+                            let salt = (0u8..3).map(|b| [b; 32]).find(|x| commit(x) == c).unwrap_or(SALT);
+                            if v.recover(CHAIN, &cold(), &salt, &proof_for(&c, v.epoch())).is_ok() {
+                                recoveries += 1;
+                            }
+                        }
+                    }
+                    _ => {}
+                }
+                v.validate().unwrap();
+            }
+        }
+        assert!(recoveries > 20, "only {recoveries} recoveries exercised");
+    }
+
     // ---- real HYDRA-X -----------------------------------------------------
 
     /// End to end with the real scheme (ML-DSA-87 AND SLH-DSA-256s).
@@ -961,14 +1163,14 @@ mod tests {
         v.transfer(10, thief(), 800).unwrap();
 
         // Real signature from the right key but for another account.
-        let wrong_acct = rec.sign(&recovery_message(CHAIN, &thief(), &c));
+        let wrong_acct = rec.sign(&recovery_message(CHAIN, &thief(), &c, 0));
         assert_eq!(v.recover(CHAIN, &cold(), &SALT, &wrong_acct), Err(SentinelError::BadRecoverySignature));
 
         // Real signature over the right message from a different key.
-        let impostor = HydraXKeypair::generate().sign(&recovery_message(CHAIN, &me(), &c));
+        let impostor = HydraXKeypair::generate().sign(&recovery_message(CHAIN, &me(), &c, 0));
         assert_eq!(v.recover(CHAIN, &cold(), &SALT, &impostor), Err(SentinelError::CommitmentMismatch));
 
-        let sig = rec.sign(&recovery_message(CHAIN, &me(), &c));
+        let sig = rec.sign(&recovery_message(CHAIN, &me(), &c, 0));
         assert_eq!(v.recover(CHAIN, &cold(), &SALT, &sig).unwrap(), (cold(), 1_000));
     }
 }
