@@ -4,6 +4,7 @@
 //!   GET  /status               → node status
 //!   GET  /block/:height        → block by height
 //!   GET  /account/:address     → account balance + nonce
+//!   GET  /vault/:address       → Sentinel vault of an account
 //!   POST /tx                   → submit a signed transaction
 
 use axum::{
@@ -37,6 +38,8 @@ struct StatusResponse {
     fee:          u64,
     /// Total micro-QTR burned in fees so far
     burned:       u64,
+    /// First block that accepts Sentinel operations
+    sentinel_from_height: u64,
 }
 
 #[derive(Serialize)]
@@ -47,6 +50,14 @@ struct AccountResponse {
     nonce:   u64,
     /// Nonce the next transaction must use (counts pending txs too)
     next_nonce: u64,
+}
+
+#[derive(Serialize)]
+struct VaultResponse {
+    address:   String,
+    /// Spendable now (balance minus reserved)
+    available: u64,
+    vault:     qtrc_sentinel::Vault,
 }
 
 #[derive(Serialize)]
@@ -73,6 +84,7 @@ async fn get_status(State(engine): State<AppState>) -> Json<StatusResponse> {
         version:      env!("CARGO_PKG_VERSION"),
         fee:          state.fee_at(state.height + 1),
         burned:       state.burned,
+        sentinel_from_height: state.sentinel_from_height,
     })
 }
 
@@ -96,6 +108,20 @@ async fn get_account(
         nonce:   acct.nonce,
         next_nonce,
     }))
+}
+
+async fn get_vault(
+    State(engine): State<AppState>,
+    Path(address): Path<String>,
+) -> Result<Json<VaultResponse>, (StatusCode, Json<ErrorResponse>)> {
+    let addr = qtrc_crypto::Address::from_hex(&address).map_err(|e| {
+        (StatusCode::BAD_REQUEST, Json(ErrorResponse { error: e.to_string() }))
+    })?;
+    let state = engine.state.read();
+    let vault = state.vault(&addr).cloned().ok_or_else(|| {
+        (StatusCode::NOT_FOUND, Json(ErrorResponse { error: "account has no Sentinel vault".into() }))
+    })?;
+    Ok(Json(VaultResponse { address: addr.as_hex(), available: vault.available(), vault }))
 }
 
 async fn post_tx(
@@ -140,6 +166,7 @@ pub async fn serve(engine: Arc<ConsensusEngine>, addr: SocketAddr) {
     let app = Router::new()
         .route("/status",           get(get_status))
         .route("/account/:address", get(get_account))
+        .route("/vault/:address",   get(get_vault))
         .route("/tx",               post(post_tx))
         .layer(cors)
         .with_state(engine);

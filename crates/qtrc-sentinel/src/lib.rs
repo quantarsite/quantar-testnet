@@ -390,6 +390,17 @@ impl Vault {
         self.recovered_to.as_ref()
     }
 
+    /// Point the forwarding of an already recovered vault somewhere else.
+    /// Consensus uses it for path compression: when the vault this one
+    /// forwards to is itself recovered, every vault pointing at it is
+    /// redirected to the new destination, so forwarding is always a single
+    /// hop. No effect on a vault that is not recovered.
+    pub fn redirect_forward(&mut self, to: Address) {
+        if self.recovered_to.is_some() {
+            self.recovered_to = Some(to);
+        }
+    }
+
     /// Balance not locked by pending transfers.
     #[must_use]
     pub fn available(&self) -> u64 {

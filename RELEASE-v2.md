@@ -132,3 +132,32 @@ verdade é uma taxa mínima, que é decisão de economia do token.
   queimado); a carteira mostra os dois e avisa quando falta saldo para a taxa
 - Com a taxa, gerar volume custa: os 50 QTR do faucet dão para 5.000
   transferências, e o faucet entrega no máximo 5.000 QTR por hora
+
+## v2.1.0: HYDRA-X Sentinel (sem reset)
+
+Recuperação com compromisso em hash, transferências grandes com atraso e
+watchtower (crate `qtrc-sentinel`), ligado no consenso com altura de
+ativação. Detalhes em `crates/qtrc-sentinel/README.md`.
+
+Compatibilidade: transação comum continua com os mesmos bytes assinados,
+hash e assinatura; blocos antigos (0x01) são lidos; blocos sem operação
+Sentinel continuam sendo gravados em 0x01. O Sentinel liga no bloco
+seguinte ao primeiro start do binário novo (fica gravado no data dir).
+
+Deploy no droplet:
+
+1. Backup: `systemctl stop quantar-node quantar-faucet` e
+   `cp -a /var/lib/quantar /root/backup-quantar-$(date +%F)`
+2. `cd ~/quantar-testnet && git checkout main && git pull` e `cd ~/hx-mempool && git pull`
+3. `cargo build --release` e `install -m 755 target/release/qtrc-{node,faucet,wallet} /usr/local/bin/`
+4. nginx: copiar `deploy/nginx/testnet-rpc.locations` para `/etc/quantar/`
+   (nova rota `/rpc/vault/`, corpo até 512k), `nginx -t && systemctl reload nginx`
+5. `systemctl start quantar-node quantar-faucet` e
+   `journalctl -u quantar-node -n 30` mostra `sentinel_from_height`
+6. Confira: `curl https://testnet.quantarnetwork.com/rpc/status` com
+   `"version":"0.3.0"` e `sentinel_from_height`
+7. Release `v2.1.0` no GitHub para publicar a carteira nova
+
+Volta atrás: enquanto nenhum bloco tiver operação Sentinel, o binário
+anterior roda no mesmo data dir. Depois disso, só restaurando o backup.
+Release com `overflow-checks = true`: overflow aritmético para o node.

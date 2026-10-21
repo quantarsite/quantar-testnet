@@ -26,6 +26,8 @@ pub enum TxError {
     InsufficientBalance { need: u64, have: u64 },
     #[error("Invalid nonce: expected {expected}, got {got}")]
     InvalidNonce { expected: u64, got: u64 },
+    #[error("Sentinel: {0}")]
+    Sentinel(String),
 }
 
 /// Protocol fee per transaction, in micro-QTR: 0.01 QTR. It is burned
@@ -73,6 +75,12 @@ pub struct Transaction {
     pub timestamp: i64,
     /// HYDRA-X AND-composed signature over the canonical payload
     pub signature: HydraXSignature,
+    /// Signed operation payload. Empty for a plain transfer, which keeps
+    /// the signed bytes, the ID and the signature of every transaction
+    /// made before this field existed exactly as they were. Non-empty
+    /// carries a Sentinel operation (see `crate::sentinel`).
+    #[serde(default, with = "serde_bytes")]
+    pub data: Vec<u8>,
 }
 
 impl Transaction {
@@ -83,9 +91,22 @@ impl Transaction {
     ///   domain_prefix || nonce(8) || sender(32) || recipient(32) || value(16)
     ///   || fee_per_gas(8) || gas_limit(8) || data_len(8)
     pub fn signing_payload(from: &Address, to: &Address, amount: u64, nonce: u64) -> Vec<u8> {
+        Self::signing_payload_with_data(from, to, amount, nonce, &[])
+    }
+
+    /// Canonical payload including the `data` field, matching hx-mempool
+    /// `RawTransaction::signing_bytes()` (`data_len(8) || data` at the end).
+    /// With empty `data` it is byte-identical to [`Self::signing_payload`].
+    pub fn signing_payload_with_data(
+        from: &Address,
+        to: &Address,
+        amount: u64,
+        nonce: u64,
+        data: &[u8],
+    ) -> Vec<u8> {
         const GAS_LIMIT: u64 = 21_000;
         let prefix = signing_domain_prefix();
-        let mut buf = Vec::with_capacity(prefix.len() + 8 + 32 + 32 + 16 + 8 + 8 + 8);
+        let mut buf = Vec::with_capacity(prefix.len() + 8 + 32 + 32 + 16 + 8 + 8 + 8 + data.len());
         buf.extend_from_slice(&prefix);
         buf.extend_from_slice(&nonce.to_le_bytes());
         buf.extend_from_slice(&from.0);
@@ -93,8 +114,14 @@ impl Transaction {
         buf.extend_from_slice(&(amount as u128).to_le_bytes());
         buf.extend_from_slice(&0u64.to_le_bytes());       // fee_per_gas
         buf.extend_from_slice(&GAS_LIMIT.to_le_bytes()); // gas_limit
-        buf.extend_from_slice(&0u64.to_le_bytes());       // data_len
+        buf.extend_from_slice(&(data.len() as u64).to_le_bytes()); // data_len
+        buf.extend_from_slice(data);
         buf
+    }
+
+    /// The exact bytes the sender signed.
+    pub fn payload(&self) -> Vec<u8> {
+        Self::signing_payload_with_data(&self.from, &self.to, self.amount, self.nonce, &self.data)
     }
 
     /// Transaction ID: BLAKE3 of the signed payload.
@@ -105,7 +132,7 @@ impl Transaction {
     /// transaction (the malleability problem Bitcoin had before SegWit).
     /// It is the same hash hx-mempool computes from `signing_bytes()`.
     pub fn hash(&self) -> TxHash {
-        let payload = Self::signing_payload(&self.from, &self.to, self.amount, self.nonce);
+        let payload = self.payload();
         TxHash(*blake3::hash(&payload).as_bytes())
     }
 
@@ -115,7 +142,7 @@ impl Transaction {
     ///   1. Both ML-DSA-87 and SLH-DSA signatures are valid.
     ///   2. The signing key's derived address matches `self.from`.
     pub fn verify(&self) -> Result<(), TxError> {
-        let payload = Self::signing_payload(&self.from, &self.to, self.amount, self.nonce);
+        let payload = self.payload();
 
         // AND-composition check
         self.signature

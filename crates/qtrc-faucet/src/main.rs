@@ -159,6 +159,7 @@ async fn handle_faucet(
         nonce,
         timestamp: Utc::now().timestamp(),
         signature: state.keypair.sign(&payload),
+        data: vec![],
     };
 
     let resp = state

@@ -1,6 +1,6 @@
 # /etc/quantar/testnet-rpc.locations
 # Incluido no server 443 de testnet.quantarnetwork.com.
-# Expoe so tres rotas do node (127.0.0.1:8545), nada mais.
+# Expoe so estas rotas do node (127.0.0.1:8545), nada mais.
 
 location = /rpc/status {
     limit_req zone=qtr_read burst=20 nodelay;
@@ -18,11 +18,18 @@ location ~ "^/rpc/account/([0-9a-fA-F]{64})$" {
     proxy_pass http://127.0.0.1:8545/account/$1;
 }
 
+# Cofre Sentinel de uma conta (estado publico da chain)
+location ~ "^/rpc/vault/([0-9a-fA-F]{64})$" {
+    limit_req zone=qtr_read burst=20 nodelay;
+    proxy_pass http://127.0.0.1:8545/vault/$1;
+}
+
 location = /rpc/tx {
     limit_except POST { deny all; }
     limit_req zone=qtr_tx burst=5 nodelay;
     # Uma tx HYDRA-X em JSON tem ~132 KB: os bytes das assinaturas vao
-    # como lista de numeros. 256k cobre com folga.
-    client_max_body_size 256k;
+    # como lista de numeros. Um resgate Sentinel leva uma segunda
+    # assinatura no campo data (ate 48 KiB, ~200 KB em JSON): ~330 KB.
+    client_max_body_size 512k;
     proxy_pass http://127.0.0.1:8545/tx;
 }

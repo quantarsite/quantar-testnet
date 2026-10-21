@@ -13,6 +13,7 @@ path = "src/main.rs"
 
 [dependencies]
 qtrc-crypto.path      = "../qtrc-crypto"
+qtrc-sentinel.path    = "../qtrc-sentinel"
 qtrc-common.path      = "../qtrc-common"
 qtrc-consensus.path   = "../qtrc-consensus"
 

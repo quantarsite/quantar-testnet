@@ -9,7 +9,7 @@
 //!     || fee_per_gas(8) || gas_limit(8) || data_len(8) || data
 //!
 //!   `Transaction::signing_payload()` in qtrc-common uses the same layout
-//!   with fixed sentinels: fee_per_gas=0, gas_limit=21_000, data=[].
+//!   with fixed values fee_per_gas=0, gas_limit=21_000, and the tx's `data`.
 //!   This alignment ensures the pipeline's PqCryptoVerifier verifies the
 //!   same bytes that the client originally signed.
 
@@ -43,7 +43,9 @@ pub fn to_ingest_item(tx: &Transaction) -> Result<IngestItem, ConsensusError> {
         value: tx.amount as u128,
         fee_per_gas: 0,
         gas_limit: 21_000,
-        data: vec![],
+        // Signed payload: empty for plain transfers, a Sentinel operation
+        // otherwise. hx-mempool hashes and verifies it as part of the tx.
+        data: tx.data.clone(),
     };
 
     let sig = HxSig::new(
