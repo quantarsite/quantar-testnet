@@ -29,8 +29,10 @@
 //! `recover_at <= allowance_per_window` to veto on any untrusted outflow
 //! (the owner's own payments to untrusted addresses then count too).
 //!
-//! [`FLOOD_PENDING`] or more untrusted pending transfers are treated as
-//! hostile regardless of value: they exist to exhaust the queue.
+//! [`FLOOD_PENDING`] or more pending transfers, to any destination, are
+//! treated as hostile regardless of value: they exist to exhaust the
+//! queue. An owner who legitimately queues that many payments at once
+//! will trigger a recovery; batch them instead.
 //!
 //! Operations become final at exactly `unlock_height`, so the useful
 //! reaction window is `delay_blocks` minus inclusion latency. Findings are
@@ -40,7 +42,7 @@ use crate::{Hash, PendingKind, RecoveryProof, Vault, MAX_PENDING};
 use qtrc_crypto::Address;
 use std::cmp::Reverse;
 
-/// Untrusted pending transfers at or above this count trigger recovery.
+/// Pending transfers (any destination) at or above this count trigger recovery.
 pub const FLOOD_PENDING: usize = MAX_PENDING / 2;
 
 /// What the owner considers normal.
@@ -109,20 +111,17 @@ pub fn untrusted_total(vault: &Vault, policy: &WatchPolicy, height: u64) -> u64 
     pending.chain(settled).fold(0, u64::saturating_add)
 }
 
-fn untrusted_pending_count(vault: &Vault, policy: &WatchPolicy) -> usize {
-    vault
-        .pending()
-        .iter()
-        .filter(|p| matches!(&p.kind, PendingKind::Transfer { to, .. } if !policy.trusted.contains(to)))
-        .count()
+fn pending_transfer_count(vault: &Vault) -> usize {
+    vault.pending().iter().filter(|p| matches!(p.kind, PendingKind::Transfer { .. })).count()
 }
 
 /// Classify vault activity, most urgent first.
 #[must_use]
 pub fn inspect(vault: &Vault, policy: &WatchPolicy, height: u64) -> Vec<Finding> {
-    let escalate = untrusted_total(vault, policy, height) >= policy.recover_at
-        || untrusted_pending_count(vault, policy) >= FLOOD_PENDING;
+    let flood = pending_transfer_count(vault) >= FLOOD_PENDING;
+    let escalate = flood || untrusted_total(vault, policy, height) >= policy.recover_at;
     let untrusted = if escalate { Severity::Recover } else { Severity::Alert };
+    let trusted_sev = if flood { Severity::Recover } else { Severity::Info };
 
     let mut out: Vec<Finding> = vault
         .pending()
@@ -130,7 +129,7 @@ pub fn inspect(vault: &Vault, policy: &WatchPolicy, height: u64) -> Vec<Finding>
         .map(|p| {
             let (severity, reason) = match &p.kind {
                 PendingKind::Transfer { to, .. } if policy.trusted.contains(to) => {
-                    (Severity::Info, "transfer to trusted destination")
+                    (trusted_sev, if flood { "queue flood" } else { "transfer to trusted destination" })
                 }
                 PendingKind::Transfer { .. } => (untrusted, "transfer to unknown destination"),
                 PendingKind::RotateCommitment { new_commitment }
@@ -447,5 +446,17 @@ mod tests {
         let Action::Recovered { cause, .. } = tick(&mut v, &wpol(), &kit(), CHAIN, 12) else { panic!() };
         assert_eq!(cause.subject, Subject::Pending(id));
     }
-}
 
+    /// Regression R1: dust flooding toward a trusted address is caught too.
+    #[test]
+    fn trusted_dust_flood_is_vetoed() {
+        let mut v = Vault::new(me(), 10_000, Some(commit(&SALT)), Policy::new(100, 0).unwrap());
+        for i in 0..(FLOOD_PENDING as u64 - 1) {
+            v.transfer(10 + i, exchange(), 1).unwrap();
+        }
+        assert_eq!(tick(&mut v, &wpol(), &kit(), CHAIN, 50), Action::Idle);
+        v.transfer(60, exchange(), 1).unwrap();
+        let Action::Recovered { cause, .. } = tick(&mut v, &wpol(), &kit(), CHAIN, 61) else { panic!() };
+        assert_eq!(cause.reason, "queue flood");
+    }
+}

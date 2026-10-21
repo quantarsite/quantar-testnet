@@ -51,11 +51,18 @@
 //!   itself sends, **except recovery**: the recovery fee must be paid by
 //!   whoever submits it (owner's other wallet or watchtower), otherwise a
 //!   thief who reserves the whole balance blocks the recovery;
-//! * credits routed through [`Vault::credit`], forwarding **at most one
-//!   hop**: if the forward target is itself recovered, keep the credit
-//!   there instead of following the chain (two vaults pointing at each
-//!   other would otherwise loop);
-//! * [`Vault::validate`] on every state load;
+//! * before executing a recovery, [`ensure_recovery_target`] on the
+//!   `cold_dest` account: a recovery may not point at an already recovered
+//!   vault. Every forwarding edge then points at a vault with no outgoing
+//!   edge, so the forwarding graph can never contain a cycle;
+//! * credits routed through [`Vault::credit`]; when it returns
+//!   [`Credit::Forward`], resolve the final recipient with
+//!   [`resolve_forward`] (terminates because of the rule above, and is
+//!   capped at [`MAX_FORWARD_HOPS`] as a second line of defence);
+//! * [`Vault::validate`] on every state load. It checks internal
+//!   consistency only: the rotation `epoch` and the other fields must be
+//!   covered by the consensus state root, since nothing inside one vault
+//!   can tell a tampered epoch from a real one;
 //! * `overflow-checks = true` in release builds.
 //!
 //! `finalize` takes no authorization on purpose: once a time lock expires,
@@ -87,7 +94,14 @@ pub const MAX_RECENT: usize = 64;
 /// so watchtowers can see thefts carried out one transfer at a time.
 pub const HISTORY_WINDOWS: u64 = 4;
 /// Maximum finalized outflows remembered (oldest dropped first).
-pub const MAX_HISTORY: usize = 256;
+pub const MAX_HISTORY: usize = 512;
+/// Upper bound for [`resolve_forward`].
+pub const MAX_FORWARD_HOPS: usize = 64;
+
+// An attacker can finalize at most MAX_PENDING transfers per window. The
+// history must outlast that over its whole span, or a large theft could be
+// evicted by filler before the watchtower sees it.
+const _: () = assert!(MAX_HISTORY as u64 > MAX_PENDING as u64 * (HISTORY_WINDOWS + 1));
 
 /// Length-prefixed absorb, so `"ab"||"c"` and `"a"||"bc"` never collide.
 fn absorb(h: &mut Sha3_256, field: &[u8]) {
@@ -234,6 +248,10 @@ pub enum SentinelError {
     InvalidPolicy,
     #[error("cold_dest must differ from the account")]
     SelfRecovery,
+    #[error("cold_dest is an already recovered vault")]
+    DestinationRecovered,
+    #[error("credit forwarding exceeded the hop limit")]
+    ForwardLoop,
     #[error("vault state violates an invariant")]
     InvalidState,
     #[error("arithmetic overflow")]
@@ -274,11 +292,46 @@ pub struct Vault {
     commitment: Option<Hash>,
     pending: Vec<Pending>,
     recent: Vec<Outflow>,
+    #[serde(default)]
     finalized: Vec<Outflow>,
     recovered_to: Option<Address>,
     policy: Policy,
     next_id: u64,
+    #[serde(default)]
     epoch: u64,
+}
+
+/// Consensus check before any recovery: `cold_dest` must not be a vault
+/// that was already recovered. Pass the destination's vault, if it has one.
+///
+/// # Errors
+/// [`SentinelError::DestinationRecovered`].
+pub fn ensure_recovery_target(dest: Option<&Vault>) -> Result<(), SentinelError> {
+    if dest.is_some_and(Vault::is_recovered) {
+        Err(SentinelError::DestinationRecovered)
+    } else {
+        Ok(())
+    }
+}
+
+/// Follow forwarding from `start` to the account that finally holds a
+/// credit. `forward_of` returns the forward target of a recovered vault,
+/// or `None` for an account that keeps credits.
+///
+/// # Errors
+/// [`SentinelError::ForwardLoop`] after [`MAX_FORWARD_HOPS`] hops.
+pub fn resolve_forward(
+    start: &Address,
+    mut forward_of: impl FnMut(&Address) -> Option<Address>,
+) -> Result<Address, SentinelError> {
+    let mut at = start.clone();
+    for _ in 0..MAX_FORWARD_HOPS {
+        match forward_of(&at) {
+            Some(next) => at = next,
+            None => return Ok(at),
+        }
+    }
+    Err(SentinelError::ForwardLoop)
 }
 
 impl Vault {
@@ -452,8 +505,9 @@ impl Vault {
 
     /// Replace the recovery commitment. Delayed whenever a guardian already
     /// exists, so the current guardian can veto a hostile swap. A new
-    /// request replaces any rotation already pending and restarts the
-    /// delay. Repeated replacement means the main key is compromised; the
+    /// request for a different commitment replaces any rotation already
+    /// pending and restarts the delay; repeating the same request keeps
+    /// the original deadline. Repeated replacement means the main key is compromised; the
     /// correct response is recovery, which watchtowers do automatically
     /// for any rotation they were not told to expect.
     ///
@@ -464,6 +518,13 @@ impl Vault {
         if self.commitment.is_none() {
             self.commitment = Some(new_commitment);
             return Ok(Outcome::CommitmentSet);
+        }
+        // Re-requesting the rotation already pending is a no-op, so nobody
+        // can push its deadline back by repeating it.
+        if let Some(p) = self.pending.iter().find(|p| {
+            matches!(&p.kind, PendingKind::RotateCommitment { new_commitment: c } if *c == new_commitment)
+        }) {
+            return Ok(Outcome::Queued { id: p.id, unlock_height: p.unlock_height });
         }
         // The rotation has its own slot, outside MAX_PENDING.
         let unlock_height = self.next_unlock(height)?;
@@ -1150,6 +1211,67 @@ mod tests {
             }
         }
         assert!(recoveries > 20, "only {recoveries} recoveries exercised");
+    }
+
+    // ---- audit round 3 ----------------------------------------------------
+
+    /// Regression R6: two vaults cannot end up forwarding to each other,
+    /// and forwarding chains resolve to the final holder.
+    #[test]
+    fn forwarding_graph_stays_acyclic() {
+        let b = Address([5u8; 32]);
+        let cb = recovery_commitment(CHAIN, &b, &rec_key(), &me(), &SALT);
+        let va = vault();
+        let mut vb = Vault::new(b.clone(), 1_000, Some(cb), policy());
+        let pb = MockProof::sign(&rec_key(), &recovery_message(CHAIN, &b, &cb, 0));
+
+        // A recovers into B (B still active): allowed.
+        let ca_cold = recovery_commitment(CHAIN, &me(), &rec_key(), &b, &SALT);
+        let mut va2 = Vault::new(me(), 1_000, Some(ca_cold), policy());
+        ensure_recovery_target(Some(&vb)).unwrap();
+        va2.recover(CHAIN, &b, &SALT, &proof_for(&ca_cold, 0)).unwrap();
+
+        // B now wants to recover into A, which is recovered: rejected.
+        assert_eq!(ensure_recovery_target(Some(&va2)), Err(SentinelError::DestinationRecovered));
+        // Into a plain active account it is fine.
+        ensure_recovery_target(Some(&va)).unwrap();
+        ensure_recovery_target(None).unwrap();
+        vb.recover(CHAIN, &me(), &SALT, &pb).unwrap();
+
+        // A credit to va2 forwards to B, which forwards to `me`'s address
+        // (here an active account): the resolver follows to the end.
+        let fwd = |a: &Address| -> Option<Address> {
+            if *a == me() { None } else if *a == b { Some(me()) } else { None }
+        };
+        assert_eq!(resolve_forward(&b, fwd).unwrap(), me());
+        let looping = |a: &Address| -> Option<Address> { Some(if *a == me() { b.clone() } else { me() }) };
+        assert_eq!(resolve_forward(&me(), looping), Err(SentinelError::ForwardLoop));
+    }
+
+    /// Regression R2: repeating the pending rotation cannot delay it.
+    #[test]
+    fn repeated_rotation_keeps_deadline() {
+        let mut v = vault();
+        let mine = commit(&[3u8; 32]);
+        let (id, unlock) = queued(v.request_rotation(10, mine).unwrap());
+        for h in [50, 100, 109] {
+            assert_eq!(queued(v.request_rotation(h, mine).unwrap()), (id, unlock));
+        }
+        v.finalize(unlock, id).unwrap();
+        assert_eq!(v.epoch(), 1);
+    }
+
+    /// R3: state written before `finalized`/`epoch` existed still loads.
+    #[test]
+    fn old_state_without_history_fields_loads() {
+        let v = vault();
+        let mut json: serde_json::Value = serde_json::to_value(&v).unwrap();
+        let obj = json.as_object_mut().unwrap();
+        obj.remove("finalized");
+        obj.remove("epoch");
+        let back: Vault = serde_json::from_value(json).unwrap();
+        back.validate().unwrap();
+        assert_eq!(back.epoch(), 0);
     }
 
     // ---- real HYDRA-X -----------------------------------------------------
