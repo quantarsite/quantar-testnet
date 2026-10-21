@@ -47,8 +47,15 @@ Timing: an operation can finalize at exactly `unlock_height`, so the useful reac
 
 ## Status
 
-Library only, not wired into consensus. Integration requirements are in the crate docs (`src/lib.rs`, "Integration notes"): new transaction types, recovery fee paid by the submitter, `ensure_recovery_target` before recovery, `resolve_forward` for credits, `validate` on every state load, vault state under the state root. It changes state layout, so it needs a testnet reset or an activation height. `finalize` is intentionally permissionless.
+Wired into consensus (`qtrc-common::state`, `qtrc-consensus`, `qtrc-node`, `qtrc-wallet`):
 
-`overflow-checks = true` applies to the whole workspace: arithmetic overflow anywhere now stops the node instead of wrapping.
+* Operations travel in the transaction's signed `data` field (`QSN1 || bincode(op)`), so plain transfers keep the exact signed bytes, IDs and signatures they had before, and hx-mempool verifies them unchanged.
+* Activation height stored once per data directory, like the fee: block 1 on a new chain, the next block on an existing one. Earlier blocks replay unchanged.
+* Blocks are stored as format `0x02`; format `0x01` blocks (pre-Sentinel) are still read, tested against a block written by the previous release.
+* `apply_tx` is all-or-nothing (journal + rollback). Finalize and Recover are paid by the submitter. Recovery into a recovered vault is refused; credits follow forwarding to the final holder.
+* RPC: `GET /vault/:address`; `/status` reports `sentinel_from_height`.
+* Wallet: `guardian setup|rotate`, `vault`, `finalize`, `recover --kit [--recovery-key]`.
 
-`cargo test -p qtrc-sentinel`: 67 tests, including regression tests for every confirmed finding of three audit rounds, two randomized invariant tests (one with recoveries and post-recovery credits), and end-to-end recovery with real HYDRA-X keys.
+`finalize` is intentionally permissionless. There is no policy-change API; if one is added it must be time-locked too.
+
+`cargo test -p qtrc-sentinel`: 67 tests, including regression tests for every confirmed finding of three audit rounds, two randomized invariant tests, and end-to-end recovery with real HYDRA-X keys. `cargo test -p qtrc-consensus --test sentinel`: the full flow through mempool and blocks.

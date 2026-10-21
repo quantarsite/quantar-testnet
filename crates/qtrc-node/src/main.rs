@@ -169,6 +169,11 @@ async fn cmd_start(rpc_addr: String, data_dir: String, key_file: Option<String>)
 
     let mut init_state = genesis.initial_state();
     init_state.fee_from_height = store.fee_from_height()?;
+    init_state.sentinel_from_height = store.sentinel_from_height()?;
+    info!(
+        sentinel_from_height = init_state.sentinel_from_height,
+        "Sentinel operations accepted from this height"
+    );
     info!(
         fee_from_height = init_state.fee_from_height,
         fee_micro_qtr = qtrc_common::tx::TX_FEE,

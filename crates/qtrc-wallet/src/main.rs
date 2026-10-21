@@ -14,6 +14,13 @@
 //! qtrc-wallet send <TO> <AMOUNT>      send QTR (amount in QTR, e.g. 12.5;
 //!                                     a 0.01 QTR network fee is burned)
 //! qtrc-wallet status                  show the network status
+//!
+//! Sentinel (recovery + delayed large transfers):
+//! qtrc-wallet guardian setup --cold <ADDR>   protect this account
+//! qtrc-wallet guardian rotate --cold <ADDR>  replace the recovery key (delayed)
+//! qtrc-wallet vault [ADDRESS]                show a vault and its queue
+//! qtrc-wallet finalize <ACCOUNT> <ID>        settle a matured queued operation
+//! qtrc-wallet recover <ACCOUNT> --kit <FILE> send a guarded account to its cold address
 //! ```
 //!
 //! Testnet only: the key file is stored unencrypted (owner-only permissions on
@@ -22,6 +29,7 @@
 use anyhow::{anyhow, bail, Context, Result};
 use clap::{Parser, Subcommand};
 use qtrc_common::genesis::MICRO_QTR;
+use qtrc_common::sentinel::SentinelOp;
 use qtrc_common::tx::{Transaction, CHAIN_ID};
 use qtrc_crypto::{Address, HydraXKeypair};
 use reqwest::blocking::Client;
@@ -71,6 +79,52 @@ enum Command {
     Send { to: String, amount: String },
     /// Show the network status
     Status,
+    /// Sentinel guardian: recovery key and delayed large transfers
+    #[command(subcommand)]
+    Guardian(GuardianCmd),
+    /// Show the Sentinel vault of your account, or of any address
+    Vault { address: Option<String> },
+    /// Settle a queued operation whose delay has passed (anyone can; you pay the fee)
+    Finalize { account: String, id: u64 },
+    /// Recover a guarded account to its committed cold address (you pay the fee)
+    Recover {
+        /// The guarded account
+        account: String,
+        /// Recovery kit written by `guardian setup` / `guardian rotate`
+        #[arg(long)]
+        kit: PathBuf,
+        /// Recovery key file: sign now instead of using the kit's pre-made
+        /// signature (needed after a rotation the kit predates)
+        #[arg(long)]
+        recovery_key: Option<PathBuf>,
+    },
+}
+
+#[derive(Subcommand, Debug)]
+enum GuardianCmd {
+    /// Protect this account: create a recovery key, commit to it and to a
+    /// cold address, and turn on delayed large transfers
+    Setup {
+        /// Where a recovery sends everything. Use a fresh, never-used address
+        #[arg(long)]
+        cold: String,
+        /// Blocks a large transfer waits (5 s per block; 720 = 1 hour)
+        #[arg(long, default_value_t = 720)]
+        delay: u64,
+        /// QTR that may leave without delay per window of `delay` blocks
+        #[arg(long, default_value = "100")]
+        allowance: String,
+        /// Where to write the new recovery key (default: next to the wallet)
+        #[arg(long)]
+        out: Option<PathBuf>,
+    },
+    /// Replace the recovery key and cold address. Takes effect after the delay
+    Rotate {
+        #[arg(long)]
+        cold: String,
+        #[arg(long)]
+        out: Option<PathBuf>,
+    },
 }
 
 fn main() {
@@ -106,6 +160,28 @@ fn run(cli: Cli) -> Result<()> {
             Ok(())
         }
         Command::Send { to, amount } => cmd_send(&http, rpc, &key_path, &to, &amount),
+        Command::Guardian(GuardianCmd::Setup { cold, delay, allowance, out }) => {
+            cmd_guardian(&http, rpc, &key_path, &cold, Some((delay, &allowance)), out)
+        }
+        Command::Guardian(GuardianCmd::Rotate { cold, out }) => cmd_guardian(&http, rpc, &key_path, &cold, None, out),
+        Command::Vault { address } => {
+            let addr = match address {
+                Some(a) => parse_address(&a)?,
+                None => load_wallet(&key_path)?.address(),
+            };
+            cmd_vault(&http, rpc, &addr)
+        }
+        Command::Finalize { account, id } => {
+            let target = parse_address(&account)?;
+            let op = SentinelOp::Finalize { id };
+            let body = submit(&http, rpc, &load_wallet(&key_path)?, &target, 0, op.encode())?;
+            println!("Finalize of operation {id} on {} submitted.", target.as_hex());
+            println!("tx: {}", body["tx_hash"].as_str().unwrap_or("?"));
+            Ok(())
+        }
+        Command::Recover { account, kit, recovery_key } => {
+            cmd_recover(&http, rpc, &key_path, &account, &kit, recovery_key.as_ref())
+        }
         Command::Status => {
             let s = get_json(&http, &format!("{rpc}/status"))?;
             println!("network : {}", s["chain_id"].as_str().unwrap_or("?"));
@@ -213,19 +289,63 @@ fn cmd_send(http: &Client, rpc: &str, key_path: &PathBuf, to: &str, amount: &str
             format_qtr(micro)
         );
     }
+    let vault = get_json(http, &format!("{rpc}/vault/{}", from.as_hex())).ok();
+    if let Some(v) = &vault {
+        let available = v["available"].as_u64().unwrap_or(0);
+        if available < total {
+            bail!(
+                "not enough unlocked QTR: {} available ({} locked by queued transfers)",
+                format_qtr(available),
+                format_qtr(v["vault"]["reserved"].as_u64().unwrap_or(0))
+            );
+        }
+    }
+
+    let body = submit(http, rpc, &wallet, &to, micro, Vec::new())?;
+
+    if let Some(v) = &vault {
+        let delay = v["vault"]["policy"]["delay_blocks"].as_u64().unwrap_or(0);
+        println!("Submitted {} QTR to {}", format_qtr(micro), to.as_hex());
+        println!(
+            "This account is guarded: within the allowance it leaves with the next block; above it, it waits {delay} blocks and then anyone can finalize it. Check with `qtrc-wallet vault`."
+        );
+    } else {
+        println!("Sent {} QTR to {}", format_qtr(micro), to.as_hex());
+    }
+    if fee > 0 {
+        println!("fee: {} QTR (burned)", format_qtr(fee));
+    }
+    println!("tx: {}", body["tx_hash"].as_str().unwrap_or("?"));
+    println!("Signed with ML-DSA-87 AND SLH-DSA-SHA2-256s.");
+    Ok(())
+}
+
+/// Sign and submit a transaction with the next nonce. Checks the network first.
+fn submit(http: &Client, rpc: &str, wallet: &HydraXKeypair, to: &Address, amount: u64, data: Vec<u8>) -> Result<Value> {
+    let status = get_json(http, &format!("{rpc}/status"))?;
+    let network = status["chain_id"].as_str().unwrap_or_default();
+    if network != CHAIN_ID {
+        bail!("node is on {network}, this wallet signs for {CHAIN_ID}. Update the wallet.");
+    }
+    if !data.is_empty() && status["sentinel_from_height"].is_null() {
+        bail!("this node does not support Sentinel yet");
+    }
+    let from = wallet.address();
+    let acct = get_json(http, &format!("{rpc}/account/{}", from.as_hex()))?;
     let nonce = acct["next_nonce"]
         .as_u64()
         .or_else(|| acct["nonce"].as_u64())
         .ok_or_else(|| anyhow!("node did not return a nonce"))?;
 
-    let payload = Transaction::signing_payload(&from, &to, micro, nonce);
+    let payload = Transaction::signing_payload_with_data(&from, to, amount, nonce, &data);
     let tx = Transaction {
         from,
         to: to.clone(),
-        amount: micro,
+        amount,
         nonce,
         timestamp: chrono::Utc::now().timestamp(),
         signature: wallet.sign(&payload),
+        data,
     };
     // Never send something the node would reject for our own mistake.
     tx.verify().map_err(|e| anyhow!("local signature check failed: {e}"))?;
@@ -236,13 +356,191 @@ fn cmd_send(http: &Client, rpc: &str, key_path: &PathBuf, to: &str, amount: &str
     if !ok {
         bail!("node rejected the transaction: {}", body["error"].as_str().unwrap_or("unknown error"));
     }
+    Ok(body)
+}
 
-    println!("Sent {} QTR to {}", format_qtr(micro), to.as_hex());
-    if fee > 0 {
-        println!("fee: {} QTR (burned)", format_qtr(fee));
+/// Everything needed to recover an account, written next to the wallet.
+/// It contains a ready-made recovery signature: whoever holds this file can
+/// force a recovery (funds still only go to `cold_dest`). Keep it private.
+#[derive(serde::Serialize, serde::Deserialize)]
+struct RecoveryKitFile {
+    chain_id:  String,
+    account:   String,
+    cold_dest: String,
+    salt:      String,
+    /// Guardian epoch the signature is valid for
+    epoch:     u64,
+    /// Pre-made recovery signature (for you or a watchtower)
+    proof:     qtrc_crypto::HydraXSignature,
+}
+
+fn cmd_guardian(
+    http: &Client,
+    rpc: &str,
+    key_path: &PathBuf,
+    cold: &str,
+    setup: Option<(u64, &str)>,
+    out: Option<PathBuf>,
+) -> Result<()> {
+    let wallet = load_wallet(key_path)?;
+    let account = wallet.address();
+    let cold = parse_address(cold)?;
+    if cold == account {
+        bail!("the cold address must be a different account");
     }
+    let vault = get_json(http, &format!("{rpc}/vault/{}", account.as_hex())).ok();
+    match (&setup, &vault) {
+        (Some(_), Some(_)) => bail!("this account already has a guardian; use `guardian rotate`"),
+        (None, None) => bail!("this account has no guardian yet; use `guardian setup`"),
+        _ => {}
+    }
+    if get_json(http, &format!("{rpc}/vault/{}", cold.as_hex())).is_ok() {
+        bail!("the cold address has its own vault; use a plain, never-used address");
+    }
+
+    let dir = key_path.parent().map(PathBuf::from).unwrap_or_default();
+    let stamp = chrono::Utc::now().format("%Y%m%d%H%M%S");
+    let rec_path = out.unwrap_or_else(|| dir.join(format!("recovery-{stamp}.key")));
+    let kit_path = rec_path.with_extension("kit.json");
+
+    let recovery = HydraXKeypair::generate();
+    let mut salt = [0u8; 32];
+    rand::RngCore::fill_bytes(&mut rand::rngs::OsRng, &mut salt);
+    let commitment = qtrc_sentinel::recovery_commitment(
+        CHAIN_ID.as_bytes(),
+        &account,
+        &recovery.address(),
+        &cold,
+        &salt,
+    );
+    // Epoch the new commitment will be under: 0 for a first setup, one more
+    // than now for a rotation (it only applies once finalized).
+    let epoch = match &vault {
+        Some(v) => v["vault"]["epoch"].as_u64().unwrap_or(0) + 1,
+        None => 0,
+    };
+    let proof = recovery.sign(&qtrc_sentinel::recovery_message(CHAIN_ID.as_bytes(), &account, &commitment, epoch));
+
+    // Write the secrets before anything goes on chain.
+    write_secret_file(&rec_path, &recovery.to_bytes())?;
+    let kit = RecoveryKitFile {
+        chain_id: CHAIN_ID.into(),
+        account: account.as_hex(),
+        cold_dest: cold.as_hex(),
+        salt: hex::encode(salt),
+        epoch,
+        proof,
+    };
+    write_secret_file(&kit_path, &serde_json::to_vec_pretty(&kit)?)?;
+
+    let op = match setup {
+        Some((delay, allowance)) => SentinelOp::SetGuardian {
+            commitment,
+            delay_blocks: delay,
+            allowance_per_window: parse_qtr(allowance)?,
+        },
+        None => SentinelOp::RotateGuardian { commitment },
+    };
+    let body = submit(http, rpc, &wallet, &account, 0, op.encode())?;
+
+    match setup {
+        Some((delay, allowance)) => {
+            println!("Guardian set up for {}.", account.as_hex());
+            println!("Up to {allowance} QTR per {delay} blocks leaves at once; anything above waits {delay} blocks.");
+        }
+        None => println!("Rotation queued. It takes effect after the delay; until then the old kit still works."),
+    }
+    println!();
+    println!("Recovery key : {}", rec_path.display());
+    println!("Recovery kit : {}", kit_path.display());
+    println!("Cold address : {}", cold.as_hex());
+    println!();
+    println!("Move the recovery key OFF this computer (USB drive, paper backup).");
+    println!("The kit can force a recovery to the cold address: keep it private.");
     println!("tx: {}", body["tx_hash"].as_str().unwrap_or("?"));
-    println!("Signed with ML-DSA-87 AND SLH-DSA-SHA2-256s.");
+    Ok(())
+}
+
+fn cmd_vault(http: &Client, rpc: &str, addr: &Address) -> Result<()> {
+    let r = get_json(http, &format!("{rpc}/vault/{}", addr.as_hex()))?;
+    let v = &r["vault"];
+    let height = get_json(http, &format!("{rpc}/status"))?["height"].as_u64().unwrap_or(0);
+    println!("account   : {}", addr.as_hex());
+    if let Some(to) = v["recovered_to"].as_str() {
+        println!("status    : RECOVERED, everything forwards to {to}");
+        return Ok(());
+    }
+    println!("balance   : {} QTR", format_qtr(v["balance"].as_u64().unwrap_or(0)));
+    println!("available : {} QTR", format_qtr(r["available"].as_u64().unwrap_or(0)));
+    println!("locked    : {} QTR", format_qtr(v["reserved"].as_u64().unwrap_or(0)));
+    println!(
+        "policy    : {} QTR per {} blocks without delay",
+        format_qtr(v["policy"]["allowance_per_window"].as_u64().unwrap_or(0)),
+        v["policy"]["delay_blocks"]
+    );
+    println!("epoch     : {}", v["epoch"]);
+    let pending = v["pending"].as_array().cloned().unwrap_or_default();
+    if pending.is_empty() {
+        println!("queue     : empty");
+    }
+    for p in pending {
+        let unlock = p["unlock_height"].as_u64().unwrap_or(0);
+        let when = if height >= unlock { "ready to finalize".to_string() } else { format!("{} blocks left", unlock - height) };
+        let what = if let Some(t) = p["kind"].get("Transfer") {
+            format!("send {} QTR to {}", format_qtr(t["amount"].as_u64().unwrap_or(0)), t["to"].as_str().unwrap_or("?"))
+        } else {
+            "replace recovery key".to_string()
+        };
+        println!("  #{} {what} ({when})", p["id"]);
+    }
+    Ok(())
+}
+
+fn cmd_recover(
+    http: &Client,
+    rpc: &str,
+    key_path: &PathBuf,
+    account: &str,
+    kit_path: &PathBuf,
+    recovery_key: Option<&PathBuf>,
+) -> Result<()> {
+    let target = parse_address(account)?;
+    let kit: RecoveryKitFile = serde_json::from_slice(
+        &std::fs::read(kit_path).with_context(|| format!("cannot read {}", kit_path.display()))?,
+    )
+    .context("invalid kit file")?;
+    if kit.account != target.as_hex() {
+        bail!("this kit belongs to account {}, not {}", kit.account, target.as_hex());
+    }
+    let cold = parse_address(&kit.cold_dest)?;
+    let salt: [u8; 32] = hex::decode(&kit.salt)
+        .ok()
+        .and_then(|b| b.try_into().ok())
+        .ok_or_else(|| anyhow!("invalid salt in kit"))?;
+
+    let r = get_json(http, &format!("{rpc}/vault/{}", target.as_hex()))?;
+    let epoch = r["vault"]["epoch"].as_u64().unwrap_or(0);
+    let commitment: [u8; 32] = serde_json::from_value(r["vault"]["commitment"].clone())
+        .ok()
+        .flatten()
+        .ok_or_else(|| anyhow!("the account has no active guardian"))?;
+
+    let proof = match recovery_key {
+        Some(path) => {
+            let rec = load_wallet(path)?;
+            rec.sign(&qtrc_sentinel::recovery_message(CHAIN_ID.as_bytes(), &target, &commitment, epoch))
+        }
+        None => {
+            if kit.epoch != epoch {
+                bail!("this kit is for epoch {}, the vault is at {epoch}; pass --recovery-key to sign now", kit.epoch);
+            }
+            kit.proof
+        }
+    };
+    let op = SentinelOp::Recover { cold_dest: cold.clone(), salt, proof: Box::new(proof) };
+    let body = submit(http, rpc, &load_wallet(key_path)?, &target, 0, op.encode())?;
+    println!("Recovery submitted: everything in {} goes to {}.", target.as_hex(), cold.as_hex());
+    println!("tx: {}", body["tx_hash"].as_str().unwrap_or("?"));
     Ok(())
 }
 

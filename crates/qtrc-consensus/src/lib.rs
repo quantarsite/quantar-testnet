@@ -187,7 +187,27 @@ impl ConsensusEngine {
         }
         let (balance, fee) = {
             let st = self.state.read();
-            (st.account(&tx.from).balance, st.fee_at(st.height + 1))
+            let next = st.height + 1;
+            // Sentinel operations: refuse garbage and early use here, before
+            // they cost a HYDRA-X verification. Full checks run at apply.
+            if !tx.data.is_empty() {
+                if !st.sentinel_active_at(next) {
+                    return Err(ConsensusError::InvalidTx(format!(
+                        "Sentinel is not active before block {}",
+                        st.sentinel_from_height
+                    )));
+                }
+                let op = qtrc_common::sentinel::SentinelOp::decode(&tx.data)
+                    .map_err(ConsensusError::InvalidTx)?;
+                if tx.amount != 0 {
+                    return Err(ConsensusError::InvalidTx("Sentinel operation must carry amount 0".into()));
+                }
+                if op.is_owner_op() && tx.to != tx.from {
+                    return Err(ConsensusError::InvalidTx("guardian operations must be sent to yourself".into()));
+                }
+            }
+            // A guarded account can only spend what is not reserved.
+            (st.spendable(&tx.from), st.fee_at(next))
         };
         // Every pending tx and this one each pay the fee on top of the amount.
         let needed = pending_out
