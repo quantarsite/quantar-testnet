@@ -147,9 +147,8 @@ fn stolen_key_drain_is_stopped_by_recovery() {
     assert_eq!(net.balance(&g.cold), expected + 5 * MICRO_QTR);
     assert_eq!(net.balance(&owner), 0);
 
-    // The thief cannot finalize the cancelled transfer.
-    net.submit(tx(&rescuer, &owner, 0, 1, SentinelOp::Finalize { id: 0 }.encode())).unwrap();
-    assert!(net.mine().is_err(), "invalid finalize is dropped, block has nothing else");
+    // The cancelled transfer cannot be finalized: refused at admission.
+    assert!(net.submit(tx(&rescuer, &owner, 0, 1, SentinelOp::Finalize { id: 0 }.encode())).is_err());
 }
 
 #[test]
@@ -164,17 +163,19 @@ fn queued_transfer_settles_after_delay_and_anyone_can_finalize() {
     let queued_at = net.height();
     assert_eq!(net.balance(&shop), 0);
 
-    // Too early: the finalize is dropped.
+    // Too early: included, pays the fee, changes nothing else.
     let stranger = HydraXKeypair::generate();
     net.fund(&stranger.address(), 1);
     net.mine().unwrap();
     net.submit(tx(&stranger, &owner, 0, 0, SentinelOp::Finalize { id: 0 }.encode())).unwrap();
-    assert!(net.mine().is_err());
+    net.mine().unwrap();
+    assert_eq!(net.balance(&shop), 0);
+    assert_eq!(net.balance(&stranger.address()), MICRO_QTR - TX_FEE, "a failed operation still pays");
 
     while net.height() + 1 < queued_at + DELAY {
         net.advance(1);
     }
-    net.submit(tx(&stranger, &owner, 0, 0, SentinelOp::Finalize { id: 0 }.encode())).unwrap();
+    net.submit(tx(&stranger, &owner, 0, 1, SentinelOp::Finalize { id: 0 }.encode())).unwrap();
     net.mine().unwrap();
     assert_eq!(net.balance(&shop), 400 * MICRO_QTR);
     assert_eq!(net.engine.state.read().vault(&owner).unwrap().reserved(), 0);
@@ -206,10 +207,17 @@ fn invalid_operations_are_refused() {
     assert!(net.submit(tx(&g.owner, &owner, 5, net.nonce(&owner), rot.clone())).is_err());
     assert!(net.submit(tx(&g.owner, &other, 0, net.nonce(&owner), rot)).is_err());
 
-    // Second SetGuardian on the same account is dropped at apply.
+    // Operations that could not apply are refused at admission.
     let again = SentinelOp::SetGuardian { commitment: [2; 32], delay_blocks: DELAY, allowance_per_window: 0 };
-    net.submit(tx(&g.owner, &owner, 0, net.nonce(&owner), again.encode())).unwrap();
-    assert!(net.mine().is_err());
+    assert!(net.submit(tx(&g.owner, &owner, 0, net.nonce(&owner), again.encode())).is_err());
+    let bad_policy = SentinelOp::SetGuardian { commitment: [2; 32], delay_blocks: 0, allowance_per_window: 0 };
+    let fresh = HydraXKeypair::generate();
+    net.fund(&fresh.address(), 1);
+    net.mine().unwrap();
+    assert!(net.submit(tx(&fresh, &fresh.address(), 0, 0, bad_policy.encode())).is_err());
+    let no_vault = SentinelOp::RotateGuardian { commitment: [3; 32] };
+    assert!(net.submit(tx(&fresh, &fresh.address(), 0, 0, no_vault.encode())).is_err());
+    assert!(net.submit(tx(&fresh, &other, 0, 0, SentinelOp::Finalize { id: 0 }.encode())).is_err());
 
     // Recovery into the account itself, and with a forged destination.
     let mut bad = recover_op(&g, 0);
@@ -219,8 +227,7 @@ fn invalid_operations_are_refused() {
     let r = HydraXKeypair::generate();
     net.fund(&r.address(), 1);
     net.mine().unwrap();
-    net.submit(tx(&r, &owner, 0, 0, bad)).unwrap();
-    assert!(net.mine().is_err(), "redirected recovery must fail");
+    assert!(net.submit(tx(&r, &owner, 0, 0, bad)).is_err(), "redirected recovery is refused");
     assert!(net.engine.state.read().vault(&owner).unwrap().commitment().is_some());
 }
 
@@ -269,18 +276,124 @@ fn sentinel_activates_at_height_and_replays_identically() {
 }
 
 #[test]
-fn failed_operation_leaves_state_untouched() {
+fn failed_operation_pays_and_rolls_back_its_effects() {
     let mut net = Net::new(|_| {});
     let g = guarded(&mut net, 100);
     let owner = g.owner.address();
     let r = HydraXKeypair::generate();
     net.fund(&r.address(), 1);
     net.mine().unwrap();
-    let before = serde_json::to_value(&*net.engine.state.read()).unwrap();
-    // Recovery with a valid signature for the wrong epoch: the submitter's
-    // fee and nonce are applied first, then the op fails. Nothing may stick.
-    let mut scratch = net.engine.state.read().clone();
+    let before = net.engine.state.read().clone();
+    // Valid signature for the wrong epoch: fee and nonce are charged, the
+    // recovery itself has no effect.
+    let mut st = before.clone();
     let t = tx(&r, &owner, 0, 0, recover_op(&g, 5));
-    assert!(scratch.apply_tx(&t).is_err());
-    assert_eq!(serde_json::to_value(&scratch).unwrap(), before);
+    st.apply_tx(&t).unwrap();
+    assert_eq!(st.account(&r.address()).balance, MICRO_QTR - TX_FEE);
+    assert_eq!(st.account(&r.address()).nonce, 1);
+    assert_eq!(st.burned, before.burned + TX_FEE);
+    assert_eq!(
+        serde_json::to_value(&st.vaults).unwrap(),
+        serde_json::to_value(&before.vaults).unwrap(),
+        "vault untouched"
+    );
+    assert_eq!(st.account(&owner), before.account(&owner));
+    // The same tx cannot be replayed (nonce consumed).
+    assert!(st.apply_tx(&t).is_err());
+}
+
+/// Regression D1: an operation that passes admission but fails in the
+/// block is not free. Two finalizes of the same id in one block: the
+/// second fails and still pays.
+#[test]
+fn racing_operations_pay_even_when_they_lose() {
+    let mut net = Net::new(|_| {});
+    let g = guarded(&mut net, 1_000);
+    let owner = g.owner.address();
+    let shop = HydraXKeypair::generate().address();
+    net.submit(tx(&g.owner, &shop, 400 * MICRO_QTR, net.nonce(&owner), vec![])).unwrap();
+    net.mine().unwrap();
+    let unlock = net.height() + DELAY;
+    let (a, b) = (HydraXKeypair::generate(), HydraXKeypair::generate());
+    net.fund(&a.address(), 1);
+    net.fund(&b.address(), 1);
+    net.mine().unwrap();
+    while net.height() + 1 < unlock {
+        net.advance(1);
+    }
+    net.submit(tx(&a, &owner, 0, 0, SentinelOp::Finalize { id: 0 }.encode())).unwrap();
+    net.submit(tx(&b, &owner, 0, 0, SentinelOp::Finalize { id: 0 }.encode())).unwrap();
+    let block = net.mine().unwrap();
+    assert_eq!(block.transactions.len(), 2, "the losing finalize is included");
+    assert_eq!(net.balance(&shop), 400 * MICRO_QTR, "paid once");
+    assert_eq!(net.balance(&b.address()), MICRO_QTR - TX_FEE, "the loser paid its fee");
+}
+
+/// Regression A1: the guarded account can submit its own recovery even when
+/// a thief has locked every unlocked micro-QTR; the fee comes out of the
+/// recovered amount.
+#[test]
+fn self_recovery_works_with_nothing_unlocked() {
+    let mut net = Net::new(|_| {});
+    let g = guarded(&mut net, 1_000);
+    let owner = g.owner.address();
+    let thief = HydraXKeypair::generate().address();
+    let avail = net.engine.state.read().spendable(&owner);
+    // Thief: spend the allowance, then queue everything else.
+    net.submit(tx(&g.owner, &thief, ALLOWANCE, net.nonce(&owner), vec![])).unwrap();
+    net.submit(tx(&g.owner, &thief, avail - ALLOWANCE - 2 * TX_FEE, net.nonce(&owner), vec![])).unwrap();
+    net.mine().unwrap();
+    assert_eq!(net.engine.state.read().spendable(&owner), 0);
+    let total = net.balance(&owner);
+
+    net.submit(tx(&g.owner, &owner, 0, net.nonce(&owner), recover_op(&g, 0))).unwrap();
+    net.mine().unwrap();
+    assert_eq!(net.balance(&g.cold), total - TX_FEE);
+    assert_eq!(net.balance(&thief), ALLOWANCE);
+}
+
+/// Regression M2: forwarding never grows into a chain.
+#[test]
+fn forwarding_is_compressed_to_one_hop() {
+    let mut net = Net::new(|_| {});
+    // B is a guarded account whose own cold address is C.
+    let b = guarded(&mut net, 10);
+    let rescuer = HydraXKeypair::generate();
+    net.fund(&rescuer.address(), 1);
+    net.mine().unwrap();
+
+    // A2 is guarded with B as its cold address. A2 recovers into B
+    // (allowed: B is active), then B recovers into C.
+    let a2 = HydraXKeypair::generate();
+    let rec2 = HydraXKeypair::generate();
+    net.fund(&a2.address(), 10);
+    net.mine().unwrap();
+    let c2 = recovery_commitment(CHAIN_ID.as_bytes(), &a2.address(), &rec2.address(), &b.owner.address(), &SALT);
+    let set = SentinelOp::SetGuardian { commitment: c2, delay_blocks: DELAY, allowance_per_window: 0 };
+    net.submit(tx(&a2, &a2.address(), 0, 0, set.encode())).unwrap();
+    net.mine().unwrap();
+    let msg = recovery_message(CHAIN_ID.as_bytes(), &a2.address(), &c2, 0);
+    let rec_a2 = SentinelOp::Recover { cold_dest: b.owner.address(), salt: SALT, proof: Box::new(rec2.sign(&msg)) };
+    net.submit(tx(&rescuer, &a2.address(), 0, 0, rec_a2.encode())).unwrap();
+    net.mine().unwrap();
+    net.submit(tx(&rescuer, &b.owner.address(), 0, 1, recover_op(&b, 0))).unwrap();
+    net.mine().unwrap();
+
+    let st = net.engine.state.read();
+    assert_eq!(st.vault(&a2.address()).unwrap().recovered_to(), Some(&b.cold), "A2 now points straight at C");
+    drop(st);
+    let before = net.balance(&b.cold);
+    net.fund(&a2.address(), 3);
+    net.mine().unwrap();
+    assert_eq!(net.balance(&b.cold), before + 3 * MICRO_QTR);
+}
+
+#[test]
+fn oversized_data_is_refused() {
+    let net = Net::new(|_| {});
+    let me = net.faucet.address();
+    let mut big = qtrc_common::sentinel::MAGIC.to_vec();
+    big.resize(qtrc_common::state::MAX_DATA_LEN + 1, 0);
+    let err = net.submit(tx(&net.faucet, &me, 0, 0, big)).unwrap_err();
+    assert!(err.contains("larger than"), "{err}");
 }

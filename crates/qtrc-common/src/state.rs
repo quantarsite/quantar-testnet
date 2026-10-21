@@ -3,6 +3,9 @@
 use crate::block::{Block, BlockHash};
 use crate::sentinel::SentinelOp;
 use crate::tx::{Transaction, TxError, CHAIN_ID, TX_FEE};
+
+/// Largest `data` payload a transaction may carry (a recovery is ~37 KB).
+pub const MAX_DATA_LEN: usize = 48 * 1024;
 use qtrc_crypto::Address;
 use qtrc_sentinel::{self as sn, Credit, Outcome, Policy, SentinelError, Vault};
 use serde::{Deserialize, Serialize};
@@ -102,15 +105,88 @@ impl ChainState {
         height >= self.sentinel_from_height
     }
 
+    /// Format checks shared by mempool admission and block application.
+    /// Returns the decoded operation, or `None` for a plain transfer.
+    pub fn parse_op(&self, tx: &Transaction, height: u64) -> Result<Option<SentinelOp>, TxError> {
+        if tx.data.is_empty() {
+            return Ok(None);
+        }
+        if !self.sentinel_active_at(height) {
+            return Err(TxError::Sentinel(format!(
+                "Sentinel is not active before block {}",
+                self.sentinel_from_height
+            )));
+        }
+        if tx.data.len() > MAX_DATA_LEN {
+            return Err(TxError::Sentinel(format!("data larger than {MAX_DATA_LEN} bytes")));
+        }
+        let op = SentinelOp::decode(&tx.data).map_err(TxError::Sentinel)?;
+        if tx.amount != 0 {
+            return Err(TxError::Sentinel("operation must carry amount 0".into()));
+        }
+        if op.is_owner_op() && tx.to != tx.from {
+            return Err(TxError::Sentinel("guardian operations must be sent to yourself".into()));
+        }
+        Ok(Some(op))
+    }
+
+    /// Whether the fee of `tx` is taken from the recovered amount instead of
+    /// the sender's spendable balance: a guarded account submitting its own
+    /// recovery, whose unlocked balance a thief may have drained.
+    pub fn fee_from_recovery(op: &SentinelOp, tx: &Transaction) -> bool {
+        matches!(op, SentinelOp::Recover { .. }) && tx.from == tx.to
+    }
+
+    /// Read-only check that a Sentinel operation would succeed on the
+    /// current state. Used by mempool admission so operations that cannot
+    /// apply are refused before they take a slot.
+    pub fn check_op(&self, tx: &Transaction, op: &SentinelOp) -> Result<(), TxError> {
+        let active = |a: &Address| -> Result<&Vault, TxError> {
+            let v = self.vault(a).ok_or_else(no_vault)?;
+            if v.is_recovered() { Err(sentinel_err(SentinelError::Recovered)) } else { Ok(v) }
+        };
+        match op {
+            SentinelOp::SetGuardian { delay_blocks, allowance_per_window, .. } => {
+                if self.vault(&tx.from).is_some() {
+                    return Err(TxError::Sentinel("account already has a vault; use RotateGuardian".into()));
+                }
+                Policy::new(*delay_blocks, *allowance_per_window).map_err(sentinel_err)?;
+            }
+            SentinelOp::RotateGuardian { .. } => {
+                active(&tx.from)?;
+            }
+            SentinelOp::Finalize { id } => {
+                if !active(&tx.to)?.pending().iter().any(|p| p.id == *id) {
+                    return Err(sentinel_err(SentinelError::NotFound));
+                }
+            }
+            SentinelOp::Recover { cold_dest, salt, proof } => {
+                sn::ensure_recovery_target(self.vault(cold_dest)).map_err(sentinel_err)?;
+                active(&tx.to)?
+                    .check_recovery(CHAIN_ID.as_bytes(), cold_dest, salt, proof.as_ref())
+                    .map_err(sentinel_err)?;
+            }
+        }
+        Ok(())
+    }
+
     /// Apply a single verified transaction as part of block `self.height + 1`.
-    /// All or nothing: on error the state is unchanged.
+    ///
+    /// * A plain transfer is all or nothing: on error the state is
+    ///   unchanged and the transaction is left out of the block, as before.
+    /// * A Sentinel operation that passes the format, nonce and fee checks
+    ///   is always included: the fee and nonce are charged even if the
+    ///   operation itself then fails (its effects are rolled back). That
+    ///   makes failing operations cost the same as successful ones.
     pub fn apply_tx(&mut self, tx: &Transaction) -> Result<(), TxError> {
         let mut j = Journal { burned: self.burned, ..Journal::default() };
-        let result = self.apply_tx_inner(tx, &mut j);
-        if result.is_err() {
-            self.rollback(j);
+        match self.apply_tx_inner(tx, &mut j) {
+            Ok(()) => Ok(()),
+            Err(e) => {
+                self.rollback(j);
+                Err(e)
+            }
         }
-        result
     }
 
     fn rollback(&mut self, j: Journal) {
@@ -149,25 +225,7 @@ impl ChainState {
     fn apply_tx_inner(&mut self, tx: &Transaction, j: &mut Journal) -> Result<(), TxError> {
         let height = self.height + 1;
         let fee = self.fee_at(height);
-
-        let op = if tx.data.is_empty() {
-            None
-        } else {
-            if !self.sentinel_active_at(height) {
-                return Err(TxError::Sentinel(format!(
-                    "Sentinel is not active before block {}",
-                    self.sentinel_from_height
-                )));
-            }
-            let op = SentinelOp::decode(&tx.data).map_err(TxError::Sentinel)?;
-            if tx.amount != 0 {
-                return Err(TxError::Sentinel("operation must carry amount 0".into()));
-            }
-            if op.is_owner_op() && tx.to != tx.from {
-                return Err(TxError::Sentinel("guardian operations must be sent to yourself".into()));
-            }
-            Some(op)
-        };
+        let op = self.parse_op(tx, height)?;
 
         let from = tx.from.as_hex();
         let expected = self.account(&tx.from).nonce;
@@ -175,13 +233,55 @@ impl ChainState {
             return Err(TxError::InvalidNonce { expected, got: tx.nonce });
         }
 
-        self.debit_fee(j, &from, fee)?;
-        self.acct(j, &from).nonce += 1;
-        self.burned = self.burned.saturating_add(fee);
+        let Some(op) = op else {
+            self.debit_fee(j, &from, fee)?;
+            self.acct(j, &from).nonce += 1;
+            self.burned = self.burned.saturating_add(fee);
+            return self.plain_transfer(j, tx, height);
+        };
 
+        // Phase 1: nonce and fee. Failing here leaves the tx out of the block.
+        let deferred = Self::fee_from_recovery(&op, tx);
+        if !deferred {
+            self.debit_fee(j, &from, fee)?;
+            self.burned = self.burned.saturating_add(fee);
+        }
+        self.acct(j, &from).nonce += 1;
+
+        // Phase 2: the operation. Its effects are rolled back on failure,
+        // but the tx stays in the block and keeps what phase 1 charged.
+        let mut j2 = Journal { burned: self.burned, ..Journal::default() };
+        match self.apply_op(tx, op, height, fee, deferred, &mut j2) {
+            Ok(()) => {
+                merge(j, j2);
+                Ok(())
+            }
+            Err(e) => {
+                self.rollback(j2);
+                if deferred {
+                    // The recovery did not happen, so there is no recovered
+                    // amount to take the fee from: charge it normally, or
+                    // leave the tx out if the account cannot pay.
+                    self.debit_fee(j, &from, fee).map_err(|_| e)?;
+                    self.burned = self.burned.saturating_add(fee);
+                }
+                Ok(())
+            }
+        }
+    }
+
+    fn apply_op(
+        &mut self,
+        tx: &Transaction,
+        op: SentinelOp,
+        height: u64,
+        fee: u64,
+        fee_from_recovered: bool,
+        j: &mut Journal,
+    ) -> Result<(), TxError> {
+        let from = tx.from.as_hex();
         match op {
-            None => self.plain_transfer(j, tx, height),
-            Some(SentinelOp::SetGuardian { commitment, delay_blocks, allowance_per_window }) => {
+            SentinelOp::SetGuardian { commitment, delay_blocks, allowance_per_window } => {
                 if self.vaults.contains_key(&from) {
                     return Err(TxError::Sentinel(
                         "account already has a vault; use RotateGuardian".into(),
@@ -193,12 +293,12 @@ impl ChainState {
                 self.vaults.insert(from, Vault::new(tx.from.clone(), balance, Some(commitment), policy));
                 Ok(())
             }
-            Some(SentinelOp::RotateGuardian { commitment }) => {
+            SentinelOp::RotateGuardian { commitment } => {
                 let v = self.vault_mut(j, &from).ok_or_else(no_vault)?;
                 v.request_rotation(height, commitment).map_err(sentinel_err)?;
                 Ok(())
             }
-            Some(SentinelOp::Finalize { id }) => {
+            SentinelOp::Finalize { id } => {
                 let target = tx.to.as_hex();
                 let v = self.vault_mut(j, &target).ok_or_else(no_vault)?;
                 let paid = v.finalize(height, id).map_err(sentinel_err)?;
@@ -208,14 +308,32 @@ impl ChainState {
                 }
                 Ok(())
             }
-            Some(SentinelOp::Recover { cold_dest, salt, proof }) => {
+            SentinelOp::Recover { cold_dest, salt, proof } => {
                 sn::ensure_recovery_target(self.vaults.get(&cold_dest.as_hex())).map_err(sentinel_err)?;
                 let target = tx.to.as_hex();
                 let v = self.vault_mut(j, &target).ok_or_else(no_vault)?;
-                let (dest, amount) = v
+                let (dest, mut amount) = v
                     .recover(CHAIN_ID.as_bytes(), &cold_dest, &salt, proof.as_ref())
                     .map_err(sentinel_err)?;
                 self.sync(j, &target);
+                if fee_from_recovered {
+                    amount = amount.checked_sub(fee).ok_or(TxError::InsufficientBalance { need: fee, have: amount })?;
+                    self.burned = self.burned.saturating_add(fee);
+                }
+                // Path compression: vaults that forwarded to the account just
+                // recovered now forward straight to its destination, so
+                // forwarding is always a single hop.
+                let pointing: Vec<String> = self
+                    .vaults
+                    .iter()
+                    .filter(|(_, v)| v.recovered_to() == Some(&tx.to))
+                    .map(|(k, _)| k.clone())
+                    .collect();
+                for k in pointing {
+                    if let Some(v) = self.vault_mut(j, &k) {
+                        v.redirect_forward(dest.clone());
+                    }
+                }
                 self.credit(j, &dest, amount)
             }
         }
@@ -291,6 +409,17 @@ impl ChainState {
         self.height     = block.header.height;
         self.block_hash = block.hash();
         Ok(())
+    }
+}
+
+/// Merge a successful phase-2 journal into the outer one, keeping the
+/// outer (older) original for keys both touched.
+fn merge(outer: &mut Journal, inner: Journal) {
+    for (k, v) in inner.accounts {
+        outer.accounts.entry(k).or_insert(v);
+    }
+    for (k, v) in inner.vaults {
+        outer.vaults.entry(k).or_insert(v);
     }
 }
 

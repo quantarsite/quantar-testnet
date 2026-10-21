@@ -127,7 +127,14 @@ const BINCODE_V2: u8 = 0x02;
 
 /// Binary encoding: about 4x smaller than JSON, which writes every
 /// signature byte as a decimal number (a tx was ~132 KB in JSON).
+///
+/// Blocks without any Sentinel operation are still written in format 0x01,
+/// which the previous release reads: until the first Sentinel operation is
+/// mined, the operator can roll back to the old binary on the same data dir.
 fn encode_block(block: &Block) -> Result<Vec<u8>> {
+    if block.transactions.iter().all(|t| t.data.is_empty()) {
+        return v1::encode(block);
+    }
     let mut out = vec![BINCODE_V2];
     out.extend(bincode::serialize(block)?);
     Ok(out)
@@ -188,9 +195,9 @@ mod v1 {
         }
     }
 
-    /// Encoder for tests: the exact bytes a pre-Sentinel node wrote.
-    #[cfg(test)]
-    pub fn encode(block: &qtrc_common::block::Block) -> Vec<u8> {
+    /// The exact bytes a pre-Sentinel node writes. Only valid for blocks
+    /// whose transactions all have empty `data`.
+    pub fn encode(block: &qtrc_common::block::Block) -> anyhow::Result<Vec<u8>> {
         #[derive(serde::Serialize)]
         struct Tx<'a> {
             from: &'a Address,
@@ -223,8 +230,8 @@ mod v1 {
             validator_sigs: &block.validator_sigs,
         };
         let mut out = vec![super::BINCODE_V1];
-        out.extend(bincode::serialize(&b).unwrap());
-        out
+        out.extend(bincode::serialize(&b)?);
+        Ok(out)
     }
 }
 
@@ -265,13 +272,19 @@ mod tests {
     #[test]
     fn pre_sentinel_bincode_blocks_still_read() {
         let block = sample_block();
-        let old = v1::encode(&block);
+        let old = v1::encode(&block).unwrap();
         let back = decode_block(&old).unwrap();
         assert_eq!(back.hash(), block.hash());
         assert_eq!(back.header.merkle_root, block.header.merkle_root);
         assert!(back.verify_transactions());
-        // New blocks use the new tag.
-        assert_eq!(encode_block(&block).unwrap()[0], BINCODE_V2);
+        // Plain blocks stay readable by the previous release.
+        assert_eq!(encode_block(&block).unwrap(), old);
+        // A block with a Sentinel operation uses the new tag.
+        let mut with_op = block.clone();
+        with_op.transactions[0].data = b"QSN1x".to_vec();
+        let enc = encode_block(&with_op).unwrap();
+        assert_eq!(enc[0], BINCODE_V2);
+        assert_eq!(decode_block(&enc).unwrap().transactions[0].data, b"QSN1x");
     }
 
     /// A block written by the pre-Sentinel node (generated with the code on
@@ -289,7 +302,7 @@ mod tests {
         // Re-encoding as v2 and back is lossless.
         let again = decode_block(&encode_block(&block).unwrap()).unwrap();
         assert_eq!(again.hash(), block.hash());
-        assert_eq!(v1::encode(&block).as_slice(), bytes.as_slice(), "our v1 encoder matches the real one");
+        assert_eq!(v1::encode(&block).unwrap().as_slice(), bytes.as_slice(), "our v1 encoder matches the real one");
     }
 
     #[test]

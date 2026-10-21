@@ -185,34 +185,28 @@ impl ConsensusEngine {
                 tx.nonce
             )));
         }
-        let (balance, fee) = {
+        let (balance, fee, fee_deferred) = {
             let st = self.state.read();
             let next = st.height + 1;
-            // Sentinel operations: refuse garbage and early use here, before
-            // they cost a HYDRA-X verification. Full checks run at apply.
-            if !tx.data.is_empty() {
-                if !st.sentinel_active_at(next) {
-                    return Err(ConsensusError::InvalidTx(format!(
-                        "Sentinel is not active before block {}",
-                        st.sentinel_from_height
-                    )));
-                }
-                let op = qtrc_common::sentinel::SentinelOp::decode(&tx.data)
-                    .map_err(ConsensusError::InvalidTx)?;
-                if tx.amount != 0 {
-                    return Err(ConsensusError::InvalidTx("Sentinel operation must carry amount 0".into()));
-                }
-                if op.is_owner_op() && tx.to != tx.from {
-                    return Err(ConsensusError::InvalidTx("guardian operations must be sent to yourself".into()));
-                }
+            // Sentinel operations get the same checks block application
+            // runs, read-only, before they cost a HYDRA-X verification or a
+            // mempool slot.
+            let op = st.parse_op(&tx, next).map_err(|e| ConsensusError::InvalidTx(e.to_string()))?;
+            let mut deferred = false;
+            if let Some(op) = &op {
+                st.check_op(&tx, op).map_err(|e| ConsensusError::InvalidTx(e.to_string()))?;
+                deferred = ChainState::fee_from_recovery(op, &tx);
             }
             // A guarded account can only spend what is not reserved.
-            (st.spendable(&tx.from), st.fee_at(next))
+            (st.spendable(&tx.from), st.fee_at(next), deferred)
         };
-        // Every pending tx and this one each pay the fee on top of the amount.
+        // Every pending tx and this one each pay the fee on top of the amount
+        // (a guarded account's own recovery pays it from the recovered sum).
+        let own_fee = if fee_deferred { 0 } else { fee };
         let needed = pending_out
             .saturating_add(tx.amount)
-            .saturating_add(fee.saturating_mul(pending_count as u64 + 1));
+            .saturating_add(fee.saturating_mul(pending_count as u64))
+            .saturating_add(own_fee);
         if balance < needed {
             return Err(ConsensusError::InvalidTx(format!(
                 "insufficient balance: have {balance} µQTR, pending txs plus this one (fee {fee} µQTR each) need {needed} µQTR"

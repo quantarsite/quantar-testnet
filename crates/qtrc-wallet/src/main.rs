@@ -114,16 +114,18 @@ enum GuardianCmd {
         /// QTR that may leave without delay per window of `delay` blocks
         #[arg(long, default_value = "100")]
         allowance: String,
-        /// Where to write the new recovery key (default: next to the wallet)
+        /// Where to write the new recovery key. Pick a removable drive or
+        /// somewhere you will move it from: it must not stay next to the wallet
         #[arg(long)]
-        out: Option<PathBuf>,
+        out: PathBuf,
     },
     /// Replace the recovery key and cold address. Takes effect after the delay
     Rotate {
         #[arg(long)]
         cold: String,
+        /// Where to write the new recovery key (see `guardian setup --out`)
         #[arg(long)]
-        out: Option<PathBuf>,
+        out: PathBuf,
     },
 }
 
@@ -380,7 +382,7 @@ fn cmd_guardian(
     key_path: &PathBuf,
     cold: &str,
     setup: Option<(u64, &str)>,
-    out: Option<PathBuf>,
+    rec_path: PathBuf,
 ) -> Result<()> {
     let wallet = load_wallet(key_path)?;
     let account = wallet.address();
@@ -398,9 +400,9 @@ fn cmd_guardian(
         bail!("the cold address has its own vault; use a plain, never-used address");
     }
 
-    let dir = key_path.parent().map(PathBuf::from).unwrap_or_default();
-    let stamp = chrono::Utc::now().format("%Y%m%d%H%M%S");
-    let rec_path = out.unwrap_or_else(|| dir.join(format!("recovery-{stamp}.key")));
+    if rec_path.parent() == key_path.parent() && key_path.parent().is_some() {
+        eprintln!("warning: the recovery key is going next to your wallet key; move it elsewhere afterwards");
+    }
     let kit_path = rec_path.with_extension("kit.json");
 
     let recovery = HydraXKeypair::generate();
@@ -538,7 +540,12 @@ fn cmd_recover(
         }
     };
     let op = SentinelOp::Recover { cold_dest: cold.clone(), salt, proof: Box::new(proof) };
-    let body = submit(http, rpc, &load_wallet(key_path)?, &target, 0, op.encode())?;
+    let payer = load_wallet(key_path)?;
+    if payer.address() == target {
+        println!("Submitting from the guarded account itself: the fee comes out of the recovered amount.");
+        println!("If a thief has this key, submitting from another wallet (--key) avoids racing its nonces.");
+    }
+    let body = submit(http, rpc, &payer, &target, 0, op.encode())?;
     println!("Recovery submitted: everything in {} goes to {}.", target.as_hex(), cold.as_hex());
     println!("tx: {}", body["tx_hash"].as_str().unwrap_or("?"));
     Ok(())
