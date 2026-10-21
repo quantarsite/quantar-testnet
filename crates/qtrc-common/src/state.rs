@@ -170,10 +170,21 @@ impl ChainState {
         Ok(())
     }
 
+    /// Read-only check that a plain transfer from a guarded account would be
+    /// accepted by its vault (amount, queue room, unlocked funds).
+    pub fn check_guarded_transfer(&self, tx: &Transaction, fee: u64) -> Result<(), TxError> {
+        let Some(v) = self.vault(&tx.from) else { return Ok(()) };
+        let mut v = v.clone();
+        v.charge_fee(fee).map_err(sentinel_err)?;
+        v.transfer(self.height + 1, tx.to.clone(), tx.amount).map(|_| ()).map_err(sentinel_err)
+    }
+
     /// Apply a single verified transaction as part of block `self.height + 1`.
     ///
-    /// * A plain transfer is all or nothing: on error the state is
-    ///   unchanged and the transaction is left out of the block, as before.
+    /// * A plain transfer from an unguarded account is all or nothing: on
+    ///   error the state is unchanged and the transaction is left out of
+    ///   the block, as before. From a guarded account it follows the
+    ///   two-phase rule below.
     /// * A Sentinel operation that passes the format, nonce and fee checks
     ///   is always included: the fee and nonce are charged even if the
     ///   operation itself then fails (its effects are rolled back). That
@@ -237,11 +248,26 @@ impl ChainState {
             self.debit_fee(j, &from, fee)?;
             self.acct(j, &from).nonce += 1;
             self.burned = self.burned.saturating_add(fee);
-            return self.plain_transfer(j, tx, height);
+            if !self.vaults.contains_key(&from) {
+                // Unguarded account: all or nothing, exactly as before
+                // Sentinel existed, so old blocks replay unchanged.
+                return self.plain_transfer(j, tx, height);
+            }
+            // Guarded account: a transfer the vault refuses (zero amount,
+            // full queue, locked funds) is still included and pays.
+            let mut j2 = Journal { burned: self.burned, ..Journal::default() };
+            match self.plain_transfer(&mut j2, tx, height) {
+                Ok(()) => merge(j, j2),
+                Err(_) => self.rollback(j2),
+            }
+            return Ok(());
         };
 
         // Phase 1: nonce and fee. Failing here leaves the tx out of the block.
         let deferred = Self::fee_from_recovery(&op, tx);
+        if deferred && self.vault(&tx.from).map_or(0, Vault::balance) < fee {
+            return Err(TxError::InsufficientBalance { need: fee, have: self.vault(&tx.from).map_or(0, Vault::balance) });
+        }
         if !deferred {
             self.debit_fee(j, &from, fee)?;
             self.burned = self.burned.saturating_add(fee);

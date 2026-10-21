@@ -125,7 +125,7 @@ fn stolen_key_drain_is_stopped_by_recovery() {
 
     // Admission refuses to spend locked funds.
     let err = net.submit(tx(&g.owner, &thief, 100 * MICRO_QTR, net.nonce(&owner), vec![])).unwrap_err();
-    assert!(err.contains("insufficient balance"), "{err}");
+    assert!(err.contains("insufficient"), "{err}");
 
     // A rescuer (any funded account) submits the recovery and pays the fee,
     // even though the guarded account has nothing unlocked for fees.
@@ -396,4 +396,112 @@ fn oversized_data_is_refused() {
     big.resize(qtrc_common::state::MAX_DATA_LEN + 1, 0);
     let err = net.submit(tx(&net.faucet, &me, 0, 0, big)).unwrap_err();
     assert!(err.contains("larger than"), "{err}");
+}
+
+/// Regression N1 (1, 2): plain transfers a vault would refuse are refused
+/// at admission, and if one slips into a block anyway (state changed in
+/// between) it is included and pays.
+#[test]
+fn guarded_plain_transfers_are_never_free() {
+    let mut net = Net::new(|_| {});
+    let g = guarded(&mut net, 5_000);
+    let owner = g.owner.address();
+    let sink = HydraXKeypair::generate().address();
+    // Zero amount: refused at admission.
+    assert!(net.submit(tx(&g.owner, &sink, 0, net.nonce(&owner), vec![])).is_err());
+
+    // Applied directly (as if admitted earlier): included, fee charged.
+    let mut st = net.engine.state.read().clone();
+    let before = st.account(&owner);
+    st.apply_tx(&tx(&g.owner, &sink, 0, before.nonce, vec![])).unwrap();
+    assert_eq!(st.account(&owner).nonce, before.nonce + 1);
+    assert_eq!(st.account(&owner).balance, before.balance - TX_FEE);
+
+    // Full queue: refused at admission.
+    let mut st = net.engine.state.read().clone();
+    let mut n = st.account(&owner).nonce;
+    for _ in 0..qtrc_sentinel::MAX_PENDING {
+        st.apply_tx(&tx(&g.owner, &sink, ALLOWANCE + 1, n, vec![])).unwrap();
+        n += 1;
+    }
+    let pending = st.vault(&owner).unwrap().pending().len();
+    assert_eq!(pending, qtrc_sentinel::MAX_PENDING);
+    let t = tx(&g.owner, &sink, ALLOWANCE + 1, n, vec![]);
+    assert!(st.check_guarded_transfer(&t, TX_FEE).is_err());
+    let bal = st.account(&owner).balance;
+    st.apply_tx(&t).unwrap();
+    assert_eq!(st.account(&owner).balance, bal - TX_FEE, "refused by the vault but paid");
+    assert_eq!(st.vault(&owner).unwrap().pending().len(), pending);
+}
+
+/// Regression N1 (3): a self-submitted recovery needs the fee in the vault.
+#[test]
+fn self_recovery_with_empty_vault_is_refused() {
+    let mut net = Net::new(|_| {});
+    let g = guarded(&mut net, 1);
+    let owner = g.owner.address();
+    // Empty the vault: allowance covers everything that is left.
+    let all = net.engine.state.read().spendable(&owner) - TX_FEE;
+    net.submit(tx(&g.owner, &HydraXKeypair::generate().address(), all, net.nonce(&owner), vec![])).unwrap();
+    net.mine().unwrap();
+    assert_eq!(net.balance(&owner), 0);
+    let err = net.submit(tx(&g.owner, &owner, 0, net.nonce(&owner), recover_op(&g, 0))).unwrap_err();
+    assert!(err.contains("insufficient"), "{err}");
+    let mut st = net.engine.state.read().clone();
+    assert!(st.apply_tx(&tx(&g.owner, &owner, 0, net.nonce(&owner), recover_op(&g, 0))).is_err());
+}
+
+/// Recoveries above MAX_RECOVERS_PER_BLOCK wait for the next block, along
+/// with later txs from the same sender, without losing any.
+#[test]
+fn recoveries_are_capped_per_block_without_losing_txs() {
+    use qtrc_consensus::MAX_RECOVERS_PER_BLOCK;
+    let mut net = Net::new(|_| {});
+    let n = MAX_RECOVERS_PER_BLOCK + 1;
+    let owners: Vec<(HydraXKeypair, HydraXKeypair, Address)> = (0..n)
+        .map(|_| (HydraXKeypair::generate(), HydraXKeypair::generate(), HydraXKeypair::generate().address()))
+        .collect();
+    // Three rescuers: the per-sender pending limit is 16.
+    let rescuers: Vec<HydraXKeypair> = (0..3).map(|_| HydraXKeypair::generate()).collect();
+    for (i, (o, _, _)) in owners.iter().enumerate() {
+        net.fund(&o.address(), 1);
+        if i % 15 == 14 {
+            net.mine().unwrap();
+        }
+    }
+    for r in &rescuers {
+        net.fund(&r.address(), 10);
+    }
+    net.mine().unwrap();
+    let mut commits = vec![];
+    for (o, r, cold) in &owners {
+        let c = recovery_commitment(CHAIN_ID.as_bytes(), &o.address(), &r.address(), cold, &SALT);
+        let op = SentinelOp::SetGuardian { commitment: c, delay_blocks: DELAY, allowance_per_window: 0 };
+        net.submit(tx(o, &o.address(), 0, 0, op.encode())).unwrap();
+        commits.push(c);
+    }
+    net.mine().unwrap();
+    // Rescuer i handles owners 16*i .. 16*i+15; the last one gets the
+    // recovery over the cap.
+    let mut nonces = [0u64; 3];
+    for (i, ((o, r, cold), c)) in owners.iter().zip(&commits).enumerate() {
+        let msg = recovery_message(CHAIN_ID.as_bytes(), &o.address(), c, 0);
+        let op = SentinelOp::Recover { cold_dest: cold.clone(), salt: SALT, proof: Box::new(r.sign(&msg)) };
+        let k = i / 16;
+        net.submit(tx(&rescuers[k], &o.address(), 0, nonces[k], op.encode())).unwrap();
+        nonces[k] += 1;
+    }
+    // A plain transfer from the last rescuer after its held recovery.
+    let tail = HydraXKeypair::generate().address();
+    let last = n / 16;
+    net.submit(tx(&rescuers[last], &tail, MICRO_QTR, nonces[last], vec![])).unwrap();
+
+    let first = net.mine().unwrap();
+    assert_eq!(first.transactions.len(), MAX_RECOVERS_PER_BLOCK);
+    let second = net.mine().unwrap();
+    assert_eq!(second.transactions.len(), 2, "held recovery and the tx after it");
+    for (_, _, cold) in &owners {
+        assert!(net.balance(cold) > 0);
+    }
+    assert_eq!(net.balance(&tail), MICRO_QTR);
 }
