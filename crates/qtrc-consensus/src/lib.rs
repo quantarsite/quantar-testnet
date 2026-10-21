@@ -35,6 +35,17 @@ pub const MAX_TXS_PER_BLOCK: usize = 500;
 pub const MAX_MEMPOOL: usize = 5_000;
 /// Most transactions one sender may have waiting at once.
 pub const MAX_PENDING_PER_SENDER: usize = 16;
+/// Most Sentinel recoveries per block. Each carries a second HYDRA-X
+/// signature (~37 KB); the rest wait for the next block.
+pub const MAX_RECOVERS_PER_BLOCK: usize = 32;
+
+fn is_recover(tx: &Transaction) -> bool {
+    !tx.data.is_empty()
+        && matches!(
+            qtrc_common::sentinel::SentinelOp::decode(&tx.data),
+            Ok(qtrc_common::sentinel::SentinelOp::Recover { .. })
+        )
+}
 
 #[derive(Debug, Error)]
 pub enum ConsensusError {
@@ -187,7 +198,30 @@ impl ConsensusEngine {
         }
         let (balance, fee) = {
             let st = self.state.read();
-            (st.account(&tx.from).balance, st.fee_at(st.height + 1))
+            let next = st.height + 1;
+            // Sentinel operations get the same checks block application
+            // runs, read-only, before they cost a HYDRA-X verification or a
+            // mempool slot.
+            let op = st.parse_op(&tx, next).map_err(|e| ConsensusError::InvalidTx(e.to_string()))?;
+            let fee = st.fee_at(next);
+            let mut deferred = false;
+            match &op {
+                // Recovery proofs are checked after the tx signature (below),
+                // so a forged tx cannot make the node verify two signatures.
+                Some(op @ qtrc_common::sentinel::SentinelOp::Recover { .. }) => {
+                    deferred = ChainState::fee_from_recovery(op, &tx);
+                }
+                Some(op) => st.check_op(&tx, op).map_err(|e| ConsensusError::InvalidTx(e.to_string()))?,
+                None => st.check_guarded_transfer(&tx, fee).map_err(|e| ConsensusError::InvalidTx(e.to_string()))?,
+            }
+            // A guarded account can only spend what is not reserved; its own
+            // recovery pays the fee out of the whole (recovered) balance.
+            let have = if deferred {
+                st.vault(&tx.from).map_or(0, |v| v.balance())
+            } else {
+                st.spendable(&tx.from)
+            };
+            (have, fee)
         };
         // Every pending tx and this one each pay the fee on top of the amount.
         let needed = pending_out
@@ -210,6 +244,12 @@ impl ConsensusEngine {
         let item = adapter::to_ingest_item(&tx)?;
         match self.pipeline.ingest_one(item) {
             IngestResult::Accepted { hash: h } => {
+                // Recovery proof: checked only now that the tx signature is
+                // known to be valid.
+                if let Err(e) = self.check_recovery_op(&tx) {
+                    self.forget(&[hash]);
+                    return Err(e);
+                }
                 self.mempool.write().push(tx);
                 Ok(adapter::hx_hash_to_qtrc(h))
             }
@@ -219,6 +259,10 @@ impl ConsensusEngine {
                 self.forget(&[hash.clone()]);
                 match self.pipeline.ingest_one(adapter::to_ingest_item(&tx)?) {
                     IngestResult::Accepted { .. } => {
+                        if let Err(e) = self.check_recovery_op(&tx) {
+                            self.forget(&[hash]);
+                            return Err(e);
+                        }
                         self.mempool.write().push(tx);
                         Ok(adapter::hx_hash_to_qtrc(h))
                     }
@@ -230,6 +274,19 @@ impl ConsensusEngine {
             IngestResult::Rejected { reason } => {
                 Err(ConsensusError::InvalidTx(reason.to_string()))
             }
+        }
+    }
+
+    fn check_recovery_op(&self, tx: &Transaction) -> Result<(), ConsensusError> {
+        if tx.data.is_empty() {
+            return Ok(());
+        }
+        let st = self.state.read();
+        match qtrc_common::sentinel::SentinelOp::decode(&tx.data) {
+            Ok(op @ qtrc_common::sentinel::SentinelOp::Recover { .. }) => {
+                st.check_op(tx, &op).map_err(|e| ConsensusError::InvalidTx(e.to_string()))
+            }
+            _ => Ok(()),
         }
     }
 
@@ -327,9 +384,27 @@ impl ConsensusEngine {
         let mut scratch = self.state.read().clone();
         let mut txs = Vec::with_capacity(candidates.len());
         let mut dropped = Vec::new();
+        // Recoveries over the per-block cap wait for the next block, and so
+        // does everything after them from the same sender (nonce order).
+        let mut recovers = 0usize;
+        let mut held: Vec<Transaction> = Vec::new();
+        let mut held_senders: Vec<Address> = Vec::new();
         for tx in candidates {
+            if held_senders.contains(&tx.from) {
+                held.push(tx);
+                continue;
+            }
+            let recover = is_recover(&tx);
+            if recover && recovers >= MAX_RECOVERS_PER_BLOCK {
+                held_senders.push(tx.from.clone());
+                held.push(tx);
+                continue;
+            }
             match scratch.apply_tx(&tx) {
-                Ok(()) => txs.push(tx),
+                Ok(()) => {
+                    recovers += usize::from(recover);
+                    txs.push(tx);
+                }
                 Err(e) => {
                     warn!(tx = %tx.hash(), "dropping invalid tx from block: {e}");
                     dropped.push(tx.hash());
@@ -339,6 +414,15 @@ impl ConsensusEngine {
         if !dropped.is_empty() {
             self.inflight.write().retain(|t| !dropped.contains(&t.hash()));
             self.forget(&dropped);
+        }
+        if !held.is_empty() {
+            let held_hashes: Vec<TxHash> = held.iter().map(Transaction::hash).collect();
+            let mut pool = self.mempool.write();
+            let mut inflight = self.inflight.write();
+            inflight.retain(|t| !held_hashes.contains(&t.hash()));
+            let rest = std::mem::take(&mut *pool);
+            *pool = held;
+            pool.extend(rest);
         }
         if txs.is_empty() {
             self.release_inflight(false);

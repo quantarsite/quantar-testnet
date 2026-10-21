@@ -5,6 +5,7 @@
 
 pub mod block;
 pub mod genesis;
+pub mod sentinel;
 pub mod state;
 pub mod tx;
 

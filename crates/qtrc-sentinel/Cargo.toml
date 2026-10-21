@@ -1,0 +1,17 @@
+[package]
+name        = "qtrc-sentinel"
+description = "HYDRA-X Sentinel: hash-committed recovery, delayed outflows and watchtower"
+version.workspace    = true
+edition.workspace    = true
+authors.workspace    = true
+license.workspace    = true
+repository.workspace = true
+
+[dependencies]
+qtrc-crypto.path    = "../qtrc-crypto"
+sha3.workspace      = true
+serde.workspace     = true
+thiserror.workspace = true
+
+[dev-dependencies]
+serde_json.workspace = true

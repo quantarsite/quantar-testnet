@@ -1,8 +1,9 @@
 //! Persistent block storage backed by sled.
 //!
 //! Layout:
-//!   tree "blocks": height (u64 big-endian) -> 0x01 || bincode(block)
-//!                  (blocks written before v2.0.1 are JSON and still read)
+//!   tree "blocks": height (u64 big-endian) -> 0x02 || bincode(block)
+//!                  (0x01 = bincode without the tx `data` field, written
+//!                  before Sentinel; JSON = written by v2.0.0; both still read)
 //!   tree "meta":   "genesis" -> JSON genesis config this chain was started with
 //!
 //! Heights are stored big-endian so sled's byte ordering is numeric order.
@@ -15,6 +16,7 @@ use sled::{Db, Tree};
 
 const GENESIS_KEY: &[u8] = b"genesis";
 const FEE_FROM_KEY: &[u8] = b"fee_from_height";
+const SENTINEL_FROM_KEY: &[u8] = b"sentinel_from_height";
 
 pub struct BlockStore {
     db:     Db,
@@ -52,12 +54,23 @@ impl BlockStore {
     /// blocks from before fees existed starts charging at the next block,
     /// so its stored blocks still replay to the same state.
     pub fn fee_from_height(&self) -> Result<u64> {
-        if let Some(v) = self.meta.get(FEE_FROM_KEY)? {
-            let buf: [u8; 8] = v.as_ref().try_into().context("corrupt fee_from_height")?;
+        self.activation_height(FEE_FROM_KEY)
+    }
+
+    /// First height that accepts Sentinel operations, fixed once per data
+    /// dir: block 1 on a new chain, the next block on a chain that already
+    /// has blocks, so stored history replays unchanged.
+    pub fn sentinel_from_height(&self) -> Result<u64> {
+        self.activation_height(SENTINEL_FROM_KEY)
+    }
+
+    fn activation_height(&self, key: &[u8]) -> Result<u64> {
+        if let Some(v) = self.meta.get(key)? {
+            let buf: [u8; 8] = v.as_ref().try_into().context("corrupt activation height")?;
             return Ok(u64::from_be_bytes(buf));
         }
         let from = self.latest_height()?.map_or(1, |h| h + 1);
-        self.meta.insert(FEE_FROM_KEY, &from.to_be_bytes())?;
+        self.meta.insert(key, &from.to_be_bytes())?;
         self.db.flush()?;
         Ok(from)
     }
@@ -108,22 +121,117 @@ impl BlockStore {
     }
 }
 
-/// Format tag for bincode-encoded blocks.
+/// Format tags for bincode-encoded blocks.
 const BINCODE_V1: u8 = 0x01;
+const BINCODE_V2: u8 = 0x02;
 
 /// Binary encoding: about 4x smaller than JSON, which writes every
 /// signature byte as a decimal number (a tx was ~132 KB in JSON).
+///
+/// Blocks without any Sentinel operation are still written in format 0x01,
+/// which the previous release reads: until the first Sentinel operation is
+/// mined, the operator can roll back to the old binary on the same data dir.
 fn encode_block(block: &Block) -> Result<Vec<u8>> {
-    let mut out = vec![BINCODE_V1];
+    if block.transactions.iter().all(|t| t.data.is_empty()) {
+        return v1::encode(block);
+    }
+    let mut out = vec![BINCODE_V2];
     out.extend(bincode::serialize(block)?);
     Ok(out)
 }
 
 fn decode_block(bytes: &[u8]) -> Result<Block> {
     match bytes.first() {
-        Some(&BINCODE_V1) => Ok(bincode::deserialize(&bytes[1..])?),
+        Some(&BINCODE_V2) => Ok(bincode::deserialize(&bytes[1..])?),
+        Some(&BINCODE_V1) => Ok(bincode::deserialize::<v1::Block>(&bytes[1..])?.into()),
         Some(b'{') => Ok(serde_json::from_slice(bytes)?), // written by v2.0.0
         _ => bail!("unknown block encoding"),
+    }
+}
+
+/// Block layout before transactions had a `data` field. bincode is not
+/// self-describing, so these blocks need their own field-for-field type.
+mod v1 {
+    use qtrc_common::block::{BlockHeader, ValidatorSig};
+    use qtrc_crypto::{Address, HydraXSignature};
+    use serde::Deserialize;
+
+    #[derive(Deserialize)]
+    pub struct Transaction {
+        from:      Address,
+        to:        Address,
+        amount:    u64,
+        nonce:     u64,
+        timestamp: i64,
+        signature: HydraXSignature,
+    }
+
+    #[derive(Deserialize)]
+    pub struct Block {
+        header:         BlockHeader,
+        transactions:   Vec<Transaction>,
+        validator_sigs: Vec<ValidatorSig>,
+    }
+
+    impl From<Block> for qtrc_common::block::Block {
+        fn from(b: Block) -> Self {
+            Self {
+                header: b.header,
+                transactions: b
+                    .transactions
+                    .into_iter()
+                    .map(|t| qtrc_common::tx::Transaction {
+                        from: t.from,
+                        to: t.to,
+                        amount: t.amount,
+                        nonce: t.nonce,
+                        timestamp: t.timestamp,
+                        signature: t.signature,
+                        data: Vec::new(),
+                    })
+                    .collect(),
+                validator_sigs: b.validator_sigs,
+            }
+        }
+    }
+
+    /// The exact bytes a pre-Sentinel node writes. Only valid for blocks
+    /// whose transactions all have empty `data`.
+    pub fn encode(block: &qtrc_common::block::Block) -> anyhow::Result<Vec<u8>> {
+        #[derive(serde::Serialize)]
+        struct Tx<'a> {
+            from: &'a Address,
+            to: &'a Address,
+            amount: u64,
+            nonce: u64,
+            timestamp: i64,
+            signature: &'a HydraXSignature,
+        }
+        #[derive(serde::Serialize)]
+        struct B<'a> {
+            header: &'a BlockHeader,
+            transactions: Vec<Tx<'a>>,
+            validator_sigs: &'a Vec<ValidatorSig>,
+        }
+        let b = B {
+            header: &block.header,
+            transactions: block
+                .transactions
+                .iter()
+                .map(|t| Tx {
+                    from: &t.from,
+                    to: &t.to,
+                    amount: t.amount,
+                    nonce: t.nonce,
+                    timestamp: t.timestamp,
+                    signature: &t.signature,
+                })
+                .collect(),
+            validator_sigs: &block.validator_sigs,
+        };
+        let mut out = vec![super::BINCODE_V1];
+        out.extend(bincode::serialize(&b)?);
+        Ok(out)
     }
 }
 
@@ -155,9 +263,58 @@ mod tests {
                 nonce: 0,
                 timestamp: 0,
                 signature: faucet.sign(&payload),
+                data: vec![],
             })
             .unwrap();
         engine.propose_block().unwrap()
+    }
+
+    #[test]
+    fn pre_sentinel_bincode_blocks_still_read() {
+        let block = sample_block();
+        let old = v1::encode(&block).unwrap();
+        let back = decode_block(&old).unwrap();
+        assert_eq!(back.hash(), block.hash());
+        assert_eq!(back.header.merkle_root, block.header.merkle_root);
+        assert!(back.verify_transactions());
+        // Plain blocks stay readable by the previous release.
+        assert_eq!(encode_block(&block).unwrap(), old);
+        // A block with a Sentinel operation uses the new tag.
+        let mut with_op = block.clone();
+        with_op.transactions[0].data = b"QSN1x".to_vec();
+        let enc = encode_block(&with_op).unwrap();
+        assert_eq!(enc[0], BINCODE_V2);
+        assert_eq!(decode_block(&enc).unwrap().transactions[0].data, b"QSN1x");
+    }
+
+    /// A block written by the pre-Sentinel node (generated with the code on
+    /// `main`, the format the live testnet has on disk) must decode with
+    /// the same merkle root and valid HYDRA-X signatures.
+    #[test]
+    fn block_written_by_previous_release_still_verifies() {
+        let bytes = include_bytes!("../tests/fixtures/block_v1_main.bin");
+        assert_eq!(bytes[0], BINCODE_V1);
+        let block = decode_block(bytes).unwrap();
+        assert!(!block.transactions.is_empty());
+        assert!(block.transactions.iter().all(|t| t.data.is_empty()));
+        assert_eq!(Block::compute_merkle_root(&block.transactions), block.header.merkle_root);
+        assert!(block.verify_transactions(), "HYDRA-X signatures still verify");
+        // Re-encoding as v2 and back is lossless.
+        let again = decode_block(&encode_block(&block).unwrap()).unwrap();
+        assert_eq!(again.hash(), block.hash());
+        assert_eq!(v1::encode(&block).unwrap().as_slice(), bytes.as_slice(), "our v1 encoder matches the real one");
+    }
+
+    #[test]
+    fn sentinel_activation_follows_existing_blocks() {
+        let dir = std::env::temp_dir().join(format!("qtrc-sentinel-act-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        let s = BlockStore::open(dir.to_str().unwrap()).unwrap();
+        s.put_block(&sample_block()).unwrap();
+        assert_eq!(s.sentinel_from_height().unwrap(), 2);
+        assert_eq!(s.sentinel_from_height().unwrap(), 2, "fixed once written");
+        drop(s);
+        let _ = std::fs::remove_dir_all(&dir);
     }
 
     #[test]

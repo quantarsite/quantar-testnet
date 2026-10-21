@@ -17,6 +17,7 @@ fn transfer(kp: &HydraXKeypair, to: &Address, amount: u64, nonce: u64) -> Transa
         nonce,
         timestamp: 1_792_281_600,
         signature: kp.sign(&payload),
+        data: vec![],
     }
 }
 
