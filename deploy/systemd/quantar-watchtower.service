@@ -1,0 +1,19 @@
+# /etc/systemd/system/quantar-watchtower.service
+[Unit]
+Description=Quantar Sentinel watchtower
+After=quantar-node.service
+Wants=quantar-node.service
+
+[Service]
+ExecStart=/usr/local/bin/qtrc-watchtower --config /etc/quantar/watchtower.json
+Restart=always
+RestartSec=5
+# Reads kits and its own fee wallet; needs nothing else.
+NoNewPrivileges=true
+ProtectSystem=strict
+ProtectHome=true
+ReadOnlyPaths=/etc/quantar
+PrivateTmp=true
+
+[Install]
+WantedBy=multi-user.target

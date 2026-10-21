@@ -1,0 +1,14 @@
+{
+  "rpc": "http://127.0.0.1:8545",
+  "payer_key": "/etc/quantar/watchtower.key",
+  "poll_secs": 5,
+  "webhook": null,
+  "accounts": [
+    {
+      "label": "example",
+      "kit": "/etc/quantar/kits/example.kit.json",
+      "recover_at": "50",
+      "trusted": []
+    }
+  ]
+}

@@ -9,10 +9,11 @@ members = [
     "crates/qtrc-faucet",
     "crates/qtrc-wallet",
     "crates/qtrc-sentinel",
+    "crates/qtrc-watchtower",
 ]
 
 [workspace.package]
-version     = "0.3.0"
+version     = "0.4.0"
 edition     = "2021"
 authors     = ["Jefferson Buiar <contact@quantarnetwork.com>"]
 license     = "MIT"
