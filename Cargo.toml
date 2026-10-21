@@ -8,6 +8,7 @@ members = [
     "crates/qtrc-node",
     "crates/qtrc-faucet",
     "crates/qtrc-wallet",
+    "crates/qtrc-sentinel",
 ]
 
 [workspace.package]
