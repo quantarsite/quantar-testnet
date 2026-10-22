@@ -6,6 +6,12 @@
 //!                  before Sentinel; JSON = written by v2.0.0; both still read)
 //!   tree "meta":   "genesis" -> JSON genesis config this chain was started with
 //!
+//!   file "chain.marker" next to the sled dir: written when the genesis is
+//!                  saved, then raised after every stored block. sled can
+//!                  lose files and open as an empty database; the marker
+//!                  lives outside it so that case is refused instead of
+//!                  being mistaken for a new data directory.
+//!
 //! Heights are stored big-endian so sled's byte ordering is numeric order.
 //! (Little-endian keys, as in v1, sort 256 before 255 and break `last()`.)
 
@@ -13,16 +19,20 @@ use anyhow::{bail, Context, Result};
 use qtrc_common::{block::Block, genesis::Genesis};
 use qtrc_consensus::BlockSink;
 use sled::{Db, Tree};
+use std::path::{Path, PathBuf};
 
 const GENESIS_KEY: &[u8] = b"genesis";
 const FEE_FROM_KEY: &[u8] = b"fee_from_height";
 const SENTINEL_FROM_KEY: &[u8] = b"sentinel_from_height";
 const STATE_ROOT_FROM_KEY: &[u8] = b"state_root_from_height";
+const MARKER_FILE: &str = "chain.marker";
+const MARKER_HEADER: &str = "quantar chain store v1";
 
 pub struct BlockStore {
     db:     Db,
     blocks: Tree,
     meta:   Tree,
+    marker: PathBuf,
 }
 
 impl BlockStore {
@@ -31,7 +41,65 @@ impl BlockStore {
             .with_context(|| format!("cannot open chain store in {path}"))?;
         let blocks = db.open_tree("blocks")?;
         let meta = db.open_tree("meta")?;
-        Ok(BlockStore { db, blocks, meta })
+        let store = BlockStore { db, blocks, meta, marker: Path::new(path).join(MARKER_FILE) };
+        store.check_marker(path)?;
+        Ok(store)
+    }
+
+    /// Refuse a store that holds less than this data dir is known to have
+    /// committed. Data dirs from before the marker get one on first open.
+    fn check_marker(&self, path: &str) -> Result<()> {
+        let has_genesis = self.meta.get(GENESIS_KEY)?.is_some();
+        let latest = self.latest_height()?.unwrap_or(0);
+        match self.read_marker()? {
+            Some(committed) => {
+                if !has_genesis {
+                    bail!(
+                        "{path} holds a chain that reached block {committed}, but its database \
+                         opened without a genesis: the sled files are damaged or incomplete. \
+                         Refusing to start a new chain over it. Restore the data dir from a backup."
+                    );
+                }
+                if latest < committed {
+                    bail!(
+                        "{path} committed up to block {committed}, but its database ends at \
+                         block {latest}: blocks are missing. Restore the data dir from a backup."
+                    );
+                }
+                Ok(())
+            }
+            None if has_genesis => self.write_marker(latest),
+            None => Ok(()),
+        }
+    }
+
+    fn read_marker(&self) -> Result<Option<u64>> {
+        let text = match std::fs::read_to_string(&self.marker) {
+            Ok(t) => t,
+            Err(e) if e.kind() == std::io::ErrorKind::NotFound => return Ok(None),
+            Err(e) => return Err(e).with_context(|| format!("cannot read {}", self.marker.display())),
+        };
+        let mut lines = text.lines();
+        let height = (lines.next() == Some(MARKER_HEADER))
+            .then(|| lines.next()?.strip_prefix("height=")?.parse::<u64>().ok())
+            .flatten();
+        match height {
+            Some(h) => Ok(Some(h)),
+            None => bail!("{} is corrupt; restore the data dir from a backup", self.marker.display()),
+        }
+    }
+
+    /// Atomic replace: write a temp file, sync it, rename over the marker.
+    fn write_marker(&self, height: u64) -> Result<()> {
+        use std::io::Write;
+        let tmp = self.marker.with_extension("tmp");
+        let mut f = std::fs::File::create(&tmp)
+            .with_context(|| format!("cannot write {}", tmp.display()))?;
+        writeln!(f, "{MARKER_HEADER}\nheight={height}")?;
+        f.sync_all()?;
+        std::fs::rename(&tmp, &self.marker)
+            .with_context(|| format!("cannot write {}", self.marker.display()))?;
+        Ok(())
     }
 
     /// Genesis this data directory was created with, if any.
@@ -46,7 +114,7 @@ impl BlockStore {
     pub fn save_genesis(&self, genesis: &Genesis) -> Result<()> {
         self.meta.insert(GENESIS_KEY, serde_json::to_vec(genesis)?)?;
         self.db.flush()?;
-        Ok(())
+        self.write_marker(self.latest_height()?.unwrap_or(0))
     }
 
     /// First height that charges the protocol fee, fixed once per data dir.
@@ -115,6 +183,12 @@ impl BlockStore {
         if let Err(e) = self.db.flush() {
             let _ = self.blocks.remove(height.to_be_bytes());
             bail!("could not flush block {height} to disk: {e}");
+        }
+        // The block is durable in sled; the marker may only trail it. A
+        // crash before this line leaves the marker one block behind, which
+        // the open check accepts.
+        if self.marker.exists() {
+            self.write_marker(height)?;
         }
         Ok(())
     }
@@ -507,6 +581,75 @@ mod tests {
         assert_eq!(decode_block(&bin).unwrap().hash(), block.hash());
         assert_eq!(decode_block(&json).unwrap().hash(), block.hash(), "blocos da v2.0.0");
         assert!(bin.len() * 3 < json.len(), "binario {} vs json {}", bin.len(), json.len());
+    }
+
+    fn tmp_dir(tag: &str) -> std::path::PathBuf {
+        let dir = std::env::temp_dir().join(format!("qtrc-store-{tag}-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        dir
+    }
+
+    /// Adversarial finding F1: deleting sled's snapshot made the store open
+    /// empty and the node started a new chain over the old data dir.
+    #[test]
+    fn lost_sled_snapshot_is_refused_not_mistaken_for_a_new_chain() {
+        let dir = tmp_dir("snaploss");
+        let path = dir.to_str().unwrap();
+        {
+            let s = BlockStore::open(path).unwrap();
+            s.save_genesis(&Genesis::testnet_with_faucet(None)).unwrap();
+            s.put_block(&sample_block()).unwrap();
+        }
+        assert!(BlockStore::open(path).is_ok(), "healthy reopen");
+        // With blob-sized values (real HYDRA-X blocks), losing snap.* after a
+        // reopen makes sled open with no trees at all. That outcome is
+        // reproduced directly here, since which files sled needs varies.
+        std::fs::remove_dir_all(dir.join("chain")).unwrap();
+        let err = BlockStore::open(path).err().expect("damaged store must not open").to_string();
+        assert!(err.contains("Refusing to start a new chain"), "{err}");
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn missing_blocks_are_refused() {
+        let dir = tmp_dir("missing");
+        let path = dir.to_str().unwrap();
+        {
+            let s = BlockStore::open(path).unwrap();
+            s.save_genesis(&Genesis::testnet_with_faucet(None)).unwrap();
+            s.put_block(&sample_block()).unwrap();
+        }
+        std::fs::write(dir.join(MARKER_FILE), format!("{MARKER_HEADER}\nheight=5\n")).unwrap();
+        let err = BlockStore::open(path).err().expect("must refuse").to_string();
+        assert!(err.contains("blocks are missing"), "{err}");
+        std::fs::write(dir.join(MARKER_FILE), "garbage").unwrap();
+        assert!(BlockStore::open(path).err().unwrap().to_string().contains("corrupt"));
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// The live data dir has a genesis and blocks but no marker yet: the
+    /// first open of the new binary adopts it at its current height.
+    #[test]
+    fn existing_data_dir_gets_a_marker_on_first_open() {
+        let dir = tmp_dir("adopt");
+        let path = dir.to_str().unwrap();
+        {
+            let s = BlockStore::open(path).unwrap();
+            s.save_genesis(&Genesis::testnet_with_faucet(None)).unwrap();
+            s.put_block(&sample_block()).unwrap();
+        }
+        std::fs::remove_file(dir.join(MARKER_FILE)).unwrap();
+        let s = BlockStore::open(path).unwrap();
+        assert_eq!(s.read_marker().unwrap(), Some(1));
+        drop(s);
+        // A fresh directory stays markerless until it has a genesis.
+        let fresh = tmp_dir("fresh");
+        let s = BlockStore::open(fresh.to_str().unwrap()).unwrap();
+        assert_eq!(s.read_marker().unwrap(), None);
+        s.save_genesis(&Genesis::testnet_with_faucet(None)).unwrap();
+        assert_eq!(s.read_marker().unwrap(), Some(0));
+        let _ = std::fs::remove_dir_all(&dir);
+        let _ = std::fs::remove_dir_all(&fresh);
     }
 
     #[test]
