@@ -641,6 +641,82 @@ impl Vault {
         Ok((cold_dest.clone(), amount))
     }
 
+    /// Canonical, versioned byte encoding of the whole vault, used to
+    /// commit it in the chain's state root. Independent of serde and
+    /// bincode, so changing how the vault is stored can never change the
+    /// state root of past blocks. The exhaustive destructuring makes any new
+    /// field a compile error here until it is given an encoding (and the
+    /// version bumped). Locked by a fixed test vector.
+    #[must_use]
+    pub fn canonical_encoding(&self) -> Vec<u8> {
+        fn u64le(out: &mut Vec<u8>, v: u64) {
+            out.extend_from_slice(&v.to_le_bytes());
+        }
+        fn outflows(out: &mut Vec<u8>, list: &[Outflow]) {
+            u64le(out, list.len() as u64);
+            for Outflow { height, to, amount } in list {
+                u64le(out, *height);
+                out.extend_from_slice(&to.0);
+                u64le(out, *amount);
+            }
+        }
+        let Vault {
+            address,
+            balance,
+            reserved,
+            commitment,
+            pending,
+            recent,
+            finalized,
+            recovered_to,
+            policy: Policy { delay_blocks, allowance_per_window },
+            next_id,
+            epoch,
+        } = self;
+        let mut out = b"QTR/VAULT/v1".to_vec();
+        out.extend_from_slice(&address.0);
+        u64le(&mut out, *balance);
+        u64le(&mut out, *reserved);
+        match commitment {
+            Some(c) => {
+                out.push(1);
+                out.extend_from_slice(c);
+            }
+            None => out.push(0),
+        }
+        u64le(&mut out, pending.len() as u64);
+        for Pending { id, kind, created_height, unlock_height } in pending {
+            u64le(&mut out, *id);
+            u64le(&mut out, *created_height);
+            u64le(&mut out, *unlock_height);
+            match kind {
+                PendingKind::Transfer { to, amount } => {
+                    out.push(1);
+                    out.extend_from_slice(&to.0);
+                    u64le(&mut out, *amount);
+                }
+                PendingKind::RotateCommitment { new_commitment } => {
+                    out.push(2);
+                    out.extend_from_slice(new_commitment);
+                }
+            }
+        }
+        outflows(&mut out, recent);
+        outflows(&mut out, finalized);
+        match recovered_to {
+            Some(a) => {
+                out.push(1);
+                out.extend_from_slice(&a.0);
+            }
+            None => out.push(0),
+        }
+        u64le(&mut out, *delay_blocks);
+        u64le(&mut out, *allowance_per_window);
+        u64le(&mut out, *next_id);
+        u64le(&mut out, *epoch);
+        out
+    }
+
     /// Verify every invariant. Call after deserializing a vault from
     /// storage or from the network.
     ///
@@ -1284,6 +1360,27 @@ mod tests {
         back.validate().unwrap();
         assert_eq!(back.epoch(), 0);
     }
+
+    /// Locks the canonical encoding used by the chain's state root. If this
+    /// fails, past state roots would change: do not update the vector, add a
+    /// new encoding version instead.
+    #[test]
+    fn canonical_encoding_test_vector() {
+        let mut v = vault();
+        v.transfer(10, thief(), 30).unwrap();
+        v.transfer(11, thief(), 500).unwrap();
+        queued(v.request_rotation(12, commit(&[3u8; 32])).unwrap());
+        let enc = v.canonical_encoding();
+        let digest: [u8; 32] = Sha3_256::digest(&enc).into();
+        assert_eq!(hex_of(&digest), VAULT_VECTOR, "canonical vault encoding changed");
+        assert!(enc.starts_with(b"QTR/VAULT/v1"));
+    }
+
+    fn hex_of(b: &[u8]) -> String {
+        b.iter().map(|x| format!("{x:02x}")).collect()
+    }
+
+    const VAULT_VECTOR: &str = "b62cde142bcd35f49c3f1d52cc072d85a3342cfd2e465c40f58428734a0394ee";
 
     // ---- real HYDRA-X -----------------------------------------------------
 

@@ -17,6 +17,7 @@ use sled::{Db, Tree};
 const GENESIS_KEY: &[u8] = b"genesis";
 const FEE_FROM_KEY: &[u8] = b"fee_from_height";
 const SENTINEL_FROM_KEY: &[u8] = b"sentinel_from_height";
+const STATE_ROOT_FROM_KEY: &[u8] = b"state_root_from_height";
 
 pub struct BlockStore {
     db:     Db,
@@ -64,6 +65,30 @@ impl BlockStore {
         self.activation_height(SENTINEL_FROM_KEY)
     }
 
+    /// First height whose header carries the state root, fixed once per
+    /// data dir like the fee and Sentinel activations.
+    ///
+    /// If the stored height already has a block and that block has no root,
+    /// an older binary ran on this data dir after the activation was recorded
+    /// (rolled back before the first root was mined). Move the activation
+    /// past those blocks so they replay instead of failing.
+    pub fn state_root_from_height(&self) -> Result<u64> {
+        let from = self.activation_height(STATE_ROOT_FROM_KEY)?;
+        let Some(latest) = self.latest_height()? else { return Ok(from) };
+        if from > latest {
+            return Ok(from);
+        }
+        match self.get_block(from)? {
+            Some(b) if b.header.state_root.is_none() => {
+                let moved = latest + 1;
+                self.meta.insert(STATE_ROOT_FROM_KEY, &moved.to_be_bytes())?;
+                self.db.flush()?;
+                Ok(moved)
+            }
+            _ => Ok(from),
+        }
+    }
+
     fn activation_height(&self, key: &[u8]) -> Result<u64> {
         if let Some(v) = self.meta.get(key)? {
             let buf: [u8; 8] = v.as_ref().try_into().context("corrupt activation height")?;
@@ -94,7 +119,6 @@ impl BlockStore {
         Ok(())
     }
 
-    #[allow(dead_code)]
     pub fn get_block(&self, height: u64) -> Result<Option<Block>> {
         match self.blocks.get(height.to_be_bytes())? {
             Some(bytes) => Ok(Some(decode_block(&bytes)?)),
@@ -124,35 +148,137 @@ impl BlockStore {
 /// Format tags for bincode-encoded blocks.
 const BINCODE_V1: u8 = 0x01;
 const BINCODE_V2: u8 = 0x02;
+const BINCODE_V3: u8 = 0x03;
 
 /// Binary encoding: about 4x smaller than JSON, which writes every
 /// signature byte as a decimal number (a tx was ~132 KB in JSON).
 ///
-/// Blocks without any Sentinel operation are still written in format 0x01,
-/// which the previous release reads: until the first Sentinel operation is
-/// mined, the operator can roll back to the old binary on the same data dir.
+/// The oldest format that can represent a block is used, so older releases
+/// keep reading this data dir for as long as possible:
+/// 0x01 no Sentinel data and no state root (any release),
+/// 0x02 Sentinel data, no state root (v2.1+),
+/// 0x03 state root in the header (v2.3+).
 fn encode_block(block: &Block) -> Result<Vec<u8>> {
+    if block.header.state_root.is_some() {
+        return wire::encode_v3(block);
+    }
     if block.transactions.iter().all(|t| t.data.is_empty()) {
         return v1::encode(block);
     }
-    let mut out = vec![BINCODE_V2];
-    out.extend(bincode::serialize(block)?);
-    Ok(out)
+    wire::encode_v2(block)
 }
 
 fn decode_block(bytes: &[u8]) -> Result<Block> {
     match bytes.first() {
-        Some(&BINCODE_V2) => Ok(bincode::deserialize(&bytes[1..])?),
+        Some(&BINCODE_V3) => Ok(bincode::deserialize::<wire::BlockV3>(&bytes[1..])?.into()),
+        Some(&BINCODE_V2) => Ok(bincode::deserialize::<wire::BlockV2>(&bytes[1..])?.into()),
         Some(&BINCODE_V1) => Ok(bincode::deserialize::<v1::Block>(&bytes[1..])?.into()),
         Some(b'{') => Ok(serde_json::from_slice(bytes)?), // written by v2.0.0
         _ => bail!("unknown block encoding"),
     }
 }
 
-/// Block layout before transactions had a `data` field. bincode is not
-/// self-describing, so these blocks need their own field-for-field type.
+/// Field-for-field layouts of the stored formats. bincode is not
+/// self-describing, so each format has its own fixed type, independent of
+/// how `BlockHeader` evolves.
+mod wire {
+    use qtrc_common::block::{Block, BlockHash, BlockHeader, ValidatorSig};
+    use qtrc_common::tx::{Transaction, TxHash};
+    use qtrc_crypto::Address;
+    use serde::{Deserialize, Serialize};
+
+    /// Header as stored before state roots (formats 0x01 and 0x02).
+    #[derive(Serialize, Deserialize)]
+    pub struct HeaderV1 {
+        pub height:      u64,
+        pub prev_hash:   BlockHash,
+        pub merkle_root: TxHash,
+        pub timestamp:   i64,
+        pub proposer:    Address,
+    }
+
+    impl HeaderV1 {
+        pub fn of(h: &BlockHeader) -> Self {
+            Self {
+                height: h.height,
+                prev_hash: h.prev_hash.clone(),
+                merkle_root: h.merkle_root.clone(),
+                timestamp: h.timestamp,
+                proposer: h.proposer.clone(),
+            }
+        }
+        pub fn into_header(self, state_root: Option<[u8; 32]>) -> BlockHeader {
+            BlockHeader {
+                height: self.height,
+                prev_hash: self.prev_hash,
+                merkle_root: self.merkle_root,
+                timestamp: self.timestamp,
+                proposer: self.proposer,
+                state_root,
+            }
+        }
+    }
+
+    #[derive(Serialize, Deserialize)]
+    pub struct BlockV2 {
+        header:         HeaderV1,
+        transactions:   Vec<Transaction>,
+        validator_sigs: Vec<ValidatorSig>,
+    }
+
+    impl From<BlockV2> for Block {
+        fn from(b: BlockV2) -> Self {
+            Block { header: b.header.into_header(None), transactions: b.transactions, validator_sigs: b.validator_sigs }
+        }
+    }
+
+    #[derive(Serialize, Deserialize)]
+    pub struct BlockV3 {
+        header:         HeaderV1,
+        state_root:     [u8; 32],
+        transactions:   Vec<Transaction>,
+        validator_sigs: Vec<ValidatorSig>,
+    }
+
+    impl From<BlockV3> for Block {
+        fn from(b: BlockV3) -> Self {
+            Block {
+                header: b.header.into_header(Some(b.state_root)),
+                transactions: b.transactions,
+                validator_sigs: b.validator_sigs,
+            }
+        }
+    }
+
+    pub fn encode_v2(block: &Block) -> anyhow::Result<Vec<u8>> {
+        let b = BlockV2 {
+            header: HeaderV1::of(&block.header),
+            transactions: block.transactions.clone(),
+            validator_sigs: block.validator_sigs.clone(),
+        };
+        let mut out = vec![super::BINCODE_V2];
+        out.extend(bincode::serialize(&b)?);
+        Ok(out)
+    }
+
+    pub fn encode_v3(block: &Block) -> anyhow::Result<Vec<u8>> {
+        let root = block.header.state_root.ok_or_else(|| anyhow::anyhow!("format 0x03 needs a state root"))?;
+        let b = BlockV3 {
+            header: HeaderV1::of(&block.header),
+            state_root: root,
+            transactions: block.transactions.clone(),
+            validator_sigs: block.validator_sigs.clone(),
+        };
+        let mut out = vec![super::BINCODE_V3];
+        out.extend(bincode::serialize(&b)?);
+        Ok(out)
+    }
+}
+
+/// Block layout before transactions had a `data` field.
 mod v1 {
-    use qtrc_common::block::{BlockHeader, ValidatorSig};
+    use super::wire::HeaderV1;
+    use qtrc_common::block::ValidatorSig;
     use qtrc_crypto::{Address, HydraXSignature};
     use serde::Deserialize;
 
@@ -168,7 +294,7 @@ mod v1 {
 
     #[derive(Deserialize)]
     pub struct Block {
-        header:         BlockHeader,
+        header:         HeaderV1,
         transactions:   Vec<Transaction>,
         validator_sigs: Vec<ValidatorSig>,
     }
@@ -176,7 +302,7 @@ mod v1 {
     impl From<Block> for qtrc_common::block::Block {
         fn from(b: Block) -> Self {
             Self {
-                header: b.header,
+                header: b.header.into_header(None),
                 transactions: b
                     .transactions
                     .into_iter()
@@ -196,7 +322,7 @@ mod v1 {
     }
 
     /// The exact bytes a pre-Sentinel node writes. Only valid for blocks
-    /// whose transactions all have empty `data`.
+    /// whose transactions all have empty `data` and no state root.
     pub fn encode(block: &qtrc_common::block::Block) -> anyhow::Result<Vec<u8>> {
         #[derive(serde::Serialize)]
         struct Tx<'a> {
@@ -209,12 +335,12 @@ mod v1 {
         }
         #[derive(serde::Serialize)]
         struct B<'a> {
-            header: &'a BlockHeader,
+            header: HeaderV1,
             transactions: Vec<Tx<'a>>,
             validator_sigs: &'a Vec<ValidatorSig>,
         }
         let b = B {
-            header: &block.header,
+            header: HeaderV1::of(&block.header),
             transactions: block
                 .transactions
                 .iter()
@@ -245,7 +371,12 @@ impl BlockSink for BlockStore {
 mod tests {
     use super::*;
 
+    /// A block as the previous releases made it: no state root.
     fn sample_block() -> Block {
+        sample_block_with(false)
+    }
+
+    fn sample_block_with(state_root: bool) -> Block {
         use qtrc_common::genesis::{Genesis, MICRO_QTR};
         use qtrc_common::tx::Transaction;
         use qtrc_consensus::ConsensusEngine;
@@ -253,7 +384,11 @@ mod tests {
         let faucet = HydraXKeypair::generate();
         let to = HydraXKeypair::generate().address();
         let g = Genesis::testnet_with_faucet(Some(&faucet.address().as_hex()));
-        let engine = ConsensusEngine::new(g.initial_state(), HydraXKeypair::generate());
+        let mut st = g.initial_state();
+        if !state_root {
+            st.state_root_from_height = u64::MAX;
+        }
+        let engine = ConsensusEngine::new(st, HydraXKeypair::generate());
         let payload = Transaction::signing_payload(&faucet.address(), &to, MICRO_QTR, 0);
         engine
             .submit_tx(Transaction {
@@ -267,6 +402,53 @@ mod tests {
             })
             .unwrap();
         engine.propose_block().unwrap()
+    }
+
+    /// A Sentinel-era block (format 0x02) written by the release on `main`,
+    /// the format the live node has on disk since v2.1. The fixture's data
+    /// was set after signing, so only the layout is checked: it must decode
+    /// and re-encode to the exact same bytes.
+    #[test]
+    fn sentinel_era_v2_block_from_previous_release_still_reads() {
+        let bytes = include_bytes!("../tests/fixtures/block_v2_main.bin");
+        assert_eq!(bytes[0], BINCODE_V2);
+        let block = decode_block(bytes).unwrap();
+        assert_eq!(block.transactions[0].data, b"QSN1-fixture-data");
+        assert!(block.header.state_root.is_none());
+        assert_eq!(wire::encode_v2(&block).unwrap().as_slice(), bytes.as_slice());
+        assert_eq!(encode_block(&block).unwrap().as_slice(), bytes.as_slice());
+    }
+
+    /// Regression U1: new binary records the activation, operator rolls back
+    /// before any root is mined, the old binary adds blocks without roots,
+    /// then the new binary returns. The activation must move past them.
+    #[test]
+    fn rollback_before_first_root_does_not_brick_the_node() {
+        let dir = std::env::temp_dir().join(format!("qtrc-u1-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        let s = BlockStore::open(dir.to_str().unwrap()).unwrap();
+        assert_eq!(s.state_root_from_height().unwrap(), 1, "new binary on an empty dir");
+        s.put_block(&sample_block()).unwrap(); // old binary mines block 1 without a root
+        assert_eq!(s.state_root_from_height().unwrap(), 2, "activation moved past it");
+        assert_eq!(s.state_root_from_height().unwrap(), 2, "and stays there");
+        drop(s);
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn state_root_blocks_use_v3_and_roundtrip() {
+        let block = sample_block_with(true);
+        assert!(block.header.state_root.is_some());
+        let enc = encode_block(&block).unwrap();
+        assert_eq!(enc[0], BINCODE_V3);
+        let back = decode_block(&enc).unwrap();
+        assert_eq!(back.header.state_root, block.header.state_root);
+        assert_eq!(back.hash(), block.hash());
+        assert!(back.verify_transactions());
+        // The root is part of the signed header: dropping it changes the hash.
+        let mut stripped = block.clone();
+        stripped.header.state_root = None;
+        assert_ne!(stripped.hash(), block.hash());
     }
 
     #[test]

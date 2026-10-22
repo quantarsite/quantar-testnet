@@ -14,6 +14,7 @@
 //! qtrc-wallet send <TO> <AMOUNT>      send QTR (amount in QTR, e.g. 12.5;
 //!                                     a 0.01 QTR network fee is burned)
 //! qtrc-wallet status                  show the network status
+//! qtrc-wallet proof [ADDRESS]         check a balance against a signed state root
 //!
 //! Sentinel (recovery + delayed large transfers):
 //! qtrc-wallet guardian setup --cold <ADDR>   protect this account
@@ -40,6 +41,8 @@ use zeroize::Zeroizing;
 
 const DEFAULT_RPC: &str = "https://testnet.quantarnetwork.com/rpc";
 const DEFAULT_FAUCET: &str = "https://faucet.quantarnetwork.com";
+/// Validator of quantar-testnet-2. `proof` only trusts headers it signed.
+const DEFAULT_VALIDATOR: &str = "809ae6fb45d3d7c9a2c2f3968c58cc55ad6bb2ca2cfe84f65619c013bbcbbbff";
 
 #[derive(Parser, Debug)]
 #[command(
@@ -60,6 +63,10 @@ struct Cli {
     #[arg(long, global = true, env = "QTR_FAUCET", default_value = DEFAULT_FAUCET)]
     faucet: String,
 
+    /// Validator whose signature `proof` requires on block headers
+    #[arg(long, global = true, env = "QTR_VALIDATOR", default_value = DEFAULT_VALIDATOR)]
+    validator: String,
+
     #[command(subcommand)]
     command: Command,
 }
@@ -79,6 +86,10 @@ enum Command {
     Send { to: String, amount: String },
     /// Show the network status
     Status,
+    /// Check an account's balance yourself: verifies the validator's
+    /// HYDRA-X signature on the latest block header and the Merkle proof
+    /// of the account against the state root in that header
+    Proof { address: Option<String> },
     /// Sentinel guardian: recovery key and delayed large transfers
     #[command(subcommand)]
     Guardian(GuardianCmd),
@@ -166,6 +177,13 @@ fn run(cli: Cli) -> Result<()> {
             cmd_guardian(&http, rpc, &key_path, &cold, Some((delay, &allowance)), out)
         }
         Command::Guardian(GuardianCmd::Rotate { cold, out }) => cmd_guardian(&http, rpc, &key_path, &cold, None, out),
+        Command::Proof { address } => {
+            let addr = match address {
+                Some(a) => parse_address(&a)?,
+                None => load_wallet(&key_path)?.address(),
+            };
+            cmd_proof(&http, rpc, &addr, &parse_address(&cli.validator)?)
+        }
         Command::Vault { address } => {
             let addr = match address {
                 Some(a) => parse_address(&a)?,
@@ -473,6 +491,94 @@ fn cmd_guardian(
     Ok(())
 }
 
+/// What a verified proof shows.
+#[derive(Debug)]
+struct Proven {
+    height: u64,
+    timestamp: i64,
+    root: [u8; 32],
+    leaf: qtrc_common::state_root::Leaf,
+}
+
+/// Check a node's answer without trusting the node: the header must be
+/// signed (ML-DSA-87 AND SLH-DSA) by the expected validator, and the proof
+/// must lead from the account to the state root in that header.
+fn verify_proof_answer(
+    header: &qtrc_common::block::BlockHeader,
+    sigs: &[qtrc_common::block::ValidatorSig],
+    proof: Option<&qtrc_common::state_root::Proof>,
+    addr: &Address,
+    validator: &Address,
+) -> Result<Proven> {
+    if &header.proposer != validator {
+        bail!(
+            "header was proposed by {}, not by the expected validator {}",
+            header.proposer.as_hex(),
+            validator.as_hex()
+        );
+    }
+    let sig = sigs
+        .iter()
+        .find(|s| &s.validator == validator)
+        .ok_or_else(|| anyhow!("header has no signature from the validator"))?;
+    if &sig.signature.signer_address() != validator {
+        bail!("header signature was made by a different key than the validator's");
+    }
+    sig.signature
+        .verify(&header.signing_bytes())
+        .map_err(|e| anyhow!("validator signature on the header is invalid: {e}"))?;
+    let root = header.state_root.ok_or_else(|| anyhow!("this block has no state root"))?;
+    let proof = proof.ok_or_else(|| {
+        anyhow!("NOT VERIFIED: the node sent no proof (it says the account is empty, which cannot be proven yet)")
+    })?;
+    if &proof.leaf.address != addr {
+        bail!("node returned a proof for a different account");
+    }
+    if !proof.verify(&root) {
+        bail!("PROOF INVALID: the node's answer does not match the signed state root");
+    }
+    Ok(Proven { height: header.height, timestamp: header.timestamp, root, leaf: proof.leaf.clone() })
+}
+
+fn cmd_proof(http: &Client, rpc: &str, addr: &Address, validator: &Address) -> Result<()> {
+    use qtrc_common::block::{BlockHeader, ValidatorSig};
+    use qtrc_common::state_root::Proof;
+
+    let r = get_json(http, &format!("{rpc}/proof/{}", addr.as_hex()))?;
+    let header: BlockHeader = serde_json::from_value(r["header"].clone()).context("bad header from node")?;
+    let sigs: Vec<ValidatorSig> = serde_json::from_value(r["validator_sigs"].clone()).context("bad signatures from node")?;
+    let proof: Option<Proof> = serde_json::from_value(r["proof"].clone()).context("bad proof from node")?;
+
+    let p = verify_proof_answer(&header, &sigs, proof.as_ref(), addr, validator)?;
+    let age = chrono::Utc::now().timestamp().saturating_sub(p.timestamp);
+
+    println!("Verified with ML-DSA-87 AND SLH-DSA-SHA2-256s, signed by validator {}.", short_addr(validator));
+    println!("account : {}", addr.as_hex());
+    println!("balance : {} QTR", format_qtr(p.leaf.balance));
+    println!("nonce   : {}", p.leaf.nonce);
+    println!("guarded : {}", if p.leaf.vault_hash.is_some() { "yes (Sentinel vault)" } else { "no" });
+    println!("block   : {} ({} ago)", p.height, human_age(age));
+    println!("root    : {}", hex::encode(p.root));
+    println!();
+    println!("This proves the balance as of block {}. A node can still answer with an older", p.height);
+    println!("block; if that block looks too old for recent activity, ask another node.");
+    Ok(())
+}
+
+fn short_addr(a: &Address) -> String {
+    let h = a.as_hex();
+    format!("{}…{}", &h[..8], &h[56..])
+}
+
+fn human_age(secs: i64) -> String {
+    match secs {
+        s if s < 120 => format!("{s} s"),
+        s if s < 7_200 => format!("{} min", s / 60),
+        s if s < 172_800 => format!("{} h", s / 3_600),
+        s => format!("{} days", s / 86_400),
+    }
+}
+
 fn cmd_vault(http: &Client, rpc: &str, addr: &Address) -> Result<()> {
     let r = get_json(http, &format!("{rpc}/vault/{}", addr.as_hex()))?;
     let v = &r["vault"];
@@ -673,6 +779,49 @@ mod tests {
         assert_eq!(format_qtr(50 * MICRO_QTR), "50");
         assert_eq!(format_qtr(12_500_000), "12.5");
         assert_eq!(format_qtr(1), "0.000001");
+    }
+
+    /// Regression W1: a node cannot pass off a header signed by its own key.
+    #[test]
+    fn proof_requires_the_expected_validator() {
+        use qtrc_common::block::{BlockHash, BlockHeader, ValidatorSig};
+        use qtrc_common::state::AccountState;
+        use qtrc_common::tx::TxHash;
+
+        let victim = HydraXKeypair::generate().address();
+        let mut fake = qtrc_common::genesis::Genesis::testnet_with_faucet(None).initial_state();
+        fake.accounts.insert(victim.as_hex(), AccountState { balance: 1_000_000 * MICRO_QTR, nonce: 0 });
+        let header_by = |kp: &HydraXKeypair| {
+            let header = BlockHeader {
+                height: 999_999,
+                prev_hash: BlockHash([0; 32]),
+                merkle_root: TxHash([0; 32]),
+                timestamp: 0,
+                proposer: kp.address(),
+                state_root: Some(fake.state_root()),
+            };
+            let sigs = vec![ValidatorSig { validator: kp.address(), signature: kp.sign(&header.signing_bytes()) }];
+            (header, sigs)
+        };
+        let proof = fake.state_proof(&victim).unwrap();
+
+        let real = HydraXKeypair::generate();
+        let evil = HydraXKeypair::generate();
+        let (h, s) = header_by(&evil);
+        assert!(verify_proof_answer(&h, &s, Some(&proof), &victim, &real.address()).is_err(), "evil key refused");
+
+        let (h, s) = header_by(&real);
+        let ok = verify_proof_answer(&h, &s, Some(&proof), &victim, &real.address()).unwrap();
+        assert_eq!(ok.leaf.balance, 1_000_000 * MICRO_QTR);
+
+        // Signature by the validator over a different header is refused.
+        let (mut h2, s2) = header_by(&real);
+        h2.height += 1;
+        assert!(verify_proof_answer(&h2, &s2, Some(&proof), &victim, &real.address()).is_err());
+
+        // No proof is "not verified", never a statement of fact.
+        let err = verify_proof_answer(&h, &s, None, &victim, &real.address()).unwrap_err().to_string();
+        assert!(err.contains("NOT VERIFIED"), "{err}");
     }
 
     #[test]

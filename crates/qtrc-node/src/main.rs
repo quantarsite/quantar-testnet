@@ -170,6 +170,11 @@ async fn cmd_start(rpc_addr: String, data_dir: String, key_file: Option<String>)
     let mut init_state = genesis.initial_state();
     init_state.fee_from_height = store.fee_from_height()?;
     init_state.sentinel_from_height = store.sentinel_from_height()?;
+    init_state.state_root_from_height = store.state_root_from_height()?;
+    info!(
+        state_root_from_height = init_state.state_root_from_height,
+        "Block headers carry the state root from this height"
+    );
     info!(
         sentinel_from_height = init_state.sentinel_from_height,
         "Sentinel operations accepted from this height"

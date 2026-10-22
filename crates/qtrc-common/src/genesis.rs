@@ -95,6 +95,7 @@ impl Genesis {
             fee_from_height: 1,
             burned: 0,
             sentinel_from_height: 1,
+            state_root_from_height: 1,
             vaults: Default::default(),
         }
     }
@@ -112,6 +113,7 @@ impl Genesis {
             merkle_root: TxHash([0u8; 32]),
             timestamp:   self.timestamp,
             proposer,
+            state_root:  None,
         };
 
         Block {

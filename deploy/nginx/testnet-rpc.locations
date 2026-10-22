@@ -24,6 +24,12 @@ location ~ "^/rpc/vault/([0-9a-fA-F]{64})$" {
     proxy_pass http://127.0.0.1:8545/vault/$1;
 }
 
+# Prova de saldo contra o state root assinado
+location ~ "^/rpc/proof/([0-9a-fA-F]{64})$" {
+    limit_req zone=qtr_read burst=20 nodelay;
+    proxy_pass http://127.0.0.1:8545/proof/$1;
+}
+
 location = /rpc/tx {
     limit_except POST { deny all; }
     limit_req zone=qtr_tx burst=5 nodelay;

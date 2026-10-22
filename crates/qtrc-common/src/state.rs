@@ -47,6 +47,9 @@ pub struct ChainState {
     /// already has blocks activates it at a later height, like fees.
     #[serde(default = "never")]
     pub sentinel_from_height: u64,
+    /// First block height whose header must carry the state root.
+    #[serde(default = "never")]
+    pub state_root_from_height: u64,
     /// Sentinel vaults, key = address hex. Ordered for determinism.
     #[serde(default)]
     pub vaults: BTreeMap<String, Vault>,
@@ -98,6 +101,11 @@ impl ChainState {
     /// Fee charged for a transaction included at block `height`.
     pub fn fee_at(&self, height: u64) -> u64 {
         if height >= self.fee_from_height { TX_FEE } else { 0 }
+    }
+
+    /// Whether the block at `height` must carry a state root.
+    pub fn state_root_active_at(&self, height: u64) -> bool {
+        height >= self.state_root_from_height
     }
 
     /// Whether Sentinel operations are accepted at block `height`.

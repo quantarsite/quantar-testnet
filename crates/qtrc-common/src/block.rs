@@ -34,6 +34,12 @@ pub struct BlockHeader {
     pub timestamp:   i64,
     /// Address of the validator that proposed this block
     pub proposer:    Address,
+    /// State root after applying this block (`crate::state_root`). Present
+    /// from the state-root activation height on. Left out of the JSON when
+    /// absent, so headers from before activation keep their exact signing
+    /// bytes and hashes.
+    #[serde(default, skip_serializing_if = "Option::is_none", with = "crate::state_root::opt_hex")]
+    pub state_root:  Option<[u8; 32]>,
 }
 
 impl BlockHeader {

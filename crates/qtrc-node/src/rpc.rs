@@ -5,6 +5,7 @@
 //!   GET  /block/:height        → block by height
 //!   GET  /account/:address     → account balance + nonce
 //!   GET  /vault/:address       → Sentinel vault of an account
+//!   GET  /proof/:address       → state proof + the signed header it verifies against
 //!   POST /tx                   → submit a signed transaction
 
 use axum::{
@@ -40,6 +41,8 @@ struct StatusResponse {
     burned:       u64,
     /// First block that accepts Sentinel operations
     sentinel_from_height: u64,
+    /// First block whose header carries the state root
+    state_root_from_height: u64,
 }
 
 #[derive(Serialize)]
@@ -58,6 +61,17 @@ struct VaultResponse {
     /// Spendable now (balance minus reserved)
     available: u64,
     vault:     qtrc_sentinel::Vault,
+}
+
+#[derive(Serialize)]
+struct ProofResponse {
+    /// Block whose header commits to the state this proof was built from
+    header:         qtrc_common::block::BlockHeader,
+    /// That block's validator signatures (verify the proposer's over
+    /// `header.signing_bytes()`)
+    validator_sigs: Vec<qtrc_common::block::ValidatorSig>,
+    /// Inclusion proof; null if the account is empty
+    proof:          Option<qtrc_common::state_root::Proof>,
 }
 
 #[derive(Serialize)]
@@ -85,6 +99,7 @@ async fn get_status(State(engine): State<AppState>) -> Json<StatusResponse> {
         fee:          state.fee_at(state.height + 1),
         burned:       state.burned,
         sentinel_from_height: state.sentinel_from_height,
+        state_root_from_height: state.state_root_from_height,
     })
 }
 
@@ -122,6 +137,23 @@ async fn get_vault(
         (StatusCode::NOT_FOUND, Json(ErrorResponse { error: "account has no Sentinel vault".into() }))
     })?;
     Ok(Json(VaultResponse { address: addr.as_hex(), available: vault.available(), vault }))
+}
+
+async fn get_proof(
+    State(engine): State<AppState>,
+    Path(address): Path<String>,
+) -> Result<Json<ProofResponse>, (StatusCode, Json<ErrorResponse>)> {
+    let addr = qtrc_crypto::Address::from_hex(&address).map_err(|e| {
+        (StatusCode::BAD_REQUEST, Json(ErrorResponse { error: e.to_string() }))
+    })?;
+    // Building the proof walks every account: keep it off the async runtime.
+    let result = tokio::task::spawn_blocking(move || engine.state_proof(&addr))
+        .await
+        .map_err(|e| (StatusCode::INTERNAL_SERVER_ERROR, Json(ErrorResponse { error: e.to_string() })))?;
+    match result {
+        Ok((header, validator_sigs, proof)) => Ok(Json(ProofResponse { header, validator_sigs, proof })),
+        Err(e) => Err((StatusCode::CONFLICT, Json(ErrorResponse { error: e.to_string() }))),
+    }
 }
 
 async fn post_tx(
@@ -167,6 +199,7 @@ pub async fn serve(engine: Arc<ConsensusEngine>, addr: SocketAddr) {
         .route("/status",           get(get_status))
         .route("/account/:address", get(get_account))
         .route("/vault/:address",   get(get_vault))
+        .route("/proof/:address",   get(get_proof))
         .route("/tx",               post(post_tx))
         .layer(cors)
         .with_state(engine);
