@@ -1,0 +1,20 @@
+# /etc/systemd/system/quantar-follower.service
+# Second machine, another provider: follows the live network, verifies every
+# block, serves status, blocks and balance proofs. Signs and produces nothing.
+[Unit]
+Description=Quantar testnet follower node
+After=network-online.target
+Wants=network-online.target
+
+[Service]
+ExecStart=/usr/local/bin/qtrc-node start --data-dir /var/lib/quantar --rpc 127.0.0.1:8545 --follow https://testnet.quantarnetwork.com/rpc
+Restart=always
+RestartSec=5
+NoNewPrivileges=true
+ProtectSystem=strict
+ProtectHome=true
+ReadWritePaths=/var/lib/quantar
+PrivateTmp=true
+
+[Install]
+WantedBy=multi-user.target

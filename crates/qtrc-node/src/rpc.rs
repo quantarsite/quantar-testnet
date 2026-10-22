@@ -26,6 +26,8 @@ use tracing::info;
 struct AppState {
     engine: Arc<ConsensusEngine>,
     store:  Arc<crate::store::BlockStore>,
+    /// Follower nodes do not take transactions: they produce no blocks.
+    follower: bool,
 }
 
 // ---------------------------------------------------------------------------
@@ -49,6 +51,8 @@ struct StatusResponse {
     state_root_from_height: u64,
     /// First block whose header commits to full transactions
     witness_root_from_height: u64,
+    /// "validator" or "follower"
+    role: &'static str,
 }
 
 #[derive(Serialize)]
@@ -94,7 +98,8 @@ struct ErrorResponse {
 // Handlers
 // ---------------------------------------------------------------------------
 
-async fn get_status(State(AppState { engine, .. }): State<AppState>) -> Json<StatusResponse> {
+async fn get_status(State(AppState { engine, follower, .. }): State<AppState>) -> Json<StatusResponse> {
+    let role = if follower { "follower" } else { "validator" };
     let state = engine.state.read();
     Json(StatusResponse {
         chain_id:     qtrc_common::tx::CHAIN_ID,
@@ -107,6 +112,7 @@ async fn get_status(State(AppState { engine, .. }): State<AppState>) -> Json<Sta
         sentinel_from_height: state.sentinel_from_height,
         state_root_from_height: state.state_root_from_height,
         witness_root_from_height: state.witness_root_from_height,
+        role,
     })
 }
 
@@ -178,9 +184,15 @@ async fn get_block(
 }
 
 async fn post_tx(
-    State(AppState { engine, .. }): State<AppState>,
+    State(AppState { engine, follower, .. }): State<AppState>,
     Json(tx): Json<Transaction>,
 ) -> Result<Json<TxResponse>, (StatusCode, Json<ErrorResponse>)> {
+    if follower {
+        return Err((
+            StatusCode::SERVICE_UNAVAILABLE,
+            Json(ErrorResponse { error: "this node is a follower and produces no blocks; send transactions to a validator".into() }),
+        ));
+    }
     // HYDRA-X verification is CPU work (~2.6 ms); run it off the async
     // runtime so status and account queries stay fast under load.
     let result = tokio::task::spawn_blocking(move || engine.submit_tx(tx))
@@ -210,7 +222,7 @@ async fn post_tx(
 // Router
 // ---------------------------------------------------------------------------
 
-pub async fn serve(engine: Arc<ConsensusEngine>, store: Arc<crate::store::BlockStore>, addr: SocketAddr) {
+pub async fn serve(engine: Arc<ConsensusEngine>, store: Arc<crate::store::BlockStore>, follower: bool, addr: SocketAddr) {
     let cors = CorsLayer::new()
         .allow_origin(Any)
         .allow_methods(Any)
@@ -224,7 +236,7 @@ pub async fn serve(engine: Arc<ConsensusEngine>, store: Arc<crate::store::BlockS
         .route("/proof/:address",   get(get_proof))
         .route("/tx",               post(post_tx))
         .layer(cors)
-        .with_state(AppState { engine, store });
+        .with_state(AppState { engine, store, follower });
 
     let listener = tokio::net::TcpListener::bind(addr)
         .await
