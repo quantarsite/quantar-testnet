@@ -97,6 +97,7 @@ impl Genesis {
             sentinel_from_height: 1,
             state_root_from_height: 1,
             vaults: Default::default(),
+            touched: Default::default(),
         }
     }
 

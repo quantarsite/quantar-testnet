@@ -14,6 +14,7 @@ use hx_mempool::{
     sig_cache::{HydraXSigCache, SigCacheConfig},
 };
 use parking_lot::{Mutex, RwLock};
+use qtrc_common::state_root::StateTree;
 use qtrc_common::{
     block::{Block, BlockHeader, ValidatorSig},
     state::ChainState,
@@ -64,7 +65,7 @@ pub enum ConsensusError {
 struct LastBlock {
     header: BlockHeader,
     sigs:   Vec<ValidatorSig>,
-    tree:   Option<Arc<qtrc_common::state_root::StateTree>>,
+    tree:   Option<Arc<StateTree>>,
     from:   u64,
 }
 
@@ -103,6 +104,9 @@ pub struct ConsensusEngine {
     /// with the state they describe (both change under the state lock), so
     /// state proofs can be served with the header that signs their root.
     last_block:  RwLock<Option<LastBlock>>,
+    /// State tree of the block this node last proposed, so committing its
+    /// own block does not build the same tree twice.
+    proposed_tree: Mutex<Option<Arc<StateTree>>>,
     /// Serializes the admission checks so two submits can't both pass them
     submit_lock: Mutex<()>,
     /// Cleared by the node when disk space runs low
@@ -138,6 +142,7 @@ impl ConsensusEngine {
             hx_pool: pool,
             sig_cache,
             last_block: RwLock::new(None),
+            proposed_tree: Mutex::new(None),
             submit_lock: Mutex::new(()),
             accepting: AtomicBool::new(true),
         }
@@ -442,9 +447,15 @@ impl ConsensusEngine {
         };
 
         // `scratch` holds exactly the state after these transactions.
-        let state_root = scratch
-            .state_root_active_at(next_height)
-            .then(|| scratch.state_root());
+        let state_root = if scratch.state_root_active_at(next_height) {
+            let touched = scratch.take_touched();
+            let tree = Arc::new(self.next_tree(&scratch, &touched, next_height));
+            let root = tree.root();
+            *self.proposed_tree.lock() = Some(tree);
+            Some(root)
+        } else {
+            None
+        };
 
         let header = BlockHeader {
             height:    next_height,
@@ -474,6 +485,22 @@ impl ConsensusEngine {
         );
 
         Ok(block)
+    }
+
+    /// Tree of `next`, a state that differs from the committed one only in
+    /// `touched`: updated from the committed tree when there is one, built
+    /// from scratch at activation.
+    fn next_tree(&self, next: &ChainState, touched: &std::collections::BTreeSet<String>, height: u64) -> StateTree {
+        let base = self
+            .last_block
+            .read()
+            .as_ref()
+            .filter(|l| l.header.height + 1 == height)
+            .and_then(|l| l.tree.clone());
+        match base {
+            Some(t) => t.updated(next, touched),
+            None => next.state_tree(),
+        }
     }
 
     /// Commit a finalized block: validate, apply, persist, then publish.
@@ -535,12 +562,19 @@ impl ConsensusEngine {
         let mut next = self.state.read().clone();
         next.apply_block(&block)
             .map_err(|e| ConsensusError::InvalidTx(e.to_string()))?;
+        let touched = next.take_touched();
 
         // From the activation height on, the header must commit to exactly
         // the resulting state; before it, it must not carry a root at all.
-        let tree = next
-            .state_root_active_at(block.header.height)
-            .then(|| Arc::new(next.state_tree()));
+        // Our own proposal's tree is reused when its root is the header's:
+        // equal roots commit to the same leaves.
+        let tree = next.state_root_active_at(block.header.height).then(|| {
+            let mine = self.proposed_tree.lock().take();
+            match mine {
+                Some(t) if Some(t.root()) == block.header.state_root => t,
+                _ => Arc::new(self.next_tree(&next, &touched, block.header.height)),
+            }
+        });
         let expected_root = tree.as_ref().map(|t| t.root());
         if block.header.state_root != expected_root {
             return Err(ConsensusError::InvalidTx(match (&block.header.state_root, &expected_root) {
