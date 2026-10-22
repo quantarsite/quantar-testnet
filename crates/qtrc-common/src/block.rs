@@ -40,6 +40,14 @@ pub struct BlockHeader {
     /// bytes and hashes.
     #[serde(default, skip_serializing_if = "Option::is_none", with = "crate::state_root::opt_hex")]
     pub state_root:  Option<[u8; 32]>,
+    /// Commitment to every byte of every transaction, signatures and
+    /// timestamps included ([`Block::compute_witness_root`]). `merkle_root`
+    /// covers only tx IDs, which leave those out on purpose (IDs must not
+    /// change when a relay re-encodes a signature), so without this a
+    /// stored or relayed block could change under the same header. Present
+    /// from its activation height on, left out of the JSON before it.
+    #[serde(default, skip_serializing_if = "Option::is_none", with = "crate::state_root::opt_hex")]
+    pub witness_root: Option<[u8; 32]>,
 }
 
 impl BlockHeader {
@@ -90,6 +98,34 @@ impl Block {
         }
         let digest: [u8; 32] = hasher.finalize().into();
         TxHash(digest)
+    }
+
+    /// Commitment to the full contents of `txs`:
+    /// `SHA3(DOM || count || leaf_1 || ... || leaf_n)` with
+    /// `leaf = SHA3(len(payload) || payload || timestamp || len(ml_dsa_sig) ||
+    /// ml_dsa_sig || len(slh_dsa_sig) || slh_dsa_sig || signer_address)`.
+    /// The signer address binds the public keys (it is their hash). Every
+    /// field is length-prefixed, so no two transactions share an encoding.
+    pub fn compute_witness_root(txs: &[Transaction]) -> [u8; 32] {
+        const DOM: &[u8] = b"QTR/TXWITNESS/v1";
+        let mut outer = Sha3_256::new();
+        outer.update(DOM);
+        outer.update((txs.len() as u64).to_le_bytes());
+        for tx in txs {
+            let mut h = Sha3_256::new();
+            let payload = tx.payload();
+            h.update((payload.len() as u64).to_le_bytes());
+            h.update(&payload);
+            h.update(tx.timestamp.to_le_bytes());
+            h.update((tx.signature.ml_dsa_sig.len() as u64).to_le_bytes());
+            h.update(&tx.signature.ml_dsa_sig);
+            h.update((tx.signature.slh_dsa_sig.len() as u64).to_le_bytes());
+            h.update(&tx.signature.slh_dsa_sig);
+            h.update(tx.signature.signer_address().0);
+            let leaf: [u8; 32] = h.finalize().into();
+            outer.update(leaf);
+        }
+        outer.finalize().into()
     }
 
     /// Hash of this block's header.

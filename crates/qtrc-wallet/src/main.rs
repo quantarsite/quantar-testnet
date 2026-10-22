@@ -799,6 +799,7 @@ mod tests {
                 timestamp: 0,
                 proposer: kp.address(),
                 state_root: Some(fake.state_root()),
+                witness_root: None,
             };
             let sigs = vec![ValidatorSig { validator: kp.address(), signature: kp.sign(&header.signing_bytes()) }];
             (header, sigs)

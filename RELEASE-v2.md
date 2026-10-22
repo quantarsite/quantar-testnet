@@ -298,3 +298,33 @@ posições, e isso continua O(n). Resolver de vez pede outro formato de
 compromisso (árvore esparsa por endereço), que muda a raiz e entra com
 altura de ativação junto com o trabalho de múltiplos validadores. Nada muda
 no consenso nesta versão.
+
+## v2.4.0: cabeçalho cobre a transação inteira, regras fixas da rede, /block
+
+Achados F6 e F8 do teste adversarial.
+
+- Witness root (F6): o `merkle_root` cobre só os IDs das transações, que de
+  propósito deixam de fora assinaturas e timestamps. Assim um bloco gravado
+  ou repassado podia mudar sem mudar o cabeçalho. Agora o cabeçalho leva
+  `witness_root`, um compromisso com todos os bytes de cada transação
+  (payload, timestamp, as duas assinaturas, endereço do signatário), com
+  todos os campos prefixados pelo tamanho. Vale a partir do bloco 20.
+  Formato 0x04 no disco.
+- Regras fixas (F8): o endereço do faucet da gênese e as alturas de
+  ativação da quantar-testnet-2 (taxa 5, Sentinel 6, state root 15, witness
+  root 20) estão no código (`qtrc-common/src/chain.rs`). Um servidor novo,
+  em outro provedor, reconstrói exatamente a mesma cadeia sem configuração.
+  Antes, uma pasta vazia ligaria todas as regras no bloco 1 e recusaria os
+  blocos reais. Uma pasta que gravou alturas diferentes já usadas é recusada.
+- `GET /block/:height` (e `/rpc/block/<altura>` no nginx): qualquer um pode
+  baixar os blocos e refazer a cadeia, conferindo cabeçalho, assinaturas,
+  state root e witness root.
+
+Atenção: a partir do bloco 20 a carteira precisa ser a v2.4.0 para conferir
+provas. Versões antigas não conhecem o campo novo, montam bytes diferentes
+para a assinatura do cabeçalho e respondem "não verificado".
+
+Deploy: os passos de sempre (backup primeiro), mais copiar
+`deploy/nginx/testnet-rpc.locations` para `/etc/quantar/` e recarregar o
+nginx. No log deve aparecer "Known network: activation heights fixed by the
+chain parameters" e `witness_root_from_height=20`.

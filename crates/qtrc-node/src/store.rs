@@ -25,6 +25,7 @@ const GENESIS_KEY: &[u8] = b"genesis";
 const FEE_FROM_KEY: &[u8] = b"fee_from_height";
 const SENTINEL_FROM_KEY: &[u8] = b"sentinel_from_height";
 const STATE_ROOT_FROM_KEY: &[u8] = b"state_root_from_height";
+const WITNESS_ROOT_FROM_KEY: &[u8] = b"witness_root_from_height";
 const MARKER_FILE: &str = "chain.marker";
 const MARKER_HEADER: &str = "quantar chain store v1";
 
@@ -157,6 +158,41 @@ impl BlockStore {
         }
     }
 
+    /// First height whose header carries the witness root, fixed once per
+    /// data dir like the others (chains without fixed parameters).
+    pub fn witness_root_from_height(&self) -> Result<u64> {
+        self.activation_height(WITNESS_ROOT_FROM_KEY)
+    }
+
+    /// Use a known network's fixed activation heights. A data dir that
+    /// recorded different ones followed other rules: refuse it rather than
+    /// replay its blocks under the wrong ones.
+    pub fn pin_activations(&self, a: &qtrc_common::chain::Activations) -> Result<()> {
+        for (key, fixed) in [
+            (FEE_FROM_KEY, a.fee),
+            (SENTINEL_FROM_KEY, a.sentinel),
+            (STATE_ROOT_FROM_KEY, a.state_root),
+            (WITNESS_ROOT_FROM_KEY, a.witness_root),
+        ] {
+            if let Some(v) = self.meta.get(key)? {
+                let buf: [u8; 8] = v.as_ref().try_into().context("corrupt activation height")?;
+                let recorded = u64::from_be_bytes(buf);
+                // A height recorded past the last block was never used.
+                let used = self.latest_height()?.is_some_and(|l| recorded <= l || fixed <= l);
+                if recorded != fixed && used {
+                    bail!(
+                        "this data dir activated {} at block {recorded}, but the network fixes it at {fixed}. \
+                         Restore a backup or sync a new data dir.",
+                        String::from_utf8_lossy(key)
+                    );
+                }
+            }
+            self.meta.insert(key, &fixed.to_be_bytes())?;
+        }
+        self.db.flush()?;
+        Ok(())
+    }
+
     fn activation_height(&self, key: &[u8]) -> Result<u64> {
         if let Some(v) = self.meta.get(key)? {
             let buf: [u8; 8] = v.as_ref().try_into().context("corrupt activation height")?;
@@ -223,6 +259,7 @@ impl BlockStore {
 const BINCODE_V1: u8 = 0x01;
 const BINCODE_V2: u8 = 0x02;
 const BINCODE_V3: u8 = 0x03;
+const BINCODE_V4: u8 = 0x04;
 
 /// Binary encoding: about 4x smaller than JSON, which writes every
 /// signature byte as a decimal number (a tx was ~132 KB in JSON).
@@ -231,8 +268,12 @@ const BINCODE_V3: u8 = 0x03;
 /// keep reading this data dir for as long as possible:
 /// 0x01 no Sentinel data and no state root (any release),
 /// 0x02 Sentinel data, no state root (v2.1+),
-/// 0x03 state root in the header (v2.3+).
+/// 0x03 state root in the header (v2.3+),
+/// 0x04 witness root, and the state root if any, in the header (v2.4+).
 fn encode_block(block: &Block) -> Result<Vec<u8>> {
+    if block.header.witness_root.is_some() {
+        return wire::encode_v4(block);
+    }
     if block.header.state_root.is_some() {
         return wire::encode_v3(block);
     }
@@ -244,6 +285,7 @@ fn encode_block(block: &Block) -> Result<Vec<u8>> {
 
 fn decode_block(bytes: &[u8]) -> Result<Block> {
     match bytes.first() {
+        Some(&BINCODE_V4) => Ok(bincode::deserialize::<wire::BlockV4>(&bytes[1..])?.into()),
         Some(&BINCODE_V3) => Ok(bincode::deserialize::<wire::BlockV3>(&bytes[1..])?.into()),
         Some(&BINCODE_V2) => Ok(bincode::deserialize::<wire::BlockV2>(&bytes[1..])?.into()),
         Some(&BINCODE_V1) => Ok(bincode::deserialize::<v1::Block>(&bytes[1..])?.into()),
@@ -281,7 +323,7 @@ mod wire {
                 proposer: h.proposer.clone(),
             }
         }
-        pub fn into_header(self, state_root: Option<[u8; 32]>) -> BlockHeader {
+        pub fn into_header(self, state_root: Option<[u8; 32]>, witness_root: Option<[u8; 32]>) -> BlockHeader {
             BlockHeader {
                 height: self.height,
                 prev_hash: self.prev_hash,
@@ -289,6 +331,7 @@ mod wire {
                 timestamp: self.timestamp,
                 proposer: self.proposer,
                 state_root,
+                witness_root,
             }
         }
     }
@@ -302,7 +345,7 @@ mod wire {
 
     impl From<BlockV2> for Block {
         fn from(b: BlockV2) -> Self {
-            Block { header: b.header.into_header(None), transactions: b.transactions, validator_sigs: b.validator_sigs }
+            Block { header: b.header.into_header(None, None), transactions: b.transactions, validator_sigs: b.validator_sigs }
         }
     }
 
@@ -317,7 +360,7 @@ mod wire {
     impl From<BlockV3> for Block {
         fn from(b: BlockV3) -> Self {
             Block {
-                header: b.header.into_header(Some(b.state_root)),
+                header: b.header.into_header(Some(b.state_root), None),
                 transactions: b.transactions,
                 validator_sigs: b.validator_sigs,
             }
@@ -331,6 +374,41 @@ mod wire {
             validator_sigs: block.validator_sigs.clone(),
         };
         let mut out = vec![super::BINCODE_V2];
+        out.extend(bincode::serialize(&b)?);
+        Ok(out)
+    }
+
+    #[derive(Serialize, Deserialize)]
+    pub struct BlockV4 {
+        header:         HeaderV1,
+        state_root:     Option<[u8; 32]>,
+        witness_root:   [u8; 32],
+        transactions:   Vec<Transaction>,
+        validator_sigs: Vec<ValidatorSig>,
+    }
+
+    impl From<BlockV4> for Block {
+        fn from(b: BlockV4) -> Self {
+            Block {
+                header: b.header.into_header(b.state_root, Some(b.witness_root)),
+                transactions: b.transactions,
+                validator_sigs: b.validator_sigs,
+            }
+        }
+    }
+
+    pub fn encode_v4(block: &Block) -> anyhow::Result<Vec<u8>> {
+        let Some(witness_root) = block.header.witness_root else {
+            anyhow::bail!("format 0x04 needs a witness root");
+        };
+        let b = BlockV4 {
+            header: HeaderV1::of(&block.header),
+            state_root: block.header.state_root,
+            witness_root,
+            transactions: block.transactions.clone(),
+            validator_sigs: block.validator_sigs.clone(),
+        };
+        let mut out = vec![super::BINCODE_V4];
         out.extend(bincode::serialize(&b)?);
         Ok(out)
     }
@@ -376,7 +454,7 @@ mod v1 {
     impl From<Block> for qtrc_common::block::Block {
         fn from(b: Block) -> Self {
             Self {
-                header: b.header.into_header(None),
+                header: b.header.into_header(None, None),
                 transactions: b
                     .transactions
                     .into_iter()
@@ -459,6 +537,8 @@ mod tests {
         let to = HydraXKeypair::generate().address();
         let g = Genesis::testnet_with_faucet(Some(&faucet.address().as_hex()));
         let mut st = g.initial_state();
+        // Witness roots have their own test; these blocks are v1/v2/v3.
+        st.witness_root_from_height = u64::MAX;
         if !state_root {
             st.state_root_from_height = u64::MAX;
         }
@@ -650,6 +730,47 @@ mod tests {
         assert_eq!(s.read_marker().unwrap(), Some(0));
         let _ = std::fs::remove_dir_all(&dir);
         let _ = std::fs::remove_dir_all(&fresh);
+    }
+
+    #[test]
+    fn witness_root_blocks_use_v4_and_roundtrip() {
+        let mut block = sample_block_with(true);
+        block.header.witness_root = Some(Block::compute_witness_root(&block.transactions));
+        let bytes = encode_block(&block).unwrap();
+        assert_eq!(bytes[0], BINCODE_V4);
+        let back = decode_block(&bytes).unwrap();
+        assert_eq!(back.hash(), block.hash());
+        assert_eq!(back.header.witness_root, block.header.witness_root);
+        // A witness root without a state root still has a format.
+        block.header.state_root = None;
+        let back = decode_block(&encode_block(&block).unwrap()).unwrap();
+        assert_eq!(back.hash(), block.hash());
+    }
+
+    /// The live data dir recorded fee 5, Sentinel 6, state root 15 and no
+    /// witness height: pinning keeps them and adds the fixed one.
+    #[test]
+    fn pinning_accepts_the_live_dir_and_refuses_other_rules() {
+        use qtrc_common::chain::Activations;
+        let dir = tmp_dir("pin");
+        let path = dir.to_str().unwrap();
+        let fixed = Activations { fee: 2, sentinel: 2, state_root: 2, witness_root: 5 };
+        {
+            let s = BlockStore::open(path).unwrap();
+            s.save_genesis(&Genesis::testnet_with_faucet(None)).unwrap();
+            s.put_block(&sample_block()).unwrap();
+            // Recorded by earlier releases: next block after the one stored.
+            assert_eq!(s.fee_from_height().unwrap(), 2);
+            assert_eq!(s.sentinel_from_height().unwrap(), 2);
+            assert_eq!(s.state_root_from_height().unwrap(), 2);
+            s.pin_activations(&fixed).unwrap();
+            assert_eq!(s.witness_root_from_height().unwrap(), 5);
+            // A rule recorded at block 1, already used, disagrees: refuse.
+            let other = Activations { fee: 1, ..fixed };
+            let err = s.pin_activations(&other).unwrap_err().to_string();
+            assert!(err.contains("fee_from_height"), "{err}");
+        }
+        let _ = std::fs::remove_dir_all(&dir);
     }
 
     #[test]

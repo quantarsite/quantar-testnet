@@ -457,6 +457,9 @@ impl ConsensusEngine {
             None
         };
 
+        let witness_root = scratch
+            .witness_root_active_at(next_height)
+            .then(|| Block::compute_witness_root(&txs));
         let header = BlockHeader {
             height:    next_height,
             prev_hash,
@@ -464,6 +467,7 @@ impl ConsensusEngine {
             timestamp: chrono::Utc::now().timestamp(),
             proposer:  self.address.clone(),
             state_root,
+            witness_root,
         };
 
         let sig = self.keypair.sign(&header.signing_bytes());
@@ -547,6 +551,20 @@ impl ConsensusEngine {
             return Err(ConsensusError::InvalidTx(
                 "merkle root does not match the block's transactions".into(),
             ));
+        }
+        // From its activation on, the header commits to every byte of every
+        // transaction; before it, the field must be absent.
+        let witness_expected = self
+            .state
+            .read()
+            .witness_root_active_at(block.header.height)
+            .then(|| Block::compute_witness_root(&block.transactions));
+        if block.header.witness_root != witness_expected {
+            return Err(ConsensusError::InvalidTx(match (&block.header.witness_root, &witness_expected) {
+                (None, Some(_)) => "block is missing its witness root".into(),
+                (Some(_), None) => "block carries a witness root before activation".into(),
+                _ => "witness root does not match the block's transactions".into(),
+            }));
         }
 
         if !block.verify_transactions() {

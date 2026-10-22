@@ -168,9 +168,27 @@ async fn cmd_start(rpc_addr: String, data_dir: String, key_file: Option<String>)
     }
 
     let mut init_state = genesis.initial_state();
-    init_state.fee_from_height = store.fee_from_height()?;
-    init_state.sentinel_from_height = store.sentinel_from_height()?;
-    init_state.state_root_from_height = store.state_root_from_height()?;
+    match qtrc_common::chain::known_activations(&genesis) {
+        Some(a) => {
+            // The live network: heights fixed in code, the same on every node.
+            store.pin_activations(&a)?;
+            init_state.fee_from_height = a.fee;
+            init_state.sentinel_from_height = a.sentinel;
+            init_state.state_root_from_height = a.state_root;
+            init_state.witness_root_from_height = a.witness_root;
+            info!("Known network: activation heights fixed by the chain parameters");
+        }
+        None => {
+            init_state.fee_from_height = store.fee_from_height()?;
+            init_state.sentinel_from_height = store.sentinel_from_height()?;
+            init_state.state_root_from_height = store.state_root_from_height()?;
+            init_state.witness_root_from_height = store.witness_root_from_height()?;
+        }
+    }
+    info!(
+        witness_root_from_height = init_state.witness_root_from_height,
+        "Block headers commit to full transactions from this height"
+    );
     info!(
         state_root_from_height = init_state.state_root_from_height,
         "Block headers carry the state root from this height"
@@ -245,7 +263,7 @@ async fn cmd_start(rpc_addr: String, data_dir: String, key_file: Option<String>)
 
     // Start JSON-RPC server
     info!("JSON-RPC listening on http://{rpc_addr}");
-    rpc::serve(engine, rpc_addr.parse()?).await;
+    rpc::serve(engine, store, rpc_addr.parse()?).await;
 
     Ok(())
 }

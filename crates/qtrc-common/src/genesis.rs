@@ -7,6 +7,9 @@ use qtrc_crypto::Address;
 use serde::{Deserialize, Serialize};
 use std::collections::HashMap;
 
+/// Genesis time of quantar-testnet-2: 2026-10-18 00:00:00 UTC.
+pub const TESTNET2_TIMESTAMP: i64 = 1_792_281_600;
+
 /// 1 QTR = 1_000_000 micro-QTR
 pub const MICRO_QTR: u64 = 1_000_000;
 
@@ -35,11 +38,13 @@ pub struct GenesisValidator {
 impl Genesis {
     /// Quantar Testnet v2 genesis configuration.
     ///
-    /// The faucet allocation goes to the address in `QTR_FAUCET_ADDRESS`
-    /// (the address printed by `qtrc-node keygen --out <file>` for the faucet
-    /// key). Without it the chain starts with no faucet funds.
+    /// The faucet allocation goes to the address in `QTR_FAUCET_ADDRESS`,
+    /// or, without it, to the live network's faucet, so a new node joins
+    /// the real chain with no configuration.
     pub fn testnet() -> Self {
-        Self::testnet_with_faucet(std::env::var("QTR_FAUCET_ADDRESS").ok().as_deref())
+        let env = std::env::var("QTR_FAUCET_ADDRESS").ok();
+        let live = Some(crate::chain::TESTNET2_FAUCET).filter(|a| !a.is_empty());
+        Self::testnet_with_faucet(env.as_deref().or(live))
     }
 
     /// Same as [`Genesis::testnet`] with the faucet address passed in.
@@ -57,7 +62,7 @@ impl Genesis {
 
         Genesis {
             chain_id:  crate::tx::CHAIN_ID.into(),
-            timestamp: 1_792_281_600, // 2026-10-18 00:00:00 UTC, HYDRA-X v2 genesis
+            timestamp: TESTNET2_TIMESTAMP,
             allocations,
             validators: vec![],
         }
@@ -96,6 +101,7 @@ impl Genesis {
             burned: 0,
             sentinel_from_height: 1,
             state_root_from_height: 1,
+            witness_root_from_height: 1,
             vaults: Default::default(),
             touched: Default::default(),
         }
@@ -115,6 +121,7 @@ impl Genesis {
             timestamp:   self.timestamp,
             proposer,
             state_root:  None,
+            witness_root: None,
         };
 
         Block {
