@@ -4,6 +4,7 @@
 //! Starts the consensus engine, JSON-RPC HTTP server, and
 //! (future) P2P listener.
 
+mod follow;
 mod rpc;
 mod store;
 
@@ -52,6 +53,15 @@ enum Command {
         /// node generates a throwaway key and its address changes on restart.
         #[arg(long)]
         key_file: Option<String>,
+        /// Follow these nodes instead of producing blocks: download every
+        /// block from them, verify it fully and store it. Repeat for more
+        /// peers, e.g. --follow https://testnet.quantarnetwork.com/rpc
+        #[arg(long)]
+        follow: Vec<String>,
+        /// Validator whose signature blocks must carry, for chains whose
+        /// validator is not fixed in the code (the live network's is).
+        #[arg(long)]
+        validator: Option<String>,
     },
 }
 
@@ -72,7 +82,9 @@ async fn main() -> Result<()> {
 
     match cli.command {
         Command::Keygen { out } => cmd_keygen(&out)?,
-        Command::Start { rpc, data_dir, key_file } => cmd_start(rpc, data_dir, key_file).await?,
+        Command::Start { rpc, data_dir, key_file, follow, validator } => {
+            cmd_start(rpc, data_dir, key_file, follow, validator).await?
+        }
     }
 
     Ok(())
@@ -124,7 +136,13 @@ fn load_keypair(path: &str) -> Result<HydraXKeypair> {
 // start
 // ---------------------------------------------------------------------------
 
-async fn cmd_start(rpc_addr: String, data_dir: String, key_file: Option<String>) -> Result<()> {
+async fn cmd_start(
+    rpc_addr: String,
+    data_dir: String,
+    key_file: Option<String>,
+    follow: Vec<String>,
+    validator: Option<String>,
+) -> Result<()> {
     let keypair = match key_file {
         Some(path) => {
             info!("🔑 Loading HYDRA-X validator key from {path}");
@@ -184,6 +202,27 @@ async fn cmd_start(rpc_addr: String, data_dir: String, key_file: Option<String>)
             init_state.state_root_from_height = store.state_root_from_height()?;
             init_state.witness_root_from_height = store.witness_root_from_height()?;
         }
+    }
+    // Who signs the blocks. Without a set, the node would expect its own
+    // signature on every block, which only works on the single validator.
+    if let Some(vs) = qtrc_common::chain::known_validators(&genesis) {
+        init_state.validators = vs
+            .into_iter()
+            .map(|address| qtrc_common::state::ValidatorInfo { address, stake: 1 })
+            .collect();
+    } else if let Some(v) = &validator {
+        let address = qtrc_crypto::Address::from_hex(v).map_err(|e| anyhow::anyhow!("--validator must be a 64-hex address: {e}"))?;
+        init_state.validators = vec![qtrc_common::state::ValidatorInfo { address, stake: 1 }];
+    }
+    let following = !follow.is_empty();
+    if following && init_state.validators.is_empty() {
+        anyhow::bail!("--follow needs to know the validator: this chain has none fixed in code, pass --validator <address>");
+    }
+    if !following && !init_state.validators.is_empty() && !init_state.validators.iter().any(|v| v.address == keypair.address()) {
+        anyhow::bail!(
+            "this node's key ({}) is not a validator of this chain; start with --follow <peer> to run a follower",
+            keypair.address().as_hex()
+        );
     }
     info!(
         witness_root_from_height = init_state.witness_root_from_height,
@@ -255,15 +294,25 @@ async fn cmd_start(rpc_addr: String, data_dir: String, key_file: Option<String>)
         }
     });
 
-    // Spawn block producer
-    let engine_clone = engine.clone();
-    tokio::spawn(async move {
-        run_block_producer(engine_clone).await;
-    });
+    if following {
+        // Follower: verify and store other nodes' blocks, produce none.
+        let peers = follow
+            .iter()
+            .map(|u| follow::HttpPeer::new(u).map(|p| Box::new(p) as Box<dyn follow::BlockSource>))
+            .collect::<Result<Vec<_>>>()?;
+        info!(peers = ?follow, "Follower mode: syncing from peers, not producing blocks");
+        let e = engine.clone();
+        std::thread::spawn(move || follow::run(e, peers));
+    } else {
+        let engine_clone = engine.clone();
+        tokio::spawn(async move {
+            run_block_producer(engine_clone).await;
+        });
+    }
 
     // Start JSON-RPC server
     info!("JSON-RPC listening on http://{rpc_addr}");
-    rpc::serve(engine, store, rpc_addr.parse()?).await;
+    rpc::serve(engine, store, following, rpc_addr.parse()?).await;
 
     Ok(())
 }

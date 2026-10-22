@@ -328,3 +328,27 @@ Deploy: os passos de sempre (backup primeiro), mais copiar
 `deploy/nginx/testnet-rpc.locations` para `/etc/quantar/` e recarregar o
 nginx. No log deve aparecer "Known network: activation heights fixed by the
 chain parameters" e `witness_root_from_height=20`.
+
+## v2.5.0: nó seguidor e validador histórico fixo
+
+Primeiro passo para vários validadores (plano em três fases).
+
+- O validador da quantar-testnet-2 (`809ae6fb…bbcbbbff`) está no código.
+  Antes, com a lista de validadores vazia, um nó só aceitava blocos
+  assinados pela própria chave: funcionava no droplet, e um segundo
+  servidor recusaria o bloco 1. O node também se recusa a produzir blocos
+  com uma chave que não é de validador.
+- `qtrc-node start --follow <url>` (repetível): o nó baixa cada bloco de
+  outros nós por `/block/:height`, confere tudo o que um commit confere
+  (altura, hash anterior, raízes de transações e witness, assinatura HYDRA-X
+  de cada transação, assinatura do validador esperado, regras do Sentinel,
+  state root) e só então grava. Par mentiroso é pulado; sem par honesto, o
+  seguidor para antes do bloco forjado. Seguidor não aceita transações e
+  responde `role: "follower"` em `/status`.
+- `deploy/systemd/quantar-follower.service` para o segundo servidor.
+
+Num servidor novo (Ubuntu, 2 GB): instalar Rust, clonar quantar-testnet e
+hx-mempool lado a lado, `cargo build --release`, instalar `qtrc-node` e
+`qtrc-wallet`, criar `/var/lib/quantar`, copiar o service e
+`systemctl enable --now quantar-follower`. Não precisa de chave nem de
+`QTR_FAUCET_ADDRESS`: a gênese e as regras vêm do código.

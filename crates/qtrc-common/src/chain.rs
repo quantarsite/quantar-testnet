@@ -21,6 +21,12 @@ pub struct Activations {
 /// Genesis faucet of quantar-testnet-2, the live network.
 pub const TESTNET2_FAUCET: &str = "9b7eb38c5f5b8fa2248fa761a4ec4730554aed10b9a6a9069c9e2db3ea1f7aaf";
 
+/// The only validator of quantar-testnet-2 so far: it proposed and signed
+/// every block. Fixing it here lets a node with another key (a follower, or
+/// a future validator) check the history instead of expecting its own
+/// signature on every block.
+pub const TESTNET2_VALIDATOR: &str = "809ae6fb45d3d7c9a2c2f3968c58cc55ad6bb2ca2cfe84f65619c013bbcbbbff";
+
 /// Rules of quantar-testnet-2 as they happened on the live node: fee from
 /// block 5 (v2.0.2), Sentinel from 6 (v2.1.0), state root from 15
 /// (v2.3.0), witness root from 20 (v2.4.0).
@@ -39,6 +45,13 @@ pub fn known_activations(genesis: &Genesis) -> Option<Activations> {
     live.then_some(TESTNET2)
 }
 
+/// The validator set of `genesis`, if it is a known network.
+#[must_use]
+pub fn known_validators(genesis: &Genesis) -> Option<Vec<qtrc_crypto::Address>> {
+    known_activations(genesis)?;
+    Some(vec![qtrc_crypto::Address::from_hex(TESTNET2_VALIDATOR).expect("valid constant")])
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -49,7 +62,10 @@ mod tests {
         let other = "11".repeat(32);
         assert_eq!(known_activations(&Genesis::testnet_with_faucet(Some(&other))), None);
         if !TESTNET2_FAUCET.is_empty() {
-            assert_eq!(known_activations(&Genesis::testnet_with_faucet(Some(TESTNET2_FAUCET))), Some(TESTNET2));
+            let live = Genesis::testnet_with_faucet(Some(TESTNET2_FAUCET));
+            assert_eq!(known_activations(&live), Some(TESTNET2));
+            assert_eq!(known_validators(&live).unwrap()[0].as_hex(), TESTNET2_VALIDATOR);
         }
+        assert!(known_validators(&Genesis::testnet_with_faucet(None)).is_none());
     }
 }
