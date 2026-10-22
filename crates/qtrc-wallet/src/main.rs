@@ -14,6 +14,7 @@
 //! qtrc-wallet send <TO> <AMOUNT>      send QTR (amount in QTR, e.g. 12.5;
 //!                                     a 0.01 QTR network fee is burned)
 //! qtrc-wallet status                  show the network status
+//! qtrc-wallet proof [ADDRESS]         check a balance against a signed state root
 //!
 //! Sentinel (recovery + delayed large transfers):
 //! qtrc-wallet guardian setup --cold <ADDR>   protect this account
@@ -79,6 +80,10 @@ enum Command {
     Send { to: String, amount: String },
     /// Show the network status
     Status,
+    /// Check an account's balance yourself: verifies the validator's
+    /// HYDRA-X signature on the latest block header and the Merkle proof
+    /// of the account against the state root in that header
+    Proof { address: Option<String> },
     /// Sentinel guardian: recovery key and delayed large transfers
     #[command(subcommand)]
     Guardian(GuardianCmd),
@@ -166,6 +171,13 @@ fn run(cli: Cli) -> Result<()> {
             cmd_guardian(&http, rpc, &key_path, &cold, Some((delay, &allowance)), out)
         }
         Command::Guardian(GuardianCmd::Rotate { cold, out }) => cmd_guardian(&http, rpc, &key_path, &cold, None, out),
+        Command::Proof { address } => {
+            let addr = match address {
+                Some(a) => parse_address(&a)?,
+                None => load_wallet(&key_path)?.address(),
+            };
+            cmd_proof(&http, rpc, &addr)
+        }
         Command::Vault { address } => {
             let addr = match address {
                 Some(a) => parse_address(&a)?,
@@ -470,6 +482,52 @@ fn cmd_guardian(
     println!("Move the recovery key OFF this computer (USB drive, paper backup).");
     println!("The kit can force a recovery to the cold address: keep it private.");
     println!("tx: {}", body["tx_hash"].as_str().unwrap_or("?"));
+    Ok(())
+}
+
+fn cmd_proof(http: &Client, rpc: &str, addr: &Address) -> Result<()> {
+    use qtrc_common::block::{BlockHeader, ValidatorSig};
+    use qtrc_common::state_root::Proof;
+
+    let r = get_json(http, &format!("{rpc}/proof/{}", addr.as_hex()))?;
+    let header: BlockHeader = serde_json::from_value(r["header"].clone()).context("bad header from node")?;
+    let sigs: Vec<ValidatorSig> = serde_json::from_value(r["validator_sigs"].clone()).context("bad signatures from node")?;
+    let proof: Option<Proof> = serde_json::from_value(r["proof"].clone()).context("bad proof from node")?;
+
+    // 1. The header is signed by its proposer, with both HYDRA-X signatures.
+    let sig = sigs
+        .iter()
+        .find(|s| s.validator == header.proposer)
+        .ok_or_else(|| anyhow!("header has no signature from its proposer"))?;
+    if sig.signature.signer_address() != header.proposer {
+        bail!("header signature was made by a different key than the proposer's");
+    }
+    sig.signature
+        .verify(&header.signing_bytes())
+        .map_err(|e| anyhow!("validator signature on the header is invalid: {e}"))?;
+    let root = header.state_root.ok_or_else(|| anyhow!("this block has no state root"))?;
+
+    // 2. The account is in the state that header commits to.
+    let Some(proof) = proof else {
+        println!("{} is empty at block {} (no balance, no transactions).", addr.as_hex(), header.height);
+        println!("Note: the node did not send a proof for an empty account; this part is not verified.");
+        return Ok(());
+    };
+    if &proof.leaf.address != addr {
+        bail!("node returned a proof for a different account");
+    }
+    if !proof.verify(&root) {
+        bail!("PROOF INVALID: the node's answer does not match the signed state root");
+    }
+
+    println!("Verified at block {} with ML-DSA-87 AND SLH-DSA-SHA2-256s.", header.height);
+    println!("account : {}", addr.as_hex());
+    println!("balance : {} QTR", format_qtr(proof.leaf.balance));
+    println!("nonce   : {}", proof.leaf.nonce);
+    println!("guarded : {}", if proof.leaf.vault_hash.is_some() { "yes (Sentinel vault)" } else { "no" });
+    println!("root    : {}", hex::encode(root));
+    println!("signer  : {}", header.proposer.as_hex());
+    println!("Compare the signer with the published validator address to trust no one but the validator.");
     Ok(())
 }
 

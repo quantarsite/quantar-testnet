@@ -98,6 +98,10 @@ pub struct ConsensusEngine {
     /// They still count as pending until that block commits or fails, so
     /// `next_nonce` never hands out a nonce that is already in use.
     inflight:    RwLock<Vec<Transaction>>,
+    /// Header and signatures of the last committed block, kept together
+    /// with the state they describe (both change under the state lock), so
+    /// state proofs can be served with the header that signs their root.
+    last_block:  RwLock<Option<(BlockHeader, Vec<ValidatorSig>)>>,
     /// Serializes the admission checks so two submits can't both pass them
     submit_lock: Mutex<()>,
     /// Cleared by the node when disk space runs low
@@ -133,6 +137,7 @@ impl ConsensusEngine {
             hx_pool: pool,
             sig_cache,
             inflight: RwLock::new(Vec::new()),
+            last_block: RwLock::new(None),
             submit_lock: Mutex::new(()),
             accepting: AtomicBool::new(true),
         }
@@ -341,6 +346,28 @@ impl ConsensusEngine {
         chain + self.pending_for(addr).0 as u64
     }
 
+    /// Proof of `addr` against the last committed block, with that block's
+    /// header and signatures. `Ok(None)` if the account is empty; error if
+    /// state roots are not active yet.
+    #[allow(clippy::type_complexity)]
+    pub fn state_proof(
+        &self,
+        addr: &Address,
+    ) -> Result<(BlockHeader, Vec<ValidatorSig>, Option<qtrc_common::state_root::Proof>), ConsensusError> {
+        let state = self.state.read();
+        let last = self.last_block.read();
+        let Some((header, sigs)) = last.as_ref() else {
+            return Err(ConsensusError::Busy("no block committed yet".into()));
+        };
+        if header.state_root.is_none() {
+            return Err(ConsensusError::Busy(format!(
+                "state roots start at block {}",
+                state.state_root_from_height
+            )));
+        }
+        Ok((header.clone(), sigs.clone(), state.state_proof(addr)))
+    }
+
     /// Expose ingestion metrics for monitoring.
     pub fn pipeline_metrics(&self) -> &hx_mempool::metrics::IngestionMetrics {
         self.pipeline.metrics()
@@ -435,12 +462,18 @@ impl ConsensusEngine {
             state.block_hash.clone()
         };
 
+        // `scratch` holds exactly the state after these transactions.
+        let state_root = scratch
+            .state_root_active_at(next_height)
+            .then(|| scratch.state_root());
+
         let header = BlockHeader {
             height:    next_height,
             prev_hash,
             merkle_root,
             timestamp: chrono::Utc::now().timestamp(),
             proposer:  self.address.clone(),
+            state_root,
         };
 
         let sig = self.keypair.sign(&header.signing_bytes());
@@ -524,6 +557,19 @@ impl ConsensusEngine {
         next.apply_block(&block)
             .map_err(|e| ConsensusError::InvalidTx(e.to_string()))?;
 
+        // From the activation height on, the header must commit to exactly
+        // the resulting state; before it, it must not carry a root at all.
+        let expected_root = next
+            .state_root_active_at(block.header.height)
+            .then(|| next.state_root());
+        if block.header.state_root != expected_root {
+            return Err(ConsensusError::InvalidTx(match (&block.header.state_root, &expected_root) {
+                (None, Some(_)) => "block is missing its state root".into(),
+                (Some(_), None) => "block carries a state root before activation".into(),
+                _ => "state root does not match the state after this block".into(),
+            }));
+        }
+
         if persist {
             if let Some(sink) = &self.sink {
                 sink.persist(&block).map_err(ConsensusError::Storage)?;
@@ -539,6 +585,7 @@ impl ConsensusEngine {
             });
         }
         *state = next;
+        *self.last_block.write() = Some((block.header.clone(), block.validator_sigs.clone()));
 
         if persist {
             info!(

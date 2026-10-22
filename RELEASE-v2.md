@@ -189,3 +189,35 @@ restart. Depois de um `guardian rotate`, troque o kit pelo novo assim que a
 rotação finalizar; até lá o watchtower avisa que está desarmado. O
 `webhook` (opcional) recebe cada alerta como JSON `{"text","content"}`,
 formato aceito por Slack e Discord.
+
+## v2.3.0: state root no cabeçalho (sem reset)
+
+Cada bloco a partir da ativação traz no cabeçalho a raiz de uma árvore
+Merkle com todas as contas (saldo, nonce e hash do cofre Sentinel) e o
+total queimado. O proponente calcula, e quem confirma o bloco recalcula e
+recusa raiz errada, ausente ou adiantada. Com isso, qualquer pessoa confere
+o saldo de uma conta sozinha: `qtrc-wallet proof <endereço>` verifica a
+assinatura HYDRA-X do validador no cabeçalho e a prova Merkle da conta.
+É a base para vários validadores concordarem sobre o estado.
+
+Compatibilidade: o campo só entra no JSON assinado quando existe, então os
+blocos antigos mantêm bytes, hashes e assinaturas. Blocos com raiz usam o
+formato 0x03; 0x01, 0x02 e JSON continuam sendo lidos (testado com blocos
+gravados pela versão anterior). A raiz liga no bloco seguinte ao primeiro
+start do binário novo, gravada no data dir.
+
+Deploy no droplet:
+
+1. Backup: `systemctl stop quantar-watchtower quantar-faucet quantar-node` e
+   `cp -a /var/lib/quantar /root/backup-quantar-$(date +%F)-v2.3`
+2. `cd ~/quantar-testnet && git pull && cargo build --release`
+3. `install -m 755 target/release/qtrc-{node,faucet,wallet,watchtower} /usr/local/bin/`
+4. `cp deploy/nginx/testnet-rpc.locations /etc/quantar/` (nova rota
+   `/rpc/proof/`), `nginx -t && systemctl reload nginx`
+5. `systemctl start quantar-node quantar-faucet quantar-watchtower`
+6. `journalctl -u quantar-node -n 15 --no-pager` mostra `state_root_from_height`
+7. Depois do primeiro bloco novo: `qtrc-wallet proof <endereço>`
+
+Volta atrás: a partir do primeiro bloco com raiz o binário anterior não lê
+mais o data dir (para com "unknown block encoding", sem corromper nada).
+Voltar só restaurando o backup do passo 1.
