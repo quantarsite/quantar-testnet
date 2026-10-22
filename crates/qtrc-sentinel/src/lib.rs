@@ -654,10 +654,10 @@ impl Vault {
         }
         fn outflows(out: &mut Vec<u8>, list: &[Outflow]) {
             u64le(out, list.len() as u64);
-            for o in list {
-                u64le(out, o.height);
-                out.extend_from_slice(&o.to.0);
-                u64le(out, o.amount);
+            for Outflow { height, to, amount } in list {
+                u64le(out, *height);
+                out.extend_from_slice(&to.0);
+                u64le(out, *amount);
             }
         }
         let Vault {
@@ -685,11 +685,11 @@ impl Vault {
             None => out.push(0),
         }
         u64le(&mut out, pending.len() as u64);
-        for p in pending {
-            u64le(&mut out, p.id);
-            u64le(&mut out, p.created_height);
-            u64le(&mut out, p.unlock_height);
-            match &p.kind {
+        for Pending { id, kind, created_height, unlock_height } in pending {
+            u64le(&mut out, *id);
+            u64le(&mut out, *created_height);
+            u64le(&mut out, *unlock_height);
+            match kind {
                 PendingKind::Transfer { to, amount } => {
                     out.push(1);
                     out.extend_from_slice(&to.0);
