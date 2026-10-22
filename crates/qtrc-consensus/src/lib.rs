@@ -31,21 +31,13 @@ use tracing::{debug, info, warn};
 pub const BLOCK_TIME_SECS: u64 = 5;
 /// Most transactions one block may carry.
 pub const MAX_TXS_PER_BLOCK: usize = 500;
-/// Most transactions waiting in the mempool, across all senders.
-pub const MAX_MEMPOOL: usize = 5_000;
+pub mod mempool;
+pub use mempool::{Mempool, MAX_MEMPOOL, MAX_MEMPOOL_BYTES, RECOVERY_RESERVE};
 /// Most transactions one sender may have waiting at once.
 pub const MAX_PENDING_PER_SENDER: usize = 16;
 /// Most Sentinel recoveries per block. Each carries a second HYDRA-X
 /// signature (~37 KB); the rest wait for the next block.
 pub const MAX_RECOVERS_PER_BLOCK: usize = 32;
-
-fn is_recover(tx: &Transaction) -> bool {
-    !tx.data.is_empty()
-        && matches!(
-            qtrc_common::sentinel::SentinelOp::decode(&tx.data),
-            Ok(qtrc_common::sentinel::SentinelOp::Recover { .. })
-        )
-}
 
 #[derive(Debug, Error)]
 pub enum ConsensusError {
@@ -90,8 +82,10 @@ pub trait BlockSink: Send + Sync {
 pub struct ConsensusEngine {
     /// Current chain state (append-only, updated on commit)
     pub state:   Arc<RwLock<ChainState>>,
-    /// Pending transactions queued for the next block
-    pub mempool: Arc<RwLock<Vec<Transaction>>>,
+    /// Pending transactions: queued for the next block, or in flight in
+    /// the block being built (they still count as pending until it commits
+    /// or fails, so `next_nonce` never hands out a nonce already in use).
+    pub mempool: Arc<RwLock<Mempool>>,
     /// This node's keypair (used when this node is the proposer)
     keypair:     Arc<HydraXKeypair>,
     /// This node's address
@@ -105,10 +99,6 @@ pub struct ConsensusEngine {
     /// mempool so they never linger (and a dropped tx can be resubmitted)
     hx_pool:     Arc<TxPool>,
     sig_cache:   Arc<HydraXSigCache>,
-    /// Transactions taken out of the mempool for the block being built.
-    /// They still count as pending until that block commits or fails, so
-    /// `next_nonce` never hands out a nonce that is already in use.
-    inflight:    RwLock<Vec<Transaction>>,
     /// Header and signatures of the last committed block, kept together
     /// with the state they describe (both change under the state lock), so
     /// state proofs can be served with the header that signs their root.
@@ -140,14 +130,13 @@ impl ConsensusEngine {
 
         ConsensusEngine {
             state:   Arc::new(RwLock::new(state)),
-            mempool: Arc::new(RwLock::new(Vec::new())),
+            mempool: Arc::new(RwLock::new(Mempool::default())),
             keypair: Arc::new(keypair),
             address,
             pipeline,
             sink: None,
             hx_pool: pool,
             sig_cache,
-            inflight: RwLock::new(Vec::new()),
             last_block: RwLock::new(None),
             submit_lock: Mutex::new(()),
             accepting: AtomicBool::new(true),
@@ -200,11 +189,13 @@ impl ConsensusEngine {
         // Cheap admission checks first, so unfunded or out-of-order spam is
         // refused before it costs a full HYDRA-X verification.
         let _guard = self.submit_lock.lock();
+        // One hash of the incoming tx; every lookup below is indexed, so
+        // refusing junk costs the same however full the mempool is.
         let hash = tx.hash();
-        let (pending_count, pending_out) = self.pending_for(&tx.from);
         if self.is_pending(&hash) {
             return Ok(hash);
         }
+        let (pending_count, pending_out) = self.pending_for(&tx.from);
         let expected = self.state.read().account(&tx.from).nonce + pending_count as u64;
         if tx.nonce != expected {
             return Err(ConsensusError::InvalidTx(format!(
@@ -212,7 +203,7 @@ impl ConsensusEngine {
                 tx.nonce
             )));
         }
-        let (balance, fee) = {
+        let (balance, fee, recover) = {
             let st = self.state.read();
             let next = st.height + 1;
             // Sentinel operations get the same checks block application
@@ -221,6 +212,7 @@ impl ConsensusEngine {
             let op = st.parse_op(&tx, next).map_err(|e| ConsensusError::InvalidTx(e.to_string()))?;
             let fee = st.fee_at(next);
             let mut deferred = false;
+            let recover = matches!(op, Some(qtrc_common::sentinel::SentinelOp::Recover { .. }));
             match &op {
                 // Recovery proofs are checked after the tx signature (below),
                 // so a forged tx cannot make the node verify two signatures.
@@ -237,7 +229,7 @@ impl ConsensusEngine {
             } else {
                 st.spendable(&tx.from)
             };
-            (have, fee)
+            (have, fee, recover)
         };
         // Every pending tx and this one each pay the fee on top of the amount.
         let needed = pending_out
@@ -253,8 +245,11 @@ impl ConsensusEngine {
                 "this account already has {MAX_PENDING_PER_SENDER} transactions waiting; try after the next block"
             )));
         }
-        if self.mempool.read().len() >= MAX_MEMPOOL {
-            return Err(ConsensusError::Busy("mempool full, try again shortly".into()));
+        if let Err(full) = self.mempool.read().has_room(&tx, recover) {
+            return Err(ConsensusError::Busy(match full {
+                mempool::Full::RecoveryReserve => "too many recoveries waiting, try after the next block".into(),
+                _ => "mempool full, try again shortly".into(),
+            }));
         }
 
         let item = adapter::to_ingest_item(&tx)?;
@@ -266,20 +261,20 @@ impl ConsensusEngine {
                     self.forget(&[hash]);
                     return Err(e);
                 }
-                self.mempool.write().push(tx);
+                self.mempool.write().push(mempool::Entry::with_hash(tx, hash, recover));
                 Ok(adapter::hx_hash_to_qtrc(h))
             }
             // Known to hx-mempool but not queued here (left over from a drop):
             // forget it and admit this copy, which just passed every check.
             IngestResult::Duplicate { hash: h } => {
-                self.forget(&[hash.clone()]);
+                self.forget(std::slice::from_ref(&hash));
                 match self.pipeline.ingest_one(adapter::to_ingest_item(&tx)?) {
                     IngestResult::Accepted { .. } => {
                         if let Err(e) = self.check_recovery_op(&tx) {
                             self.forget(&[hash]);
                             return Err(e);
                         }
-                        self.mempool.write().push(tx);
+                        self.mempool.write().push(mempool::Entry::with_hash(tx, hash, recover));
                         Ok(adapter::hx_hash_to_qtrc(h))
                     }
                     other => Err(ConsensusError::InvalidTx(format!(
@@ -308,18 +303,11 @@ impl ConsensusEngine {
 
     /// (count, total amount) of `addr`'s txs in the mempool or in flight.
     fn pending_for(&self, addr: &Address) -> (usize, u64) {
-        let pool = self.mempool.read();
-        let inflight = self.inflight.read();
-        pool.iter()
-            .chain(inflight.iter())
-            .filter(|t| &t.from == addr)
-            .fold((0, 0u64), |(n, sum), t| (n + 1, sum.saturating_add(t.amount)))
+        self.mempool.read().pending_for(addr)
     }
 
     fn is_pending(&self, hash: &TxHash) -> bool {
-        let pool = self.mempool.read();
-        let inflight = self.inflight.read();
-        pool.iter().chain(inflight.iter()).any(|t| &t.hash() == hash)
+        self.mempool.read().contains(hash)
     }
 
     /// Drop transactions from hx-mempool's pool and signature cache.
@@ -335,18 +323,9 @@ impl ConsensusEngine {
     /// the mempool (the block failed); otherwise they are done (committed).
     /// Both locks are held together, so no submit ever sees a gap.
     fn release_inflight(&self, requeue: bool) {
-        let mut pool = self.mempool.write();
-        let mut inflight = self.inflight.write();
-        let txs = std::mem::take(&mut *inflight);
-        if requeue {
-            let rest = std::mem::take(&mut *pool);
-            *pool = txs;
-            pool.extend(rest);
-        } else {
-            drop(pool);
-            drop(inflight);
-            let hashes: Vec<TxHash> = txs.iter().map(|t| t.hash()).collect();
-            self.forget(&hashes);
+        let done = self.mempool.write().finish_inflight(!requeue);
+        if !done.is_empty() {
+            self.forget(&done);
         }
     }
 
@@ -407,16 +386,13 @@ impl ConsensusEngine {
         // every block fail and halt the chain.
         // Move candidates from the mempool to in-flight under both locks,
         // so they never stop counting as pending.
-        let candidates: Vec<Transaction> = {
+        // Senders with a Sentinel recovery waiting go first.
+        let candidates = {
             let mut pool = self.mempool.write();
-            let mut inflight = self.inflight.write();
-            if !inflight.is_empty() {
+            if !pool.inflight_is_empty() {
                 return Err(ConsensusError::Busy("a block is already being built".into()));
             }
-            let n = pool.len().min(MAX_TXS_PER_BLOCK);
-            let c: Vec<Transaction> = pool.drain(..n).collect();
-            *inflight = c.clone();
-            c
+            pool.take_for_block(MAX_TXS_PER_BLOCK)
         };
         let mut scratch = self.state.read().clone();
         let mut txs = Vec::with_capacity(candidates.len());
@@ -424,42 +400,35 @@ impl ConsensusEngine {
         // Recoveries over the per-block cap wait for the next block, and so
         // does everything after them from the same sender (nonce order).
         let mut recovers = 0usize;
-        let mut held: Vec<Transaction> = Vec::new();
-        let mut held_senders: Vec<Address> = Vec::new();
-        for tx in candidates {
-            if held_senders.contains(&tx.from) {
-                held.push(tx);
+        let mut held: std::collections::HashSet<TxHash> = Default::default();
+        let mut held_senders: std::collections::HashSet<Address> = Default::default();
+        for e in candidates {
+            if held_senders.contains(&e.tx.from) {
+                held.insert(e.hash);
                 continue;
             }
-            let recover = is_recover(&tx);
-            if recover && recovers >= MAX_RECOVERS_PER_BLOCK {
-                held_senders.push(tx.from.clone());
-                held.push(tx);
+            if e.recover && recovers >= MAX_RECOVERS_PER_BLOCK {
+                held_senders.insert(e.tx.from.clone());
+                held.insert(e.hash);
                 continue;
             }
-            match scratch.apply_tx(&tx) {
+            match scratch.apply_tx(&e.tx) {
                 Ok(()) => {
-                    recovers += usize::from(recover);
-                    txs.push(tx);
+                    recovers += usize::from(e.recover);
+                    txs.push(e.tx);
                 }
-                Err(e) => {
-                    warn!(tx = %tx.hash(), "dropping invalid tx from block: {e}");
-                    dropped.push(tx.hash());
+                Err(err) => {
+                    warn!(tx = %e.hash, "dropping invalid tx from block: {err}");
+                    dropped.push(e.hash);
                 }
             }
         }
         if !dropped.is_empty() {
-            self.inflight.write().retain(|t| !dropped.contains(&t.hash()));
+            self.mempool.write().drop_inflight(&dropped.iter().cloned().collect());
             self.forget(&dropped);
         }
         if !held.is_empty() {
-            let held_hashes: Vec<TxHash> = held.iter().map(Transaction::hash).collect();
-            let mut pool = self.mempool.write();
-            let mut inflight = self.inflight.write();
-            inflight.retain(|t| !held_hashes.contains(&t.hash()));
-            let rest = std::mem::take(&mut *pool);
-            *pool = held;
-            pool.extend(rest);
+            self.mempool.write().hold(&held);
         }
         if txs.is_empty() {
             self.release_inflight(false);
@@ -510,10 +479,10 @@ impl ConsensusEngine {
     /// Commit a finalized block: validate, apply, persist, then publish.
     pub fn commit_block(&self, block: Block) -> Result<(), ConsensusError> {
         let own = {
-            let inflight = self.inflight.read();
+            let inflight = self.mempool.read().inflight_hashes();
             !inflight.is_empty()
                 && inflight.len() == block.transactions.len()
-                && inflight.iter().zip(&block.transactions).all(|(a, b)| a.hash() == b.hash())
+                && inflight.iter().zip(&block.transactions).all(|(a, b)| *a == b.hash())
         };
         let result = self.commit_inner(block, true);
         if own {

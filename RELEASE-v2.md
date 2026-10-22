@@ -250,3 +250,22 @@ altura em que estão. Nada muda no consenso nem nos bytes dos blocos.
 
 Deploy: os mesmos passos da v2.3.0 (backup primeiro). Depois de subir,
 `cat /var/lib/quantar/chain.marker` deve mostrar a altura atual.
+
+## v2.3.2: fila de transações indexada e com lugar para recuperação
+
+Achados F2, F4 e F5 do teste adversarial.
+
+- F2: cada envio, até o lixo sem chave nem saldo, refazia o hash de todas
+  as transações da fila sob o lock global (62 ms com a fila cheia de
+  recuperações). Agora a fila mantém índices por hash e por remetente; o
+  custo de recusar lixo é o mesmo com a fila vazia ou cheia (~15 µs).
+- F4: além do limite de 5.000 transações, a fila tem limite de 64 MiB.
+  Antes, cheia, ela passava de 600 MB com as cópias do hx-mempool.
+- F5: recuperações do Sentinel têm 64 vagas próprias, por cima dos dois
+  limites, e o remetente de uma recuperação vai primeiro no bloco (todas as
+  transações dele, na ordem de nonce). Um ladrão com a chave principal não
+  consegue mais lotar a fila para atrasar a recuperação até o time lock
+  vencer. Finalize não ganha vaga própria de propósito: quem quer finalizar
+  numa conta roubada é o ladrão.
+
+Nada muda no consenso nem nos bytes dos blocos. Deploy igual à v2.3.1.
