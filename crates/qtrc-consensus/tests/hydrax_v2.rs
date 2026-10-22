@@ -129,7 +129,7 @@ fn invalid_tx_that_slips_in_is_dropped_not_halting_the_chain() {
 
     engine.submit_tx(transfer(&faucet, &user, 10 * MICRO_QTR, 0)).expect("tx 0");
     // Força uma tx inválida direto na fila (simula algo que escapou da entrada).
-    engine.mempool.write().push(transfer(&faucet, &user, 20 * MICRO_QTR, 0));
+    engine.mempool.write().push(qtrc_consensus::mempool::Entry::new(transfer(&faucet, &user, 20 * MICRO_QTR, 0), false));
 
     let block = engine.propose_block().expect("propose");
     assert_eq!(block.transactions.len(), 1, "so a tx valida entra");
