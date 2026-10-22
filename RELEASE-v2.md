@@ -195,10 +195,19 @@ formato aceito por Slack e Discord.
 Cada bloco a partir da ativação traz no cabeçalho a raiz de uma árvore
 Merkle com todas as contas (saldo, nonce e hash do cofre Sentinel) e o
 total queimado. O proponente calcula, e quem confirma o bloco recalcula e
-recusa raiz errada, ausente ou adiantada. Com isso, qualquer pessoa confere
-o saldo de uma conta sozinha: `qtrc-wallet proof <endereço>` verifica a
-assinatura HYDRA-X do validador no cabeçalho e a prova Merkle da conta.
-É a base para vários validadores concordarem sobre o estado.
+recusa raiz errada, ausente ou adiantada. `qtrc-wallet proof <endereço>`
+confere o saldo sem confiar no nó que respondeu: exige a assinatura HYDRA-X
+do validador da testnet (fixo na carteira, ou `--validator`) no cabeçalho e
+a prova Merkle da conta contra a raiz desse cabeçalho. Limite: prova o
+saldo daquele bloco; um nó ainda pode responder com um bloco mais antigo
+(a carteira mostra a idade do bloco). Conta vazia não tem prova e aparece
+como "não verificado". É a base para vários validadores concordarem sobre
+o estado.
+
+A raiz usa uma codificação canônica e versionada do cofre Sentinel,
+travada por um vetor de teste, para que mudanças futuras no formato de
+armazenamento nunca alterem raízes antigas. A árvore é calculada uma vez
+por bloco e as provas saem dela em O(log n), sem travar o estado do nó.
 
 Compatibilidade: o campo só entra no JSON assinado quando existe, então os
 blocos antigos mantêm bytes, hashes e assinaturas. Blocos com raiz usam o
@@ -221,3 +230,6 @@ Deploy no droplet:
 Volta atrás: a partir do primeiro bloco com raiz o binário anterior não lê
 mais o data dir (para com "unknown block encoding", sem corromper nada).
 Voltar só restaurando o backup do passo 1.
+Se voltar antes do primeiro bloco com raiz e depois reinstalar a versão
+nova, o node detecta os blocos sem raiz e move a ativação para depois
+deles sozinho.

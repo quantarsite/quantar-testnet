@@ -65,6 +65,17 @@ pub enum ConsensusError {
     Busy(String),
 }
 
+/// The last committed block's header and signatures, with the state tree
+/// its root was computed from (None before state-root activation). Proofs
+/// are served from here, without touching the live state.
+#[derive(Clone)]
+struct LastBlock {
+    header: BlockHeader,
+    sigs:   Vec<ValidatorSig>,
+    tree:   Option<Arc<qtrc_common::state_root::StateTree>>,
+    from:   u64,
+}
+
 /// Durable storage for committed blocks.
 ///
 /// `commit_block` calls `persist` after the block is validated and applied to
@@ -101,7 +112,7 @@ pub struct ConsensusEngine {
     /// Header and signatures of the last committed block, kept together
     /// with the state they describe (both change under the state lock), so
     /// state proofs can be served with the header that signs their root.
-    last_block:  RwLock<Option<(BlockHeader, Vec<ValidatorSig>)>>,
+    last_block:  RwLock<Option<LastBlock>>,
     /// Serializes the admission checks so two submits can't both pass them
     submit_lock: Mutex<()>,
     /// Cleared by the node when disk space runs low
@@ -354,18 +365,17 @@ impl ConsensusEngine {
         &self,
         addr: &Address,
     ) -> Result<(BlockHeader, Vec<ValidatorSig>, Option<qtrc_common::state_root::Proof>), ConsensusError> {
-        let state = self.state.read();
-        let last = self.last_block.read();
-        let Some((header, sigs)) = last.as_ref() else {
+        // Header, signatures and tree are swapped together at commit, so the
+        // proof always matches the header it is served with. O(log n), no
+        // state lock.
+        let last = self.last_block.read().clone();
+        let Some(last) = last else {
             return Err(ConsensusError::Busy("no block committed yet".into()));
         };
-        if header.state_root.is_none() {
-            return Err(ConsensusError::Busy(format!(
-                "state roots start at block {}",
-                state.state_root_from_height
-            )));
-        }
-        Ok((header.clone(), sigs.clone(), state.state_proof(addr)))
+        let Some(tree) = last.tree else {
+            return Err(ConsensusError::Busy(format!("state roots start at block {}", last.from)));
+        };
+        Ok((last.header, last.sigs, tree.proof(addr)))
     }
 
     /// Expose ingestion metrics for monitoring.
@@ -559,9 +569,10 @@ impl ConsensusEngine {
 
         // From the activation height on, the header must commit to exactly
         // the resulting state; before it, it must not carry a root at all.
-        let expected_root = next
+        let tree = next
             .state_root_active_at(block.header.height)
-            .then(|| next.state_root());
+            .then(|| Arc::new(next.state_tree()));
+        let expected_root = tree.as_ref().map(|t| t.root());
         if block.header.state_root != expected_root {
             return Err(ConsensusError::InvalidTx(match (&block.header.state_root, &expected_root) {
                 (None, Some(_)) => "block is missing its state root".into(),
@@ -585,7 +596,12 @@ impl ConsensusEngine {
             });
         }
         *state = next;
-        *self.last_block.write() = Some((block.header.clone(), block.validator_sigs.clone()));
+        *self.last_block.write() = Some(LastBlock {
+            header: block.header.clone(),
+            sigs: block.validator_sigs.clone(),
+            tree,
+            from: state.state_root_from_height,
+        });
 
         if persist {
             info!(

@@ -73,20 +73,6 @@ fn finish(count: u64, burned: u64, top: &Hash) -> Hash {
     h.finalize().into()
 }
 
-/// Tree top over leaf hashes (all zeros when empty).
-fn top(mut level: Vec<Hash>) -> Hash {
-    if level.is_empty() {
-        return [0u8; 32];
-    }
-    while level.len() > 1 {
-        level = level
-            .chunks(2)
-            .map(|p| if p.len() == 2 { node(&p[0], &p[1]) } else { p[0] })
-            .collect();
-    }
-    level[0]
-}
-
 /// Inclusion proof for one account.
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
 pub struct Proof {
@@ -135,6 +121,62 @@ impl Proof {
     }
 }
 
+/// The full tree for one state: built once per committed block and kept,
+/// so proofs cost O(log n) and never touch the live chain state.
+#[derive(Clone, Debug, Default)]
+pub struct StateTree {
+    leaves: Vec<Leaf>,
+    /// `levels[0]` are the leaf hashes, the last level is the top.
+    levels: Vec<Vec<Hash>>,
+    burned: u64,
+}
+
+impl StateTree {
+    fn build(leaves: Vec<Leaf>, burned: u64) -> Self {
+        let mut levels = vec![leaves.iter().map(Leaf::hash).collect::<Vec<Hash>>()];
+        while levels.last().is_some_and(|l| l.len() > 1) {
+            let next = levels
+                .last()
+                .expect("non-empty")
+                .chunks(2)
+                .map(|p| if p.len() == 2 { node(&p[0], &p[1]) } else { p[0] })
+                .collect();
+            levels.push(next);
+        }
+        Self { leaves, levels, burned }
+    }
+
+    /// The state root.
+    #[must_use]
+    pub fn root(&self) -> Hash {
+        let top = self.levels.last().and_then(|l| l.first()).copied().unwrap_or([0u8; 32]);
+        finish(self.leaves.len() as u64, self.burned, &top)
+    }
+
+    /// Inclusion proof for `addr`, or None if the account is empty.
+    #[must_use]
+    pub fn proof(&self, addr: &Address) -> Option<Proof> {
+        let index = self.leaves.binary_search_by(|l| l.address.0.cmp(&addr.0)).ok()?;
+        let mut siblings = Vec::new();
+        let mut idx = index;
+        for level in &self.levels[..self.levels.len() - 1] {
+            let len = level.len();
+            let promoted = idx == len - 1 && len % 2 == 1;
+            if !promoted {
+                siblings.push(level[idx ^ 1]);
+            }
+            idx /= 2;
+        }
+        Some(Proof {
+            leaf: self.leaves[index].clone(),
+            index: index as u64,
+            count: self.leaves.len() as u64,
+            burned: self.burned,
+            siblings,
+        })
+    }
+}
+
 impl ChainState {
     /// Non-empty accounts as leaves, sorted by address bytes.
     #[must_use]
@@ -147,11 +189,9 @@ impl ChainState {
             .filter_map(|k| {
                 let address = Address::from_hex(k).ok()?;
                 let acct = self.account(&address);
-                let vault_hash = self.vaults.get(k).map(|v| {
-                    let bytes = bincode::serialize(v).expect("vault serializes");
-                    let d: Hash = Sha3_256::digest(bytes).into();
-                    d
-                });
+                // Canonical, versioned encoding: storage format changes can
+                // never alter past roots.
+                let vault_hash = self.vaults.get(k).map(|v| -> Hash { Sha3_256::digest(v.canonical_encoding()).into() });
                 if acct.balance == 0 && acct.nonce == 0 && vault_hash.is_none() {
                     return None;
                 }
@@ -162,42 +202,22 @@ impl ChainState {
         out
     }
 
+    /// Full tree of this state (for serving many proofs).
+    #[must_use]
+    pub fn state_tree(&self) -> StateTree {
+        StateTree::build(self.leaves(), self.burned)
+    }
+
     /// The state root of this state.
     #[must_use]
     pub fn state_root(&self) -> Hash {
-        let leaves = self.leaves();
-        let hashes: Vec<Hash> = leaves.iter().map(Leaf::hash).collect();
-        finish(hashes.len() as u64, self.burned, &top(hashes))
+        self.state_tree().root()
     }
 
     /// Inclusion proof for `addr`, or None if the account is empty.
     #[must_use]
     pub fn state_proof(&self, addr: &Address) -> Option<Proof> {
-        let leaves = self.leaves();
-        let index = leaves.iter().position(|l| &l.address == addr)?;
-        let mut level: Vec<Hash> = leaves.iter().map(Leaf::hash).collect();
-        let count = level.len();
-        let mut siblings = Vec::new();
-        let mut idx = index;
-        while level.len() > 1 {
-            let len = level.len();
-            let promoted = idx == len - 1 && len % 2 == 1;
-            if !promoted {
-                siblings.push(level[idx ^ 1]);
-            }
-            level = level
-                .chunks(2)
-                .map(|p| if p.len() == 2 { node(&p[0], &p[1]) } else { p[0] })
-                .collect();
-            idx /= 2;
-        }
-        Some(Proof {
-            leaf: leaves[index].clone(),
-            index: index as u64,
-            count: count as u64,
-            burned: self.burned,
-            siblings,
-        })
+        self.state_tree().proof(addr)
     }
 }
 

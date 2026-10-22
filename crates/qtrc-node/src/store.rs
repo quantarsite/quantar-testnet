@@ -67,8 +67,26 @@ impl BlockStore {
 
     /// First height whose header carries the state root, fixed once per
     /// data dir like the fee and Sentinel activations.
+    ///
+    /// If the stored height already has a block and that block has no root,
+    /// an older binary ran on this data dir after the activation was recorded
+    /// (rolled back before the first root was mined). Move the activation
+    /// past those blocks so they replay instead of failing.
     pub fn state_root_from_height(&self) -> Result<u64> {
-        self.activation_height(STATE_ROOT_FROM_KEY)
+        let from = self.activation_height(STATE_ROOT_FROM_KEY)?;
+        let Some(latest) = self.latest_height()? else { return Ok(from) };
+        if from > latest {
+            return Ok(from);
+        }
+        match self.get_block(from)? {
+            Some(b) if b.header.state_root.is_none() => {
+                let moved = latest + 1;
+                self.meta.insert(STATE_ROOT_FROM_KEY, &moved.to_be_bytes())?;
+                self.db.flush()?;
+                Ok(moved)
+            }
+            _ => Ok(from),
+        }
     }
 
     fn activation_height(&self, key: &[u8]) -> Result<u64> {
@@ -101,7 +119,6 @@ impl BlockStore {
         Ok(())
     }
 
-    #[allow(dead_code)]
     pub fn get_block(&self, height: u64) -> Result<Option<Block>> {
         match self.blocks.get(height.to_be_bytes())? {
             Some(bytes) => Ok(Some(decode_block(&bytes)?)),
@@ -400,6 +417,22 @@ mod tests {
         assert!(block.header.state_root.is_none());
         assert_eq!(wire::encode_v2(&block).unwrap().as_slice(), bytes.as_slice());
         assert_eq!(encode_block(&block).unwrap().as_slice(), bytes.as_slice());
+    }
+
+    /// Regression U1: new binary records the activation, operator rolls back
+    /// before any root is mined, the old binary adds blocks without roots,
+    /// then the new binary returns. The activation must move past them.
+    #[test]
+    fn rollback_before_first_root_does_not_brick_the_node() {
+        let dir = std::env::temp_dir().join(format!("qtrc-u1-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        let s = BlockStore::open(dir.to_str().unwrap()).unwrap();
+        assert_eq!(s.state_root_from_height().unwrap(), 1, "new binary on an empty dir");
+        s.put_block(&sample_block()).unwrap(); // old binary mines block 1 without a root
+        assert_eq!(s.state_root_from_height().unwrap(), 2, "activation moved past it");
+        assert_eq!(s.state_root_from_height().unwrap(), 2, "and stays there");
+        drop(s);
+        let _ = std::fs::remove_dir_all(&dir);
     }
 
     #[test]
