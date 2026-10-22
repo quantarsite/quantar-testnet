@@ -39,3 +39,9 @@ location = /rpc/tx {
     client_max_body_size 512k;
     proxy_pass http://127.0.0.1:8545/tx;
 }
+
+# Bloco por altura: qualquer um pode refazer e auditar a cadeia
+location ~ "^/rpc/block/([0-9]{1,19})$" {
+    limit_req zone=qtr_read burst=10 nodelay;
+    proxy_pass http://127.0.0.1:8545/block/$1;
+}

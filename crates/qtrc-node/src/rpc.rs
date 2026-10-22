@@ -22,7 +22,11 @@ use std::{net::SocketAddr, sync::Arc};
 use tower_http::cors::{Any, CorsLayer};
 use tracing::info;
 
-type AppState = Arc<ConsensusEngine>;
+#[derive(Clone)]
+struct AppState {
+    engine: Arc<ConsensusEngine>,
+    store:  Arc<crate::store::BlockStore>,
+}
 
 // ---------------------------------------------------------------------------
 // Response types
@@ -43,6 +47,8 @@ struct StatusResponse {
     sentinel_from_height: u64,
     /// First block whose header carries the state root
     state_root_from_height: u64,
+    /// First block whose header commits to full transactions
+    witness_root_from_height: u64,
 }
 
 #[derive(Serialize)]
@@ -88,7 +94,7 @@ struct ErrorResponse {
 // Handlers
 // ---------------------------------------------------------------------------
 
-async fn get_status(State(engine): State<AppState>) -> Json<StatusResponse> {
+async fn get_status(State(AppState { engine, .. }): State<AppState>) -> Json<StatusResponse> {
     let state = engine.state.read();
     Json(StatusResponse {
         chain_id:     qtrc_common::tx::CHAIN_ID,
@@ -100,11 +106,12 @@ async fn get_status(State(engine): State<AppState>) -> Json<StatusResponse> {
         burned:       state.burned,
         sentinel_from_height: state.sentinel_from_height,
         state_root_from_height: state.state_root_from_height,
+        witness_root_from_height: state.witness_root_from_height,
     })
 }
 
 async fn get_account(
-    State(engine): State<AppState>,
+    State(AppState { engine, .. }): State<AppState>,
     Path(address): Path<String>,
 ) -> Result<Json<AccountResponse>, (StatusCode, Json<ErrorResponse>)> {
     let addr = qtrc_crypto::Address::from_hex(&address).map_err(|e| {
@@ -126,7 +133,7 @@ async fn get_account(
 }
 
 async fn get_vault(
-    State(engine): State<AppState>,
+    State(AppState { engine, .. }): State<AppState>,
     Path(address): Path<String>,
 ) -> Result<Json<VaultResponse>, (StatusCode, Json<ErrorResponse>)> {
     let addr = qtrc_crypto::Address::from_hex(&address).map_err(|e| {
@@ -140,7 +147,7 @@ async fn get_vault(
 }
 
 async fn get_proof(
-    State(engine): State<AppState>,
+    State(AppState { engine, .. }): State<AppState>,
     Path(address): Path<String>,
 ) -> Result<Json<ProofResponse>, (StatusCode, Json<ErrorResponse>)> {
     let addr = qtrc_crypto::Address::from_hex(&address).map_err(|e| {
@@ -156,8 +163,22 @@ async fn get_proof(
     }
 }
 
+/// A stored block, as committed: anyone can replay the chain from these and
+/// check every header, signature, state root and witness root.
+async fn get_block(
+    State(app): State<AppState>,
+    Path(height): Path<u64>,
+) -> Result<Json<qtrc_common::block::Block>, (StatusCode, Json<ErrorResponse>)> {
+    let store = app.store.clone();
+    let found = tokio::task::spawn_blocking(move || store.get_block(height))
+        .await
+        .map_err(|e| (StatusCode::INTERNAL_SERVER_ERROR, Json(ErrorResponse { error: e.to_string() })))?
+        .map_err(|e| (StatusCode::INTERNAL_SERVER_ERROR, Json(ErrorResponse { error: e.to_string() })))?;
+    found.map(Json).ok_or_else(|| (StatusCode::NOT_FOUND, Json(ErrorResponse { error: format!("no block at height {height}") })))
+}
+
 async fn post_tx(
-    State(engine): State<AppState>,
+    State(AppState { engine, .. }): State<AppState>,
     Json(tx): Json<Transaction>,
 ) -> Result<Json<TxResponse>, (StatusCode, Json<ErrorResponse>)> {
     // HYDRA-X verification is CPU work (~2.6 ms); run it off the async
@@ -189,7 +210,7 @@ async fn post_tx(
 // Router
 // ---------------------------------------------------------------------------
 
-pub async fn serve(engine: Arc<ConsensusEngine>, addr: SocketAddr) {
+pub async fn serve(engine: Arc<ConsensusEngine>, store: Arc<crate::store::BlockStore>, addr: SocketAddr) {
     let cors = CorsLayer::new()
         .allow_origin(Any)
         .allow_methods(Any)
@@ -197,12 +218,13 @@ pub async fn serve(engine: Arc<ConsensusEngine>, addr: SocketAddr) {
 
     let app = Router::new()
         .route("/status",           get(get_status))
+        .route("/block/:height",    get(get_block))
         .route("/account/:address", get(get_account))
         .route("/vault/:address",   get(get_vault))
         .route("/proof/:address",   get(get_proof))
         .route("/tx",               post(post_tx))
         .layer(cors)
-        .with_state(engine);
+        .with_state(AppState { engine, store });
 
     let listener = tokio::net::TcpListener::bind(addr)
         .await

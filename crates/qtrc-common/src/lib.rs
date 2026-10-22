@@ -4,6 +4,7 @@
 //! across all Quantar Network crates.
 
 pub mod block;
+pub mod chain;
 pub mod genesis;
 pub mod sentinel;
 pub mod state_root;
