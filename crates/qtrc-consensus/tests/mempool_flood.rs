@@ -74,7 +74,25 @@ fn recovery_is_admitted_and_goes_first_when_the_mempool_is_flooded() {
     assert_eq!(picked[0].hash, id);
 }
 
+/// With 5,000 entries queued, junk is still refused for its own reason
+/// (bad nonce), never "mempool full", and the queue is left untouched.
 #[test]
+fn junk_is_refused_on_its_own_merits_with_a_full_mempool() {
+    let s = setup();
+    let mut junk = s.recover_tx.clone();
+    junk.nonce = 12_345;
+    flood(&s.engine, &s.recover_tx);
+    let before = s.engine.mempool.read().len();
+    let err = s.engine.submit_tx(junk).unwrap_err().to_string();
+    assert!(err.contains("invalid nonce"), "{err}");
+    assert_eq!(s.engine.mempool.read().len(), before);
+}
+
+/// Timing of the same refusal, empty vs full mempool. A measurement: CI
+/// runners are too noisy for a wall-clock assertion, so it is opt-in.
+/// `cargo test --release -p qtrc-consensus --test mempool_flood -- --ignored --nocapture`
+#[test]
+#[ignore = "measurement"]
 fn refusing_junk_costs_the_same_with_a_full_mempool() {
     let s = setup();
     let mut junk = s.recover_tx.clone();
