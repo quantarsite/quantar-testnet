@@ -269,3 +269,32 @@ Achados F2, F4 e F5 do teste adversarial.
   numa conta roubada é o ladrão.
 
 Nada muda no consenso nem nos bytes dos blocos. Deploy igual à v2.3.1.
+
+## v2.3.3: árvore de estado atualizada, não reconstruída
+
+Achado F3 do teste adversarial. A raiz era recalculada do zero duas vezes
+por bloco (ao propor e ao confirmar) e de novo a cada bloco no replay.
+
+- `ChainState` guarda as chaves que cada transação tocou (vêm do mesmo
+  journal que faz o rollback, por onde passa toda mudança de conta e cofre).
+- O node mantém a árvore do último bloco e só refaz as folhas tocadas e os
+  caminhos delas. Se uma conta aparece ou some, as posições mudam e os
+  níveis acima das folhas são refeitos a partir dos hashes em cache.
+- O node reaproveita a árvore da própria proposta ao confirmar o bloco.
+- Mesma raiz, mesmas provas: um teste roda milhares de transações
+  aleatórias (todas as operações do Sentinel incluídas) e compara, bloco a
+  bloco, a árvore atualizada com a reconstrução completa.
+
+Medido por bloco com 500 contas alteradas:
+
+| contas | antes (cada vez) | sem conta nova | com conta nova |
+|---|---|---|---|
+| 10 mil | 23 ms | 3 ms | 9 ms |
+| 100 mil | 279 ms | 15 ms | 75 ms |
+| 1 milhão | 2,9 s | 120 ms | 670 ms |
+
+Limite honesto: com contas novas a árvore ordenada por endereço desloca
+posições, e isso continua O(n). Resolver de vez pede outro formato de
+compromisso (árvore esparsa por endereço), que muda a raiz e entra com
+altura de ativação junto com o trabalho de múltiplos validadores. Nada muda
+no consenso nesta versão.

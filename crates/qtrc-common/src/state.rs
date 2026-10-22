@@ -9,7 +9,7 @@ pub const MAX_DATA_LEN: usize = 48 * 1024;
 use qtrc_crypto::Address;
 use qtrc_sentinel::{self as sn, Credit, Outcome, Policy, SentinelError, Vault};
 use serde::{Deserialize, Serialize};
-use std::collections::{BTreeMap, HashMap};
+use std::collections::{BTreeMap, BTreeSet, HashMap};
 
 /// Per-account state.
 #[derive(Clone, Debug, Default, PartialEq, Eq, Serialize, Deserialize)]
@@ -53,6 +53,12 @@ pub struct ChainState {
     /// Sentinel vaults, key = address hex. Ordered for determinism.
     #[serde(default)]
     pub vaults: BTreeMap<String, Vault>,
+    /// Keys of accounts and vaults touched since the last `take_touched`,
+    /// so the state tree can be updated instead of rebuilt. Every change
+    /// to `accounts` and `vaults` in block application goes through the
+    /// journal, which is where these come from. Not part of the state.
+    #[serde(skip)]
+    pub touched: BTreeSet<String>,
 }
 
 fn fees_from_genesis() -> u64 {
@@ -199,13 +205,22 @@ impl ChainState {
     ///   makes failing operations cost the same as successful ones.
     pub fn apply_tx(&mut self, tx: &Transaction) -> Result<(), TxError> {
         let mut j = Journal { burned: self.burned, ..Journal::default() };
-        match self.apply_tx_inner(tx, &mut j) {
+        let result = self.apply_tx_inner(tx, &mut j);
+        // Marking a key that ends up unchanged only costs a re-hash.
+        self.touched.extend(j.accounts.keys().cloned());
+        self.touched.extend(j.vaults.keys().cloned());
+        match result {
             Ok(()) => Ok(()),
             Err(e) => {
                 self.rollback(j);
                 Err(e)
             }
         }
+    }
+
+    /// Keys touched since the last call, clearing the set.
+    pub fn take_touched(&mut self) -> BTreeSet<String> {
+        std::mem::take(&mut self.touched)
     }
 
     fn rollback(&mut self, j: Journal) {

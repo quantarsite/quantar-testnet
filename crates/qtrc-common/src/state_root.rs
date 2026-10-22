@@ -17,6 +17,7 @@ use crate::state::ChainState;
 use qtrc_crypto::Address;
 use serde::{Deserialize, Serialize};
 use sha3::{Digest, Sha3_256};
+use std::collections::BTreeSet;
 
 pub type Hash = [u8; 32];
 
@@ -133,17 +134,101 @@ pub struct StateTree {
 
 impl StateTree {
     fn build(leaves: Vec<Leaf>, burned: u64) -> Self {
-        let mut levels = vec![leaves.iter().map(Leaf::hash).collect::<Vec<Hash>>()];
-        while levels.last().is_some_and(|l| l.len() > 1) {
-            let next = levels
+        let hashes = leaves.iter().map(Leaf::hash).collect::<Vec<Hash>>();
+        let mut t = Self { leaves, levels: vec![hashes], burned };
+        t.rebuild_nodes();
+        t
+    }
+
+    /// Recompute every level above the leaf hashes.
+    fn rebuild_nodes(&mut self) {
+        self.levels.truncate(1);
+        while self.levels.last().is_some_and(|l| l.len() > 1) {
+            let next = self.levels
                 .last()
                 .expect("non-empty")
                 .chunks(2)
                 .map(|p| if p.len() == 2 { node(&p[0], &p[1]) } else { p[0] })
                 .collect();
-            levels.push(next);
+            self.levels.push(next);
         }
-        Self { leaves, levels, burned }
+    }
+
+    /// The tree of `state`, given that `self` was the tree of a state that
+    /// differs from it only in the accounts and vaults keyed in `touched`.
+    ///
+    /// Same result as a full build. Changed leaves are re-hashed and only
+    /// their paths recomputed; when an account appears or disappears the
+    /// positions shift, so the levels above the leaves are recomputed from
+    /// the cached leaf hashes (one node hash per pair, no leaf re-hashing).
+    #[must_use]
+    pub fn updated(&self, state: &ChainState, touched: &BTreeSet<String>) -> StateTree {
+        let mut t = self.clone();
+        t.burned = state.burned;
+        let mut changed: Vec<usize> = Vec::new();
+        let mut reshaped = false;
+        for key in touched {
+            let Ok(address) = Address::from_hex(key) else { continue };
+            let leaf = state.leaf(key, address.clone());
+            match (t.leaves.binary_search_by(|l| l.address.0.cmp(&address.0)), leaf) {
+                (Ok(i), Some(new)) => {
+                    if t.leaves[i] != new {
+                        t.levels[0][i] = new.hash();
+                        t.leaves[i] = new;
+                        changed.push(i);
+                    }
+                }
+                (Ok(i), None) => {
+                    t.leaves.remove(i);
+                    t.levels[0].remove(i);
+                    reshaped = true;
+                }
+                (Err(i), Some(new)) => {
+                    t.levels[0].insert(i, new.hash());
+                    t.leaves.insert(i, new);
+                    reshaped = true;
+                }
+                (Err(_), None) => {}
+            }
+        }
+        if reshaped || t.levels.is_empty() {
+            if t.levels.is_empty() {
+                t.levels.push(Vec::new());
+            }
+            t.rebuild_nodes();
+            return t;
+        }
+        // Same shape: walk the changed positions up, level by level.
+        let mut idx: BTreeSet<usize> = changed.into_iter().collect();
+        for lvl in 1..t.levels.len() {
+            let below = &t.levels[lvl - 1];
+            let mut up = BTreeSet::new();
+            let mut fresh = Vec::with_capacity(idx.len());
+            for &i in &idx {
+                let p = i / 2;
+                if up.insert(p) {
+                    let l = 2 * p;
+                    let h = if l + 1 < below.len() { node(&below[l], &below[l + 1]) } else { below[l] };
+                    fresh.push((p, h));
+                }
+            }
+            for (p, h) in fresh {
+                t.levels[lvl][p] = h;
+            }
+            idx = up;
+        }
+        t
+    }
+
+    /// Number of accounts committed.
+    #[must_use]
+    pub fn len(&self) -> usize {
+        self.leaves.len()
+    }
+
+    #[must_use]
+    pub fn is_empty(&self) -> bool {
+        self.leaves.is_empty()
     }
 
     /// The state root.
@@ -186,20 +271,22 @@ impl ChainState {
         keys.dedup();
         let mut out: Vec<Leaf> = keys
             .into_iter()
-            .filter_map(|k| {
-                let address = Address::from_hex(k).ok()?;
-                let acct = self.account(&address);
-                // Canonical, versioned encoding: storage format changes can
-                // never alter past roots.
-                let vault_hash = self.vaults.get(k).map(|v| -> Hash { Sha3_256::digest(v.canonical_encoding()).into() });
-                if acct.balance == 0 && acct.nonce == 0 && vault_hash.is_none() {
-                    return None;
-                }
-                Some(Leaf { address, balance: acct.balance, nonce: acct.nonce, vault_hash })
-            })
+            .filter_map(|k| self.leaf(k, Address::from_hex(k).ok()?))
             .collect();
         out.sort_by_key(|l| l.address.0);
         out
+    }
+
+    /// The leaf for one key, or None if that account is empty.
+    fn leaf(&self, key: &str, address: Address) -> Option<Leaf> {
+        let acct = self.account(&address);
+        // Canonical, versioned encoding: storage format changes can never
+        // alter past roots.
+        let vault_hash = self.vaults.get(key).map(|v| -> Hash { Sha3_256::digest(v.canonical_encoding()).into() });
+        if acct.balance == 0 && acct.nonce == 0 && vault_hash.is_none() {
+            return None;
+        }
+        Some(Leaf { address, balance: acct.balance, nonce: acct.nonce, vault_hash })
     }
 
     /// Full tree of this state (for serving many proofs).
