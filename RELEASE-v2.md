@@ -233,3 +233,20 @@ Voltar só restaurando o backup do passo 1.
 Se voltar antes do primeiro bloco com raiz e depois reinstalar a versão
 nova, o node detecta os blocos sem raiz e move a ativação para depois
 deles sozinho.
+
+## v2.3.1: o node recusa banco de dados danificado
+
+Achado F1 do teste adversarial: com blocos grandes (assinaturas HYDRA-X), o
+sled guarda os valores como blobs. Se o arquivo `snap.*` se perder depois de
+uma reabertura, o banco abre vazio, sem erro, e o node achava que era uma
+pasta nova: gravava outra gênese e começava uma cadeia do zero com a mesma
+chave de validador.
+
+Agora existe `<data-dir>/chain.marker`, fora do sled, com a última altura
+gravada. Ele nasce junto com a gênese e sobe a cada bloco. Se o sled abrir
+sem gênese ou com menos blocos do que o marker diz, o node não sobe e manda
+restaurar o backup. Pastas antigas ganham o marker na primeira abertura, na
+altura em que estão. Nada muda no consenso nem nos bytes dos blocos.
+
+Deploy: os mesmos passos da v2.3.0 (backup primeiro). Depois de subir,
+`cat /var/lib/quantar/chain.marker` deve mostrar a altura atual.
