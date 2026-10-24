@@ -53,6 +53,10 @@ pub struct ChainState {
     /// First block height whose header must carry the witness root.
     #[serde(default = "never")]
     pub witness_root_from_height: u64,
+    /// First block height decided by the validators voting (BFT): from it
+    /// on, any validator may propose and every block needs a commit proof.
+    #[serde(default = "never")]
+    pub bft_from_height: u64,
     /// Sentinel vaults, key = address hex. Ordered for determinism.
     #[serde(default)]
     pub vaults: BTreeMap<String, Vault>,
@@ -113,6 +117,10 @@ impl ChainState {
     }
 
     /// Whether the block at `height` must carry a state root.
+    pub fn bft_active_at(&self, height: u64) -> bool {
+        height >= self.bft_from_height
+    }
+
     pub fn state_root_active_at(&self, height: u64) -> bool {
         height >= self.state_root_from_height
     }

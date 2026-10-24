@@ -77,13 +77,36 @@ pub struct ValidatorSig {
     pub signature: HydraXSignature,
 }
 
+/// Proof that the validators decided a block, on chains with more than one
+/// validator: the consensus round, and precommits (HYDRA-X signatures over
+/// the BFT precommit bytes for this height, round and header hash) from
+/// validators holding more than two thirds of the voting power. Checked by
+/// `qtrc_bft::verify_commit`.
+#[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
+pub struct CommitProof {
+    pub round:      u32,
+    pub precommits: Vec<ValidatorSig>,
+}
+
+impl PartialEq for ValidatorSig {
+    fn eq(&self, other: &Self) -> bool {
+        self.validator == other.validator
+            && bincode::serialize(&self.signature).ok() == bincode::serialize(&other.signature).ok()
+    }
+}
+
 /// A complete block.
 #[derive(Clone, Debug, Serialize, Deserialize)]
 pub struct Block {
     pub header:         BlockHeader,
     pub transactions:   Vec<Transaction>,
-    /// Signatures from ≥ 2/3 of the validator set
+    /// The proposer's HYDRA-X signature over the header
     pub validator_sigs: Vec<ValidatorSig>,
+    /// Present from the multi-validator activation height on. Not part of
+    /// the header (it is made after the header is final), so absent from
+    /// the JSON before it and older blocks keep their exact bytes.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub commit:         Option<CommitProof>,
 }
 
 impl Block {

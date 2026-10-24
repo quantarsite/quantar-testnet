@@ -58,6 +58,12 @@ pub enum ConsensusError {
     Busy(String),
 }
 
+/// A block that passed every check, and the state after it.
+struct Checked {
+    next: ChainState,
+    tree: Option<Arc<StateTree>>,
+}
+
 /// The last committed block's header and signatures, with the state tree
 /// its root was computed from (None before state-root activation). Proofs
 /// are served from here, without touching the live state.
@@ -167,9 +173,18 @@ impl ConsensusEngine {
     /// signature over the header must verify. Used for block announcements,
     /// which carry no transactions.
     pub fn verify_header(&self, header: &BlockHeader, sigs: &[ValidatorSig]) -> Result<(), ConsensusError> {
-        let expected = self
-            .proposer_at(header.height)
-            .unwrap_or_else(|| self.address.clone());
+        let bft = self.state.read().bft_active_at(header.height);
+        let expected = if bft {
+            // Who proposes depends on the consensus round, which the header
+            // does not carry; the commit proof is what makes a block final.
+            // Here the proposer only has to be a validator.
+            if !self.state.read().validators.iter().any(|v| v.address == header.proposer) {
+                return Err(ConsensusError::InvalidSig(format!("block proposer {} is not a validator", header.proposer)));
+            }
+            header.proposer.clone()
+        } else {
+            self.proposer_at(header.height).unwrap_or_else(|| self.address.clone())
+        };
         if header.proposer != expected {
             return Err(ConsensusError::InvalidSig(format!(
                 "block proposer {} is not the expected proposer {}",
@@ -420,11 +435,18 @@ impl ConsensusEngine {
         let proposer = self.proposer_at(next_height)
             .unwrap_or_else(|| self.address.clone());
 
+        let bft = self.state.read().bft_active_at(next_height);
         {
             let state = self.state.read();
-            if proposer != self.address && !state.validators.is_empty() {
+            // With BFT the consensus round decides who proposes.
+            if !bft && proposer != self.address && !state.validators.is_empty() {
                 return Err(ConsensusError::NotProposer { height: next_height });
             }
+        }
+        // With BFT our proposal from an earlier round may have lost; its
+        // transactions go back to the queue and the new proposal takes them.
+        if bft && !self.mempool.read().inflight_is_empty() {
+            self.release_inflight(true);
         }
 
         // Take up to 500 pending txs and keep only those that apply, in order,
@@ -523,6 +545,7 @@ impl ConsensusEngine {
             header,
             transactions:   txs,
             validator_sigs: vec![validator_sig],
+            commit:         None,
         };
 
         info!(
@@ -558,11 +581,24 @@ impl ConsensusEngine {
                 && inflight.len() == block.transactions.len()
                 && inflight.iter().zip(&block.transactions).all(|(a, b)| *a == b.hash())
         };
+        let included: std::collections::HashSet<TxHash> =
+            if own { Default::default() } else { block.transactions.iter().map(|t| t.hash()).collect() };
         let result = self.commit_inner(block, true);
         if own {
             // Our own proposal: on success the txs are done; on failure they
             // go back to the front of the mempool for the next attempt.
             self.release_inflight(result.is_err());
+        } else if result.is_ok() {
+            // Someone else's block (BFT, or a follower). Any proposal of ours
+            // for this height lost: its txs go back to the queue. Then the
+            // txs this block included leave the mempool for good.
+            if !self.mempool.read().inflight_is_empty() {
+                self.release_inflight(true);
+            }
+            let removed = self.mempool.write().remove(&included);
+            if !removed.is_empty() {
+                self.forget(&removed);
+            }
         }
         result
     }
@@ -573,7 +609,11 @@ impl ConsensusEngine {
         self.commit_inner(block, false)
     }
 
-    fn commit_inner(&self, block: Block, persist: bool) -> Result<(), ConsensusError> {
+    /// Everything a block must satisfy except who decided it: it extends
+    /// the tip, its roots match its transactions and the resulting state,
+    /// every transaction and the proposer's header signature verify, and it
+    /// applies. Returns the state after it, untouched live state.
+    fn check(&self, block: &Block, own_tree: bool) -> Result<Checked, ConsensusError> {
         {
             let state    = self.state.read();
             let expected = state.height + 1;
@@ -616,12 +656,12 @@ impl ConsensusEngine {
             ));
         }
 
-        self.verify_proposer_sig(&block)?;
+        self.verify_proposer_sig(block)?;
 
         // Apply on a copy: a block either applies completely or not at all.
         // (Applying in place left earlier txs applied when a later one failed.)
         let mut next = self.state.read().clone();
-        next.apply_block(&block)
+        next.apply_block(block)
             .map_err(|e| ConsensusError::InvalidTx(e.to_string()))?;
         let touched = next.take_touched();
 
@@ -630,7 +670,7 @@ impl ConsensusEngine {
         // Our own proposal's tree is reused when its root is the header's:
         // equal roots commit to the same leaves.
         let tree = next.state_root_active_at(block.header.height).then(|| {
-            let mine = self.proposed_tree.lock().take();
+            let mine = if own_tree { self.proposed_tree.lock().take() } else { None };
             match mine {
                 Some(t) if Some(t.root()) == block.header.state_root => t,
                 _ => Arc::new(self.next_tree(&next, &touched, block.header.height)),
@@ -644,6 +684,13 @@ impl ConsensusEngine {
                 _ => "state root does not match the state after this block".into(),
             }));
         }
+
+        Ok(Checked { next, tree })
+    }
+
+    fn commit_inner(&self, block: Block, persist: bool) -> Result<(), ConsensusError> {
+        self.verify_finality(&block)?;
+        let Checked { next, tree } = self.check(&block, true)?;
 
         if persist {
             if let Some(sink) = &self.sink {
@@ -685,6 +732,57 @@ impl ConsensusEngine {
     /// The block must be proposed by the expected proposer and carry that
     /// proposer's HYDRA-X signature over the header. With no validator set
     /// (single-node testnet) the expected proposer is this node's own key.
+    /// The validator set as the BFT consensus sees it (voting power = stake).
+    pub fn bft_validator_set(&self) -> Result<qtrc_bft::ValidatorSet, ConsensusError> {
+        let state = self.state.read();
+        qtrc_bft::ValidatorSet::new(
+            state
+                .validators
+                .iter()
+                .map(|v| qtrc_bft::Validator { address: qtrc_bft::ValAddr::from(&v.address), power: v.stake })
+                .collect(),
+        )
+        .map_err(ConsensusError::InvalidSig)
+    }
+
+    /// From the BFT activation height on, a block is final only with a
+    /// commit proof: precommits for its header hash, at its height, from
+    /// validators holding more than two thirds of the voting power. Before
+    /// it, a block must not carry one.
+    fn verify_finality(&self, block: &Block) -> Result<(), ConsensusError> {
+        let bft = self.state.read().bft_active_at(block.header.height);
+        match (&block.commit, bft) {
+            (None, false) => Ok(()),
+            (Some(_), false) => Err(ConsensusError::InvalidSig("commit proof before multi-validator activation".into())),
+            (None, true) => Err(ConsensusError::InsufficientSigs { need: 1, got: 0 }),
+            (Some(proof), true) => {
+                use qtrc_bft::types as mc;
+                let vs = self.bft_validator_set()?;
+                let cert = mc::CommitCertificate::<qtrc_bft::Ctx> {
+                    height: qtrc_bft::Height(block.header.height),
+                    round: mc::Round::new(proof.round),
+                    value_id: qtrc_bft::BlockId(block.hash().0),
+                    commit_signatures: proof
+                        .precommits
+                        .iter()
+                        .map(|p| mc::CommitSignature::new(qtrc_bft::ValAddr::from(&p.validator), qtrc_bft::Signature::from_hydrax(&p.signature)))
+                        .collect(),
+                };
+                qtrc_bft::verify_commit(&cert, &vs).map_err(ConsensusError::InvalidSig)
+            }
+        }
+    }
+
+    /// Check a block another validator proposed, without committing it.
+    /// The consensus votes for it only if this passes. It carries no commit
+    /// proof yet: that is what the vote produces.
+    pub fn check_proposal(&self, block: &Block) -> Result<(), ConsensusError> {
+        if block.commit.is_some() {
+            return Err(ConsensusError::InvalidTx("a proposal cannot carry a commit proof".into()));
+        }
+        self.check(block, false).map(|_| ())
+    }
+
     fn verify_proposer_sig(&self, block: &Block) -> Result<(), ConsensusError> {
         self.verify_header(&block.header, &block.validator_sigs)
     }
