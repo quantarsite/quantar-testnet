@@ -28,6 +28,8 @@ struct AppState {
     store:  Arc<crate::store::BlockStore>,
     /// Follower nodes do not take transactions: they produce no blocks.
     follower: bool,
+    /// BFT validator: pass accepted transactions to the other validators.
+    relay: Option<crate::bft::Outbox>,
 }
 
 // ---------------------------------------------------------------------------
@@ -184,7 +186,7 @@ async fn get_block(
 }
 
 async fn post_tx(
-    State(AppState { engine, follower, .. }): State<AppState>,
+    State(AppState { engine, follower, relay, .. }): State<AppState>,
     Json(tx): Json<Transaction>,
 ) -> Result<Json<TxResponse>, (StatusCode, Json<ErrorResponse>)> {
     if follower {
@@ -195,6 +197,7 @@ async fn post_tx(
     }
     // HYDRA-X verification is CPU work (~2.6 ms); run it off the async
     // runtime so status and account queries stay fast under load.
+    let relayed = tx.clone();
     let result = tokio::task::spawn_blocking(move || engine.submit_tx(tx))
         .await
         .map_err(|e| {
@@ -204,9 +207,13 @@ async fn post_tx(
             )
         })?;
     match result {
-        Ok(hash) => Ok(Json(TxResponse {
+        Ok(hash) => Ok(Json({
+            if let Some(r) = &relay {
+                r.relay_tx(&relayed);
+            }
+            TxResponse {
             tx_hash: hash.to_string(),
-        })),
+        }})),
         Err(e @ qtrc_consensus::ConsensusError::Busy(_)) => Err((
             StatusCode::SERVICE_UNAVAILABLE,
             Json(ErrorResponse { error: e.to_string() }),
@@ -222,7 +229,7 @@ async fn post_tx(
 // Router
 // ---------------------------------------------------------------------------
 
-pub async fn serve(engine: Arc<ConsensusEngine>, store: Arc<crate::store::BlockStore>, follower: bool, addr: SocketAddr) {
+pub async fn serve(engine: Arc<ConsensusEngine>, store: Arc<crate::store::BlockStore>, follower: bool, relay: Option<crate::bft::Outbox>, addr: SocketAddr) {
     let cors = CorsLayer::new()
         .allow_origin(Any)
         .allow_methods(Any)
@@ -236,7 +243,7 @@ pub async fn serve(engine: Arc<ConsensusEngine>, store: Arc<crate::store::BlockS
         .route("/proof/:address",   get(get_proof))
         .route("/tx",               post(post_tx))
         .layer(cors)
-        .with_state(AppState { engine, store, follower });
+        .with_state(AppState { engine, store, follower, relay });
 
     let listener = tokio::net::TcpListener::bind(addr)
         .await

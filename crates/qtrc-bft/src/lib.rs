@@ -39,6 +39,7 @@ pub use malachitebft_core_types as types;
 pub use malachitebft_metrics as metrics;
 
 pub mod runner;
+pub mod wire;
 
 // ---------------------------------------------------------------------------
 // Address, height, value
