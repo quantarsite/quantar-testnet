@@ -375,3 +375,8 @@ hx-mempool lado a lado, `cargo build --release`, instalar `qtrc-node` e
 Deploy no seguidor: backup, copiar o binário, atualizar o service (porta
 9545), `ufw allow 9545/tcp`, reiniciar. No validador: backup, binário novo,
 `--announce-to http://207.154.219.21:9545` no ExecStart, reiniciar.
+
+Atenção no validador: parar o `quantar-node` para também o faucet e o
+watchtower, e eles não voltam sozinhos. Depois de ligar o node:
+`systemctl start quantar-faucet quantar-watchtower` e conferir com
+`systemctl is-active quantar-node quantar-faucet quantar-watchtower`.
