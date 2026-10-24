@@ -352,3 +352,26 @@ hx-mempool lado a lado, `cargo build --release`, instalar `qtrc-node` e
 `qtrc-wallet`, criar `/var/lib/quantar`, copiar o service e
 `systemctl enable --now quantar-follower`. Não precisa de chave nem de
 `QTR_FAUCET_ADDRESS`: a gênese e as regras vêm do código.
+
+## v2.6.0: anúncio de blocos entre nós (fase 2, primeira parte)
+
+- O validador avisa os seguidores logo depois de cada bloco
+  (`--announce-to http://IP:9545`, repetível). O aviso é o cabeçalho do
+  bloco com a assinatura HYDRA-X do validador que o bloco já carrega:
+  nada novo é assinado, e o validador não gasta CPU a mais.
+- O seguidor escuta com `--p2p 0.0.0.0:9545`. Só uma rota, corpo de até
+  256 KB, duas verificações por vez, timeout de 15 s. Confere primeiro o
+  barato (altura, proponente esperado) e só depois a assinatura. Aviso
+  válido acorda a sincronização na hora; o bloco em si continua vindo por
+  `/block/:height` e passa por todas as verificações do commit. Aviso
+  falso ou adulterado é recusado e não muda nada.
+- Sem aviso (porta fechada, validador antigo), o seguidor continua
+  perguntando a cada 5 s, como antes.
+- Sem `--key-file`, o nó usa `<data-dir>/node.key`, criado na primeira
+  vez. O endereço do seguidor não muda mais a cada reinício.
+- `ConsensusEngine::verify_header` e `subscribe_commits`: a base para os
+  votos da fase 3.
+
+Deploy no seguidor: backup, copiar o binário, atualizar o service (porta
+9545), `ufw allow 9545/tcp`, reiniciar. No validador: backup, binário novo,
+`--announce-to http://207.154.219.21:9545` no ExecStart, reiniciar.

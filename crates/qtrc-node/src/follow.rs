@@ -130,12 +130,14 @@ pub fn sync_once(engine: &ConsensusEngine, peers: &[Box<dyn BlockSource>]) -> Sy
 }
 
 /// Keep following the peers. Runs on its own thread (blocking HTTP).
-pub fn run(engine: std::sync::Arc<ConsensusEngine>, peers: Vec<Box<dyn BlockSource>>) {
+/// At the tip it waits for the next block: an announcement from the
+/// validator wakes it at once, polling every block time is the fallback.
+pub fn run(engine: std::sync::Arc<ConsensusEngine>, peers: Vec<Box<dyn BlockSource>>, wake: std::sync::Arc<crate::p2p::Wake>) {
     loop {
         let s = sync_once(&engine, &peers);
         // Catching up: go straight on. At the tip: wait for the next block.
         if s.stored == 0 || s.height >= s.target {
-            std::thread::sleep(Duration::from_secs(qtrc_consensus::BLOCK_TIME_SECS));
+            wake.wait_above(s.height, Duration::from_secs(qtrc_consensus::BLOCK_TIME_SECS));
         }
     }
 }

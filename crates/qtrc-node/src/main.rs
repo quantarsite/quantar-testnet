@@ -5,6 +5,7 @@
 //! (future) P2P listener.
 
 mod follow;
+mod p2p;
 mod rpc;
 mod store;
 
@@ -50,7 +51,8 @@ enum Command {
         #[arg(long, default_value = "./qtrc-data")]
         data_dir: String,
         /// Validator key file from `qtrc-node keygen --out`. Without it the
-        /// node generates a throwaway key and its address changes on restart.
+        /// node uses `<data-dir>/node.key`, created on first start, so its
+        /// address stays the same across restarts.
         #[arg(long)]
         key_file: Option<String>,
         /// Follow these nodes instead of producing blocks: download every
@@ -62,6 +64,15 @@ enum Command {
         /// validator is not fixed in the code (the live network's is).
         #[arg(long)]
         validator: Option<String>,
+        /// Listen for block announcements from validators on this address,
+        /// e.g. 0.0.0.0:9545 on a follower. Only that one route is served
+        /// there. Off by default.
+        #[arg(long)]
+        p2p: Option<String>,
+        /// Tell these nodes about every new block right after committing it
+        /// (their --p2p address, e.g. http://203.0.113.7:9545). Repeatable.
+        #[arg(long)]
+        announce_to: Vec<String>,
     },
 }
 
@@ -82,8 +93,8 @@ async fn main() -> Result<()> {
 
     match cli.command {
         Command::Keygen { out } => cmd_keygen(&out)?,
-        Command::Start { rpc, data_dir, key_file, follow, validator } => {
-            cmd_start(rpc, data_dir, key_file, follow, validator).await?
+        Command::Start { rpc, data_dir, key_file, follow, validator, p2p, announce_to } => {
+            cmd_start(rpc, data_dir, key_file, follow, validator, p2p, announce_to).await?
         }
     }
 
@@ -125,6 +136,21 @@ fn write_secret_file(path: &str, bytes: &[u8]) -> Result<()> {
     Ok(())
 }
 
+/// This node's own key in `<data_dir>/node.key`, created on first start.
+fn node_key(data_dir: &str) -> Result<HydraXKeypair> {
+    std::fs::create_dir_all(data_dir)?;
+    let path = std::path::Path::new(data_dir).join("node.key");
+    let path = path.to_str().ok_or_else(|| anyhow::anyhow!("data dir path is not UTF-8"))?;
+    if std::path::Path::new(path).exists() {
+        info!("🔑 Loading node key from {path}");
+        return load_keypair(path);
+    }
+    let kp = HydraXKeypair::generate();
+    write_secret_file(path, &kp.to_bytes())?;
+    info!("🔑 New node key saved to {path}");
+    Ok(kp)
+}
+
 fn load_keypair(path: &str) -> Result<HydraXKeypair> {
     let bytes = zeroize::Zeroizing::new(
         std::fs::read(path).map_err(|e| anyhow::anyhow!("cannot read key file {path}: {e}"))?,
@@ -142,16 +168,15 @@ async fn cmd_start(
     key_file: Option<String>,
     follow: Vec<String>,
     validator: Option<String>,
+    p2p_addr: Option<String>,
+    announce_to: Vec<String>,
 ) -> Result<()> {
     let keypair = match key_file {
         Some(path) => {
             info!("🔑 Loading HYDRA-X validator key from {path}");
             load_keypair(&path)?
         }
-        None => {
-            warn!("🔑 No --key-file given: generating a throwaway HYDRA-X key for this run");
-            HydraXKeypair::generate()
-        }
+        None => node_key(&data_dir)?,
     };
     let address = keypair.address();
     info!("Node address: {} ({address})", address.as_hex());
@@ -294,6 +319,23 @@ async fn cmd_start(
         }
     });
 
+    let wake = p2p::Wake::new();
+    if let Some(addr) = p2p_addr {
+        let addr: std::net::SocketAddr = addr.parse().map_err(|e| anyhow::anyhow!("--p2p {addr}: {e}"))?;
+        if !following {
+            warn!("--p2p on a validator: announcements are only used by followers for now");
+        }
+        let (e, w) = (engine.clone(), wake.clone());
+        tokio::spawn(async move {
+            if let Err(err) = p2p::serve(e, w, addr).await {
+                warn!("P2P listener stopped: {err:#}");
+            }
+        });
+    }
+    if !announce_to.is_empty() {
+        tokio::spawn(p2p::announce_loop(engine.clone(), announce_to));
+    }
+
     if following {
         // Follower: verify and store other nodes' blocks, produce none.
         let peers = follow
@@ -302,7 +344,8 @@ async fn cmd_start(
             .collect::<Result<Vec<_>>>()?;
         info!(peers = ?follow, "Follower mode: syncing from peers, not producing blocks");
         let e = engine.clone();
-        std::thread::spawn(move || follow::run(e, peers));
+        let w = wake.clone();
+        std::thread::spawn(move || follow::run(e, peers, w));
     } else {
         let engine_clone = engine.clone();
         tokio::spawn(async move {
@@ -315,4 +358,18 @@ async fn cmd_start(
     rpc::serve(engine, store, following, rpc_addr.parse()?).await;
 
     Ok(())
+}
+
+#[cfg(test)]
+mod tests {
+    #[test]
+    fn node_key_is_created_once_and_kept() {
+        let dir = std::env::temp_dir().join(format!("qtrc-node-key-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        let d = dir.to_str().unwrap();
+        let first = super::node_key(d).unwrap().address();
+        let again = super::node_key(d).unwrap().address();
+        assert_eq!(first, again, "a restart must keep the same node address");
+        std::fs::remove_dir_all(&dir).unwrap();
+    }
 }
