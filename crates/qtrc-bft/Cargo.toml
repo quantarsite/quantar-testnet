@@ -1,0 +1,19 @@
+[package]
+name        = "qtrc-bft"
+description = "Quantar multi-validator BFT consensus: Malachite (Tendermint) with HYDRA-X votes"
+version.workspace    = true
+edition.workspace    = true
+authors.workspace    = true
+license.workspace    = true
+repository.workspace = true
+
+[dependencies]
+qtrc-crypto.path = "../qtrc-crypto"
+qtrc-common.path = "../qtrc-common"
+malachitebft-core-types     = { package = "arc-malachitebft-core-types", version = "=0.8.2" }
+malachitebft-core-consensus = { package = "arc-malachitebft-core-consensus", version = "=0.8.2" }
+malachitebft-metrics        = { package = "arc-malachitebft-metrics", version = "=0.8.2" }
+bytes      = "1"
+bincode.workspace = true
+hex.workspace     = true
+serde.workspace   = true
