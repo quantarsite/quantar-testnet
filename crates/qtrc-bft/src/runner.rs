@@ -135,6 +135,12 @@ impl Runner {
         }
     }
 
+    /// Give back the sign guard, to build a new runner at another height
+    /// (after catching up blocks this one did not vote on).
+    pub fn into_guard(self) -> SignGuard {
+        self.guard
+    }
+
     pub fn address(&self) -> ValAddr {
         ValAddr::from(&self.key.address())
     }
@@ -255,6 +261,12 @@ fn handle_effect(
         }
         Effect::Finalize(c, _, _, r) => {
             out.push(Action::Finalized(c.height));
+            r.resume_with(())
+        }
+        // Malachite re-sends our last vote when a round stalls, so a lost
+        // message does not stall it forever.
+        Effect::RepublishVote(v, r) => {
+            out.push(Action::Publish(SignedConsensusMsg::Vote(v)));
             r.resume_with(())
         }
         Effect::ExtendVote(_, _, _, _, r) => r.resume_with(None),

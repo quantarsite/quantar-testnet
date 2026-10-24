@@ -272,7 +272,7 @@ const BINCODE_V5: u8 = 0x05;
 /// 0x03 state root in the header (v2.3+),
 /// 0x04 witness root, and the state root if any, in the header (v2.4+),
 /// 0x05 as 0x04 plus the commit proof of a block the validators voted on.
-fn encode_block(block: &Block) -> Result<Vec<u8>> {
+pub(crate) fn encode_block(block: &Block) -> Result<Vec<u8>> {
     if block.commit.is_some() {
         return wire::encode_v5(block);
     }
@@ -288,7 +288,7 @@ fn encode_block(block: &Block) -> Result<Vec<u8>> {
     wire::encode_v2(block)
 }
 
-fn decode_block(bytes: &[u8]) -> Result<Block> {
+pub(crate) fn decode_block(bytes: &[u8]) -> Result<Block> {
     match bytes.first() {
         Some(&BINCODE_V5) => Ok(bincode::deserialize::<wire::BlockV5>(&bytes[1..])?.into()),
         Some(&BINCODE_V4) => Ok(bincode::deserialize::<wire::BlockV4>(&bytes[1..])?.into()),

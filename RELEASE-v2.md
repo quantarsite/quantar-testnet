@@ -380,3 +380,33 @@ Atenção no validador: parar o `quantar-node` para também o faucet e o
 watchtower, e eles não voltam sozinhos. Depois de ligar o node:
 `systemctl start quantar-faucet quantar-watchtower` e conferir com
 `systemctl is-active quantar-node quantar-faucet quantar-watchtower`.
+
+## v2.7.0: vários validadores votando (fase 3, rede de teste local)
+
+Ainda não muda a rede no ar: as regras novas só valem com `--bft-config`,
+que a quantar-testnet-2 recusa (as regras dela vêm do código).
+
+- `qtrc-bft`: o Tendermint do Malachite (núcleo 0.8.2) com votos e
+  propostas assinados em HYDRA-X. Modo `ProposalAndParts`: no
+  `ProposalOnly` o Malachite 0.8.2 aceita qualquer proposta como válida.
+- Bloco decidido só com prova de commit: precommits de validadores com
+  mais de 2/3 do poder de voto, cada um verificado. Seguidor e quem
+  refaz a cadeia conferem a mesma prova. Formato 0x05 no disco.
+- Proteção contra voto duplo gravada no disco antes de cada assinatura
+  (`<data-dir>/bft-sign-state`), vale depois de reiniciar.
+- Node: `--bft-config arquivo.json` com `bft_from_height` e a lista de
+  validadores (`address`, `p2p`). Validador precisa de `--p2p`. Votos e
+  propostas (com o bloco) vão por HTTP para `/p2p/v1/consensus`;
+  transações recebidas de clientes são repassadas aos outros validadores;
+  quem ficou para trás busca os blocos com prova em `/p2p/v1/block/:h`.
+- Altura nova só começa quando há transação (sem blocos vazios).
+- `deploy/devnet/run-local.sh`: 4 validadores na mesma máquina.
+
+Testado com 4 processos locais: blocos decididos na rodada 0; com um
+validador desligado os outros três seguem (a altura em que ele era o
+proponente fechou na rodada 1); ao religar ele busca os blocos que
+perdeu e volta a votar; um seguidor refaz a cadeia conferindo as provas;
+cinco transações seguidas chegam iguais aos quatro.
+
+Falta antes de ativar numa rede pública: servidores em provedores
+diferentes, limites por remetente no p2p, e revisão independente.

@@ -4,6 +4,7 @@
 //! Starts the consensus engine, JSON-RPC HTTP server, and
 //! (future) P2P listener.
 
+mod bft;
 mod follow;
 mod p2p;
 mod rpc;
@@ -73,6 +74,12 @@ enum Command {
         /// (their --p2p address, e.g. http://203.0.113.7:9545). Repeatable.
         #[arg(long)]
         announce_to: Vec<String>,
+        /// Run with several validators deciding blocks by vote (BFT), on a
+        /// network not fixed in code: a JSON file with `bft_from_height`
+        /// and `validators` [{address, p2p}]. Validators listed there need
+        /// --p2p; anyone else runs as a follower (--follow).
+        #[arg(long)]
+        bft_config: Option<String>,
     },
 }
 
@@ -93,8 +100,8 @@ async fn main() -> Result<()> {
 
     match cli.command {
         Command::Keygen { out } => cmd_keygen(&out)?,
-        Command::Start { rpc, data_dir, key_file, follow, validator, p2p, announce_to } => {
-            cmd_start(rpc, data_dir, key_file, follow, validator, p2p, announce_to).await?
+        Command::Start { rpc, data_dir, key_file, follow, validator, p2p, announce_to, bft_config } => {
+            cmd_start(rpc, data_dir, key_file, follow, validator, p2p, announce_to, bft_config).await?
         }
     }
 
@@ -162,6 +169,7 @@ fn load_keypair(path: &str) -> Result<HydraXKeypair> {
 // start
 // ---------------------------------------------------------------------------
 
+#[allow(clippy::too_many_arguments)]
 async fn cmd_start(
     rpc_addr: String,
     data_dir: String,
@@ -170,6 +178,7 @@ async fn cmd_start(
     validator: Option<String>,
     p2p_addr: Option<String>,
     announce_to: Vec<String>,
+    bft_config: Option<String>,
 ) -> Result<()> {
     let keypair = match key_file {
         Some(path) => {
@@ -228,9 +237,28 @@ async fn cmd_start(
             init_state.witness_root_from_height = store.witness_root_from_height()?;
         }
     }
+    // Several validators voting (BFT), on a network not fixed in code.
+    let bft_peers = match &bft_config {
+        Some(path) => {
+            if qtrc_common::chain::known_activations(&genesis).is_some() {
+                anyhow::bail!("--bft-config is for networks not fixed in code; the live network's rules come from the code");
+            }
+            let (from, peers) = bft::BftConfig::load(path)?;
+            init_state.bft_from_height = from;
+            init_state.validators = peers
+                .iter()
+                .map(|p| qtrc_common::state::ValidatorInfo { address: p.address.clone(), stake: 1 })
+                .collect();
+            info!(validators = peers.len(), bft_from_height = from, "Blocks decided by validator votes (BFT)");
+            Some(peers)
+        }
+        None => None,
+    };
     // Who signs the blocks. Without a set, the node would expect its own
     // signature on every block, which only works on the single validator.
-    if let Some(vs) = qtrc_common::chain::known_validators(&genesis) {
+    if bft_peers.is_some() {
+        // Set above from the BFT config.
+    } else if let Some(vs) = qtrc_common::chain::known_validators(&genesis) {
         init_state.validators = vs
             .into_iter()
             .map(|address| qtrc_common::state::ValidatorInfo { address, stake: 1 })
@@ -276,6 +304,8 @@ async fn cmd_start(
     }
 
     // Build consensus engine with durable block storage
+    // The BFT driver signs votes with the same key as the engine.
+    let driver_key = HydraXKeypair::from_bytes(&keypair.to_bytes())?;
     let engine = Arc::new(ConsensusEngine::new(init_state, keypair).with_sink(store.clone()));
 
     // Rebuild state by re-verifying and re-applying every stored block
@@ -319,6 +349,30 @@ async fn cmd_start(
         }
     });
 
+    // One of the BFT validators: the consensus thread and the p2p listener
+    // that feeds it. Transactions clients send us are relayed to the others.
+    let mut relay = None;
+    let mut p2p_addr = p2p_addr;
+    let bft_validator = bft_peers.as_ref().is_some_and(|ps| ps.iter().any(|p| p.address == engine.address));
+    if let (true, Some(peers)) = (bft_validator, bft_peers.clone()) {
+        let addr = p2p_addr.take().ok_or_else(|| anyhow::anyhow!("a BFT validator needs --p2p <listen address>"))?;
+        let addr: std::net::SocketAddr = addr.parse().map_err(|e| anyhow::anyhow!("--p2p {addr}: {e}"))?;
+        let out = bft::Outbox::new(peers, engine.address.clone())?;
+        let guard_path = std::path::Path::new(&data_dir).join("bft-sign-state");
+        let guard = qtrc_bft::runner::SignGuard::open(&guard_path).map_err(|e| anyhow::anyhow!("sign guard: {e}"))?;
+        let (driver, inbox) = bft::Driver::new(engine.clone(), driver_key, out.clone(), guard)?;
+        std::thread::spawn(move || driver.run());
+        let (e, s2) = (engine.clone(), store.clone());
+        tokio::spawn(async move {
+            if let Err(err) = bft::serve(e, s2, inbox, addr).await {
+                warn!("BFT p2p listener stopped: {err:#}");
+            }
+        });
+        relay = Some(out);
+    } else {
+        drop(driver_key);
+    }
+
     let wake = p2p::Wake::new();
     if let Some(addr) = p2p_addr {
         let addr: std::net::SocketAddr = addr.parse().map_err(|e| anyhow::anyhow!("--p2p {addr}: {e}"))?;
@@ -346,7 +400,7 @@ async fn cmd_start(
         let e = engine.clone();
         let w = wake.clone();
         std::thread::spawn(move || follow::run(e, peers, w));
-    } else {
+    } else if !bft_validator {
         let engine_clone = engine.clone();
         tokio::spawn(async move {
             run_block_producer(engine_clone).await;
@@ -355,7 +409,7 @@ async fn cmd_start(
 
     // Start JSON-RPC server
     info!("JSON-RPC listening on http://{rpc_addr}");
-    rpc::serve(engine, store, following, rpc_addr.parse()?).await;
+    rpc::serve(engine, store, following, relay, rpc_addr.parse()?).await;
 
     Ok(())
 }
