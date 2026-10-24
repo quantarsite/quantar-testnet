@@ -111,6 +111,9 @@ pub struct ConsensusEngine {
     submit_lock: Mutex<()>,
     /// Cleared by the node when disk space runs low
     accepting:   AtomicBool,
+    /// Height of the last committed block, for whoever wants to react to
+    /// new blocks (e.g. announcing them to followers).
+    commits:     tokio::sync::watch::Sender<u64>,
 }
 
 impl ConsensusEngine {
@@ -145,7 +148,47 @@ impl ConsensusEngine {
             proposed_tree: Mutex::new(None),
             submit_lock: Mutex::new(()),
             accepting: AtomicBool::new(true),
+            commits: tokio::sync::watch::channel(0).0,
         }
+    }
+
+    /// Notified with the new height after every commit.
+    pub fn subscribe_commits(&self) -> tokio::sync::watch::Receiver<u64> {
+        self.commits.subscribe()
+    }
+
+    /// Header and signatures of the last committed block.
+    pub fn tip(&self) -> Option<(BlockHeader, Vec<ValidatorSig>)> {
+        self.last_block.read().as_ref().map(|l| (l.header.clone(), l.sigs.clone()))
+    }
+
+    /// Check a block header and its signatures without the block: the
+    /// proposer must be the expected one for that height and its HYDRA-X
+    /// signature over the header must verify. Used for block announcements,
+    /// which carry no transactions.
+    pub fn verify_header(&self, header: &BlockHeader, sigs: &[ValidatorSig]) -> Result<(), ConsensusError> {
+        let expected = self
+            .proposer_at(header.height)
+            .unwrap_or_else(|| self.address.clone());
+        if header.proposer != expected {
+            return Err(ConsensusError::InvalidSig(format!(
+                "block proposer {} is not the expected proposer {}",
+                header.proposer, expected
+            )));
+        }
+        let vs = sigs
+            .iter()
+            .find(|vs| vs.validator == expected)
+            .ok_or_else(|| ConsensusError::InvalidSig("proposer signature not found".into()))?;
+        // The key that signed must be the proposer's key, not just any key.
+        if vs.signature.signer_address() != expected {
+            return Err(ConsensusError::InvalidSig(
+                "proposer signature was made by a different key".into(),
+            ));
+        }
+        vs.signature
+            .verify(&header.signing_bytes())
+            .map_err(|e| ConsensusError::InvalidSig(e.to_string()))
     }
 
     /// Stop (false) or resume (true) accepting new transactions.
@@ -623,6 +666,9 @@ impl ConsensusEngine {
             tree,
             from: state.state_root_from_height,
         });
+        let height = state.height;
+        drop(state);
+        self.commits.send_replace(height);
 
         if persist {
             info!(
@@ -640,30 +686,7 @@ impl ConsensusEngine {
     /// proposer's HYDRA-X signature over the header. With no validator set
     /// (single-node testnet) the expected proposer is this node's own key.
     fn verify_proposer_sig(&self, block: &Block) -> Result<(), ConsensusError> {
-        let expected = self
-            .proposer_at(block.header.height)
-            .unwrap_or_else(|| self.address.clone());
-        if block.header.proposer != expected {
-            return Err(ConsensusError::InvalidSig(format!(
-                "block proposer {} is not the expected proposer {}",
-                block.header.proposer, expected
-            )));
-        }
-        let header_bytes = block.header.signing_bytes();
-        let vs = block
-            .validator_sigs
-            .iter()
-            .find(|vs| vs.validator == expected)
-            .ok_or_else(|| ConsensusError::InvalidSig("proposer signature not found".into()))?;
-        // The key that signed must be the proposer's key, not just any key.
-        if vs.signature.signer_address() != expected {
-            return Err(ConsensusError::InvalidSig(
-                "proposer signature was made by a different key".into(),
-            ));
-        }
-        vs.signature
-            .verify(&header_bytes)
-            .map_err(|e| ConsensusError::InvalidSig(e.to_string()))
+        self.verify_header(&block.header, &block.validator_sigs)
     }
 }
 
