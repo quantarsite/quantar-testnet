@@ -201,6 +201,24 @@ impl Mempool {
             .collect()
     }
 
+    /// Remove queued transactions with these hashes (included in a block
+    /// someone else made). Returns the hashes actually removed.
+    pub fn remove(&mut self, hashes: &HashSet<TxHash>) -> Vec<TxHash> {
+        if hashes.is_empty() {
+            return Vec::new();
+        }
+        let (gone, kept): (Vec<Entry>, Vec<Entry>) =
+            std::mem::take(&mut self.queue).into_iter().partition(|e| hashes.contains(&e.hash));
+        self.queue = kept;
+        gone.into_iter()
+            .map(|e| {
+                self.hashes.remove(&e.hash);
+                self.track(&e, false);
+                e.hash
+            })
+            .collect()
+    }
+
     /// Forget every queued and in-flight transaction. Tests only.
     #[doc(hidden)]
     pub fn clear(&mut self) {

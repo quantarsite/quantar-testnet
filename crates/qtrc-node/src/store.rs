@@ -260,6 +260,7 @@ const BINCODE_V1: u8 = 0x01;
 const BINCODE_V2: u8 = 0x02;
 const BINCODE_V3: u8 = 0x03;
 const BINCODE_V4: u8 = 0x04;
+const BINCODE_V5: u8 = 0x05;
 
 /// Binary encoding: about 4x smaller than JSON, which writes every
 /// signature byte as a decimal number (a tx was ~132 KB in JSON).
@@ -269,8 +270,12 @@ const BINCODE_V4: u8 = 0x04;
 /// 0x01 no Sentinel data and no state root (any release),
 /// 0x02 Sentinel data, no state root (v2.1+),
 /// 0x03 state root in the header (v2.3+),
-/// 0x04 witness root, and the state root if any, in the header (v2.4+).
+/// 0x04 witness root, and the state root if any, in the header (v2.4+),
+/// 0x05 as 0x04 plus the commit proof of a block the validators voted on.
 fn encode_block(block: &Block) -> Result<Vec<u8>> {
+    if block.commit.is_some() {
+        return wire::encode_v5(block);
+    }
     if block.header.witness_root.is_some() {
         return wire::encode_v4(block);
     }
@@ -285,6 +290,7 @@ fn encode_block(block: &Block) -> Result<Vec<u8>> {
 
 fn decode_block(bytes: &[u8]) -> Result<Block> {
     match bytes.first() {
+        Some(&BINCODE_V5) => Ok(bincode::deserialize::<wire::BlockV5>(&bytes[1..])?.into()),
         Some(&BINCODE_V4) => Ok(bincode::deserialize::<wire::BlockV4>(&bytes[1..])?.into()),
         Some(&BINCODE_V3) => Ok(bincode::deserialize::<wire::BlockV3>(&bytes[1..])?.into()),
         Some(&BINCODE_V2) => Ok(bincode::deserialize::<wire::BlockV2>(&bytes[1..])?.into()),
@@ -345,7 +351,7 @@ mod wire {
 
     impl From<BlockV2> for Block {
         fn from(b: BlockV2) -> Self {
-            Block { header: b.header.into_header(None, None), transactions: b.transactions, validator_sigs: b.validator_sigs }
+            Block { header: b.header.into_header(None, None), transactions: b.transactions, validator_sigs: b.validator_sigs, commit: None }
         }
     }
 
@@ -363,6 +369,7 @@ mod wire {
                 header: b.header.into_header(Some(b.state_root), None),
                 transactions: b.transactions,
                 validator_sigs: b.validator_sigs,
+                commit: None,
             }
         }
     }
@@ -393,6 +400,7 @@ mod wire {
                 header: b.header.into_header(b.state_root, Some(b.witness_root)),
                 transactions: b.transactions,
                 validator_sigs: b.validator_sigs,
+                commit: None,
             }
         }
     }
@@ -409,6 +417,44 @@ mod wire {
             validator_sigs: block.validator_sigs.clone(),
         };
         let mut out = vec![super::BINCODE_V4];
+        out.extend(bincode::serialize(&b)?);
+        Ok(out)
+    }
+
+    #[derive(Serialize, Deserialize)]
+    pub struct BlockV5 {
+        header:         HeaderV1,
+        state_root:     Option<[u8; 32]>,
+        witness_root:   Option<[u8; 32]>,
+        transactions:   Vec<Transaction>,
+        validator_sigs: Vec<ValidatorSig>,
+        commit:         qtrc_common::block::CommitProof,
+    }
+
+    impl From<BlockV5> for Block {
+        fn from(b: BlockV5) -> Self {
+            Block {
+                header: b.header.into_header(b.state_root, b.witness_root),
+                transactions: b.transactions,
+                validator_sigs: b.validator_sigs,
+                commit: Some(b.commit),
+            }
+        }
+    }
+
+    pub fn encode_v5(block: &Block) -> anyhow::Result<Vec<u8>> {
+        let Some(commit) = block.commit.clone() else {
+            anyhow::bail!("format 0x05 needs a commit proof");
+        };
+        let b = BlockV5 {
+            header: HeaderV1::of(&block.header),
+            state_root: block.header.state_root,
+            witness_root: block.header.witness_root,
+            transactions: block.transactions.clone(),
+            validator_sigs: block.validator_sigs.clone(),
+            commit,
+        };
+        let mut out = vec![super::BINCODE_V5];
         out.extend(bincode::serialize(&b)?);
         Ok(out)
     }
@@ -469,6 +515,7 @@ mod v1 {
                     })
                     .collect(),
                 validator_sigs: b.validator_sigs,
+                commit: None,
             }
         }
     }
@@ -562,6 +609,21 @@ mod tests {
     /// the format the live node has on disk since v2.1. The fixture's data
     /// was set after signing, so only the layout is checked: it must decode
     /// and re-encode to the exact same bytes.
+    #[test]
+    fn a_block_with_a_commit_proof_round_trips_as_format_5() {
+        let mut b = sample_block_with(true);
+        let sig = b.validator_sigs[0].clone();
+        b.commit = Some(qtrc_common::block::CommitProof { round: 2, precommits: vec![sig.clone(), sig] });
+        let bytes = encode_block(&b).unwrap();
+        assert_eq!(bytes[0], BINCODE_V5);
+        let back = decode_block(&bytes).unwrap();
+        assert_eq!(back.commit, b.commit);
+        assert_eq!(back.hash(), b.hash());
+        // Without a proof, the old format is still used.
+        b.commit = None;
+        assert_ne!(encode_block(&b).unwrap()[0], BINCODE_V5);
+    }
+
     #[test]
     fn sentinel_era_v2_block_from_previous_release_still_reads() {
         let bytes = include_bytes!("../tests/fixtures/block_v2_main.bin");

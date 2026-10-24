@@ -38,6 +38,8 @@ pub use malachitebft_core_consensus as consensus;
 pub use malachitebft_core_types as types;
 pub use malachitebft_metrics as metrics;
 
+pub mod runner;
+
 // ---------------------------------------------------------------------------
 // Address, height, value
 // ---------------------------------------------------------------------------
@@ -486,6 +488,23 @@ pub fn verify_commit(cert: &mc::CommitCertificate<Ctx>, vs: &ValidatorSet) -> Re
         return Err(format!("only {power} of {total} voting power signed"));
     }
     Ok(())
+}
+
+/// The commit proof a block carries, from the certificate consensus
+/// produced. `None` if a signature does not decode (never for ours).
+pub fn commit_proof(cert: &mc::CommitCertificate<Ctx>) -> Option<qtrc_common::block::CommitProof> {
+    let round = u32::try_from(cert.round.as_i64()).ok()?;
+    let precommits = cert
+        .commit_signatures
+        .iter()
+        .map(|cs| {
+            Some(qtrc_common::block::ValidatorSig {
+                validator: qtrc_crypto::Address(cs.address.0),
+                signature: cs.signature.decode()?,
+            })
+        })
+        .collect::<Option<Vec<_>>>()?;
+    Some(qtrc_common::block::CommitProof { round, precommits })
 }
 
 #[cfg(test)]
