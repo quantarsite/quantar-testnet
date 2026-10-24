@@ -10,6 +10,7 @@ members = [
     "crates/qtrc-wallet",
     "crates/qtrc-sentinel",
     "crates/qtrc-watchtower",
+    "crates/qtrc-bft",
 ]
 
 [workspace.package]
