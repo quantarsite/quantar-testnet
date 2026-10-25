@@ -357,14 +357,14 @@ async fn cmd_start(
     if let (true, Some(peers)) = (bft_validator, bft_peers.clone()) {
         let addr = p2p_addr.take().ok_or_else(|| anyhow::anyhow!("a BFT validator needs --p2p <listen address>"))?;
         let addr: std::net::SocketAddr = addr.parse().map_err(|e| anyhow::anyhow!("--p2p {addr}: {e}"))?;
-        let out = bft::Outbox::new(peers, engine.address.clone())?;
+        let out = bft::Outbox::new(peers.clone(), engine.address.clone())?;
         let guard_path = std::path::Path::new(&data_dir).join("bft-sign-state");
         let guard = qtrc_bft::runner::SignGuard::open(&guard_path).map_err(|e| anyhow::anyhow!("sign guard: {e}"))?;
         let (driver, inbox) = bft::Driver::new(engine.clone(), driver_key, out.clone(), guard)?;
         std::thread::spawn(move || driver.run());
         let (e, s2) = (engine.clone(), store.clone());
         tokio::spawn(async move {
-            if let Err(err) = bft::serve(e, s2, inbox, addr).await {
+            if let Err(err) = bft::serve(e, s2, inbox, peers, addr).await {
                 warn!("BFT p2p listener stopped: {err:#}");
             }
         });

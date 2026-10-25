@@ -408,5 +408,11 @@ proponente fechou na rodada 1); ao religar ele busca os blocos que
 perdeu e volta a votar; um seguidor refaz a cadeia conferindo as provas;
 cinco transações seguidas chegam iguais aos quatro.
 
+Limites no p2p: só os endereços IP dos validadores (resolvidos das URLs
+`p2p` da configuração, de novo a cada 5 minutos) passam da porta, antes de
+qualquer byte do corpo ser lido; cada um tem até 50 pedidos por segundo
+(rajada de 200); a fila do consenso tem 4.096 lugares e recusa o excesso
+com 503 (os timers sempre entram).
+
 Falta antes de ativar numa rede pública: servidores em provedores
-diferentes, limites por remetente no p2p, e revisão independente.
+diferentes e revisão independente.
