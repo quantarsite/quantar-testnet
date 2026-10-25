@@ -32,7 +32,7 @@ use qtrc_consensus::ConsensusEngine;
 use qtrc_crypto::{Address, HydraXKeypair};
 use serde::Deserialize;
 use std::collections::{HashMap, HashSet};
-use std::sync::mpsc::{self, Receiver, RecvTimeoutError, Sender};
+use std::sync::mpsc::{self, Receiver, RecvTimeoutError, SyncSender, TrySendError};
 use std::sync::Arc;
 use std::time::Duration;
 use tracing::{debug, info, warn};
@@ -102,13 +102,23 @@ enum Event {
     Timeout { height: u64, timeout: Timeout },
 }
 
+/// Events waiting for the consensus thread. Network messages beyond this
+/// are refused (the sender retries or the round times out); timers always
+/// get in.
+const INBOX_CAPACITY: usize = 4_096;
+
 /// Handle for the rest of the node: where network input goes.
 #[derive(Clone)]
-pub struct Inbox(Sender<Event>);
+pub struct Inbox(SyncSender<Event>);
 
 impl Inbox {
-    fn msg(&self, m: WireMsg) {
-        let _ = self.0.send(Event::Msg(m));
+    /// False if the consensus thread is too far behind to take more.
+    fn msg(&self, m: WireMsg) -> bool {
+        match self.0.try_send(Event::Msg(m)) {
+            Ok(()) => true,
+            Err(TrySendError::Full(_)) => false,
+            Err(TrySendError::Disconnected(_)) => false,
+        }
     }
 }
 
@@ -171,7 +181,7 @@ pub struct Driver {
     engine:   Arc<ConsensusEngine>,
     key:      Arc<HydraXKeypair>,
     out:      Outbox,
-    tx:       Sender<Event>,
+    tx:       SyncSender<Event>,
     rx:       Receiver<Event>,
     runner:   Option<Runner>,
     /// Height the runner is working on, if started.
@@ -194,7 +204,7 @@ const MAX_LATER: usize = 2_000;
 impl Driver {
     pub fn new(engine: Arc<ConsensusEngine>, key: HydraXKeypair, out: Outbox, guard: SignGuard) -> Result<(Self, Inbox)> {
         let key = Arc::new(key);
-        let (tx, rx) = mpsc::channel();
+        let (tx, rx) = mpsc::sync_channel(INBOX_CAPACITY);
         let next = engine.state.read().height + 1;
         let vs = engine.bft_validator_set().map_err(|e| anyhow::anyhow!("{e}"))?;
         let runner = Runner::new(key.clone(), vs, Height(next), guard, timeouts());
@@ -444,8 +454,11 @@ async fn post_consensus(State(st): State<P2p>, body: Bytes) -> StatusCode {
             if !st.engine.state.read().validators.iter().any(|v| v.address == sender) {
                 return StatusCode::FORBIDDEN;
             }
-            st.inbox.msg(m);
-            StatusCode::ACCEPTED
+            if st.inbox.msg(m) {
+                StatusCode::ACCEPTED
+            } else {
+                StatusCode::SERVICE_UNAVAILABLE
+            }
         }
         _ => StatusCode::BAD_REQUEST,
     }
@@ -481,8 +494,94 @@ async fn get_block(State(st): State<P2p>, Path(h): Path<u64>) -> Result<Json<Blo
     }
 }
 
-pub async fn serve(engine: Arc<ConsensusEngine>, store: Arc<BlockStore>, inbox: Inbox, addr: std::net::SocketAddr) -> Result<()> {
-    let app = Router::new()
+/// Who may talk to the p2p listener, and how fast.
+///
+/// Only the validators' own addresses (resolved from the `p2p` URLs in the
+/// BFT config, again every few minutes in case a host's address changes)
+/// get past the door; anyone else is refused before a byte of the body is
+/// read. Each allowed address then has a token bucket, so even a
+/// misbehaving or compromised validator cannot flood the others.
+pub struct Gate {
+    allowed: parking_lot::RwLock<HashSet<std::net::IpAddr>>,
+    buckets: parking_lot::Mutex<HashMap<std::net::IpAddr, Bucket>>,
+    rate:    f64,
+    burst:   f64,
+}
+
+struct Bucket {
+    tokens: f64,
+    last:   std::time::Instant,
+}
+
+/// Requests per second per validator, and the burst allowed above it. A
+/// round is a handful of messages per validator; rebroadcasts and catch-up
+/// stay far below this.
+const RATE: f64 = 50.0;
+const BURST: f64 = 200.0;
+
+impl Gate {
+    pub fn new(allowed: HashSet<std::net::IpAddr>, rate: f64, burst: f64) -> Self {
+        Gate { allowed: parking_lot::RwLock::new(allowed), buckets: Default::default(), rate, burst }
+    }
+
+    pub fn set_allowed(&self, allowed: HashSet<std::net::IpAddr>) {
+        *self.allowed.write() = allowed;
+    }
+
+    /// Ok, or the status to refuse with.
+    pub fn check(&self, ip: std::net::IpAddr, now: std::time::Instant) -> Result<(), StatusCode> {
+        if !self.allowed.read().contains(&ip) {
+            return Err(StatusCode::FORBIDDEN);
+        }
+        let mut buckets = self.buckets.lock();
+        let b = buckets.entry(ip).or_insert(Bucket { tokens: self.burst, last: now });
+        let elapsed = now.saturating_duration_since(b.last).as_secs_f64();
+        b.tokens = (b.tokens + elapsed * self.rate).min(self.burst);
+        b.last = now;
+        if b.tokens < 1.0 {
+            return Err(StatusCode::TOO_MANY_REQUESTS);
+        }
+        b.tokens -= 1.0;
+        Ok(())
+    }
+}
+
+/// IP addresses the validators' `p2p` URLs resolve to.
+pub fn resolve_peers(peers: &[Peer]) -> HashSet<std::net::IpAddr> {
+    use std::net::ToSocketAddrs;
+    let mut ips = HashSet::new();
+    for p in peers {
+        let Ok(url) = reqwest::Url::parse(&p.url) else {
+            warn!(url = %p.url, "unparsable p2p URL");
+            continue;
+        };
+        let (Some(host), Some(port)) = (url.host_str(), url.port_or_known_default()) else { continue };
+        match (host, port).to_socket_addrs() {
+            Ok(addrs) => ips.extend(addrs.map(|a| a.ip())),
+            Err(e) => warn!(%host, "cannot resolve validator host: {e}"),
+        }
+    }
+    ips
+}
+
+async fn gatekeeper(
+    State(gate): State<Arc<Gate>>,
+    axum::extract::ConnectInfo(peer): axum::extract::ConnectInfo<std::net::SocketAddr>,
+    req: axum::extract::Request,
+    next: axum::middleware::Next,
+) -> axum::response::Response {
+    use axum::response::IntoResponse;
+    match gate.check(peer.ip(), std::time::Instant::now()) {
+        Ok(()) => next.run(req).await,
+        Err(status) => {
+            debug!(ip = %peer.ip(), %status, "p2p request refused");
+            status.into_response()
+        }
+    }
+}
+
+fn router(engine: Arc<ConsensusEngine>, store: Arc<BlockStore>, inbox: Inbox, gate: Arc<Gate>) -> Router {
+    Router::new()
         .route("/p2p/v1/consensus", post(post_consensus))
         .route("/p2p/v1/tx", post(post_tx).layer(DefaultBodyLimit::max(256 * 1024)))
         .route("/p2p/v1/status", get(get_status))
@@ -490,9 +589,106 @@ pub async fn serve(engine: Arc<ConsensusEngine>, store: Arc<BlockStore>, inbox: 
         .layer(DefaultBodyLimit::max(wire::MAX_MESSAGE))
         .layer(tower::limit::ConcurrencyLimitLayer::new(16))
         .layer(tower_http::timeout::TimeoutLayer::new(Duration::from_secs(60)))
-        .with_state(P2p { engine, store, inbox });
+        // Outermost: refused requests never wait for a concurrency slot.
+        .layer(axum::middleware::from_fn_with_state(gate, gatekeeper))
+        .with_state(P2p { engine, store, inbox })
+}
+
+pub async fn serve(engine: Arc<ConsensusEngine>, store: Arc<BlockStore>, inbox: Inbox, peers: Vec<Peer>, addr: std::net::SocketAddr) -> Result<()> {
+    let gate = Arc::new(Gate::new(resolve_peers(&peers), RATE, BURST));
+    info!(allowed = ?gate.allowed.read(), "p2p accepts only the validators' addresses");
+    let g = gate.clone();
+    tokio::spawn(async move {
+        let mut tick = tokio::time::interval(Duration::from_secs(300));
+        tick.tick().await;
+        loop {
+            tick.tick().await;
+            let peers = peers.clone();
+            if let Ok(ips) = tokio::task::spawn_blocking(move || resolve_peers(&peers)).await {
+                if !ips.is_empty() {
+                    g.set_allowed(ips);
+                }
+            }
+        }
+    });
+    let app = router(engine, store, inbox, gate);
     let listener = tokio::net::TcpListener::bind(addr).await?;
     info!("BFT p2p listening on http://{addr}/p2p/v1");
-    axum::serve(listener, app).await?;
+    axum::serve(listener, app.into_make_service_with_connect_info::<std::net::SocketAddr>()).await?;
     Ok(())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use std::net::{IpAddr, Ipv4Addr};
+    use std::time::Instant;
+
+    const ME: IpAddr = IpAddr::V4(Ipv4Addr::new(203, 0, 113, 7));
+    const STRANGER: IpAddr = IpAddr::V4(Ipv4Addr::new(198, 51, 100, 9));
+
+    #[test]
+    fn strangers_are_refused_and_validators_rate_limited() {
+        let gate = Gate::new([ME].into(), 10.0, 5.0);
+        let t0 = Instant::now();
+        assert_eq!(gate.check(STRANGER, t0), Err(StatusCode::FORBIDDEN));
+        for _ in 0..5 {
+            assert_eq!(gate.check(ME, t0), Ok(()));
+        }
+        assert_eq!(gate.check(ME, t0), Err(StatusCode::TOO_MANY_REQUESTS));
+        // 10 per second: after 0.5 s there is room for 5 again, not 6.
+        let t1 = t0 + Duration::from_millis(500);
+        for _ in 0..5 {
+            assert_eq!(gate.check(ME, t1), Ok(()));
+        }
+        assert_eq!(gate.check(ME, t1), Err(StatusCode::TOO_MANY_REQUESTS));
+        // A changed address list takes effect at once.
+        gate.set_allowed([STRANGER].into());
+        assert_eq!(gate.check(ME, t1 + Duration::from_secs(9)), Err(StatusCode::FORBIDDEN));
+        assert_eq!(gate.check(STRANGER, t1), Ok(()));
+    }
+
+    #[test]
+    fn peer_urls_resolve_to_their_addresses() {
+        let peers = vec![
+            Peer { address: Address([1; 32]), url: "http://127.0.0.1:9601".into() },
+            Peer { address: Address([2; 32]), url: "http://203.0.113.7:9545".into() },
+            Peer { address: Address([3; 32]), url: "not a url".into() },
+        ];
+        let ips = resolve_peers(&peers);
+        assert!(ips.contains(&IpAddr::V4(Ipv4Addr::LOCALHOST)));
+        assert!(ips.contains(&ME));
+        assert_eq!(ips.len(), 2);
+    }
+
+    /// The whole listener: a stranger gets 403 on every route, before
+    /// anything else runs; a validator's address gets through.
+    #[tokio::test]
+    async fn the_listener_only_answers_validators() {
+        use axum::extract::connect_info::MockConnectInfo;
+        use tower05::ServiceExt;
+        let engine = Arc::new(ConsensusEngine::new(
+            qtrc_common::genesis::Genesis::testnet_with_faucet(None).initial_state(),
+            HydraXKeypair::generate(),
+        ));
+        let dir = std::env::temp_dir().join(format!("qtrc-gate-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        let store = Arc::new(BlockStore::open(dir.to_str().unwrap()).unwrap());
+        let (tx, _rx) = mpsc::sync_channel(4);
+        let gate = Arc::new(Gate::new([ME].into(), RATE, BURST));
+        let app = router(engine, store, Inbox(tx), gate);
+        let get = |ip: IpAddr| {
+            let app = app.clone().layer(MockConnectInfo(std::net::SocketAddr::new(ip, 40000)));
+            async move {
+                let req = axum::http::Request::get("/p2p/v1/status").body(axum::body::Body::empty()).unwrap();
+                app.oneshot(req).await.unwrap().status()
+            }
+        };
+        assert_eq!(get(STRANGER).await, StatusCode::FORBIDDEN);
+        assert_eq!(get(ME).await, StatusCode::OK);
+        let req = axum::http::Request::post("/p2p/v1/consensus").body(axum::body::Body::from(vec![0u8; 1024])).unwrap();
+        let app2 = app.clone().layer(MockConnectInfo(std::net::SocketAddr::new(STRANGER, 1)));
+        assert_eq!(app2.oneshot(req).await.unwrap().status(), StatusCode::FORBIDDEN);
+        std::fs::remove_dir_all(&dir).ok();
+    }
 }
