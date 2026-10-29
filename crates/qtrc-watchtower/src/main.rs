@@ -40,8 +40,8 @@ use qtrc_common::genesis::MICRO_QTR;
 use qtrc_common::sentinel::SentinelOp;
 use qtrc_common::tx::{Transaction, CHAIN_ID};
 use qtrc_crypto::{Address, HydraXKeypair, HydraXSignature};
-use qtrc_sentinel::watchtower::{tick, Action, Finding, RecoveryKit, Severity, Subject, WatchPolicy};
-use qtrc_sentinel::Vault;
+use qtrc_sentinel::watchtower::{tick_with, Action, Finding, RecoveryKit, Severity, Subject, WatchPolicy};
+use qtrc_sentinel::{RecoveryFormat, Vault};
 use reqwest::blocking::Client;
 use serde::Deserialize;
 use serde_json::Value;
@@ -167,9 +167,9 @@ fn load_watched(entry: &WatchEntry) -> Result<Watched> {
 
 /// What the watchtower should do about one vault right now. Runs the
 /// audited `tick` on a copy, so nothing here can diverge from it.
-fn decide(vault: &Vault, w: &Watched, height: u64) -> Action {
+fn decide(vault: &Vault, w: &Watched, height: u64, format: RecoveryFormat) -> Action {
     let mut copy = vault.clone();
-    tick(&mut copy, &w.policy, &w.kit, CHAIN_ID.as_bytes(), height)
+    tick_with(format, &mut copy, &w.policy, &w.kit, CHAIN_ID.as_bytes(), height)
 }
 
 /// Stable text for a set of findings, so the same situation alerts once.
@@ -210,7 +210,9 @@ impl Rpc {
         Ok((code, resp.json().unwrap_or(Value::Null)))
     }
 
-    fn height(&self) -> Result<u64> {
+    /// Current height, and the recovery message encoding the node verifies
+    /// in its next block (legacy digest on a node from before v3).
+    fn height(&self) -> Result<(u64, RecoveryFormat)> {
         let (code, s) = self.get("/status")?;
         if code != 200 {
             bail!("status returned {code}");
@@ -221,7 +223,12 @@ impl Rpc {
         if s["sentinel_from_height"].is_null() {
             bail!("node does not support Sentinel");
         }
-        s["height"].as_u64().ok_or_else(|| anyhow!("status has no height"))
+        let height = s["height"].as_u64().ok_or_else(|| anyhow!("status has no height"))?;
+        let format = match s["recovery_v3_from_height"].as_u64() {
+            Some(v3) if height + 1 >= v3 => RecoveryFormat::Full,
+            _ => RecoveryFormat::LegacyDigest,
+        };
+        Ok((height, format))
     }
 
     /// The account's vault, or None if it has no guardian.
@@ -323,7 +330,7 @@ impl Service {
     }
 
     fn cycle(&mut self, cfg: &Config) -> Result<()> {
-        let height = self.rpc.height()?;
+        let (height, recovery) = self.rpc.height()?;
         for entry in &cfg.accounts {
             let w = match load_watched(entry) {
                 Ok(w) => w,
@@ -333,14 +340,14 @@ impl Service {
                     continue;
                 }
             };
-            if let Err(e) = self.check(&w, height) {
+            if let Err(e) = self.check(&w, height, recovery) {
                 warn!(account = %w.name, "check failed: {e:#}");
             }
         }
         Ok(())
     }
 
-    fn check(&mut self, w: &Watched, height: u64) -> Result<()> {
+    fn check(&mut self, w: &Watched, height: u64, recovery: RecoveryFormat) -> Result<()> {
         let key = w.account.as_hex();
         let Some(vault) = self.rpc.vault(&w.account)? else {
             self.alert(&key, "noguardian".into(), format!("⚠️ {}: account has no guardian; nothing to protect", w.name), false);
@@ -353,7 +360,7 @@ impl Service {
             self.alert(&key, "recovered".into(), format!("✅ {}: recovered, everything forwards to {}", w.name, short(to)), false);
             return Ok(());
         }
-        match decide(&vault, w, height) {
+        match decide(&vault, w, height, recovery) {
             Action::Idle => self.clear(&key),
             Action::NoGuardian => {
                 self.alert(&key, "noguardian".into(), format!("⚠️ {}: account has no guardian", w.name), false);
@@ -551,24 +558,24 @@ mod tests {
         let w = &f.watched;
 
         // Quiet vault.
-        assert_eq!(decide(&f.vault, w, 10), Action::Idle);
+        assert_eq!(decide(&f.vault, w, 10, RecoveryFormat::Full), Action::Idle);
 
         // Large transfer to the trusted exchange: left alone.
         let mut v = f.vault.clone();
         v.transfer(10, f.exchange.clone(), 500 * MICRO_QTR).unwrap();
-        assert_eq!(decide(&v, w, 11), Action::Idle);
+        assert_eq!(decide(&v, w, 11, RecoveryFormat::Full), Action::Idle);
 
         // Small unknown transfer: alert only.
         let mut v = f.vault.clone();
         v.transfer(10, f.thief.clone(), 50 * MICRO_QTR).unwrap();
-        assert!(matches!(decide(&v, w, 11), Action::Notify(_)));
+        assert!(matches!(decide(&v, w, 11, RecoveryFormat::Full), Action::Notify(_)));
 
         // Large unknown transfer: recover, and the decision does not touch
         // the vault it was given.
         let mut v = f.vault.clone();
         v.transfer(10, f.thief.clone(), 500 * MICRO_QTR).unwrap();
         let before = serde_json::to_value(&v).unwrap();
-        assert!(matches!(decide(&v, w, 11), Action::Recovered { .. }));
+        assert!(matches!(decide(&v, w, 11, RecoveryFormat::Full), Action::Recovered { .. }));
         assert_eq!(serde_json::to_value(&v).unwrap(), before);
     }
 
@@ -579,7 +586,7 @@ mod tests {
         w.kit.salt = [0u8; 32]; // does not open the commitment
         let mut v = f.vault.clone();
         v.transfer(10, f.thief.clone(), 500 * MICRO_QTR).unwrap();
-        let Action::KitStale(findings) = decide(&v, &w, 11) else { panic!() };
+        let Action::KitStale(findings) = decide(&v, &w, 11, RecoveryFormat::Full) else { panic!() };
         assert_eq!(findings[0].severity, Severity::Recover);
     }
 
@@ -614,7 +621,7 @@ mod tests {
         let w = load_watched(&cfg.accounts[0]).unwrap();
         assert_eq!(w.policy.recover_at, 12_500_000);
         assert_eq!(w.account, f.watched.account);
-        assert_eq!(decide(&f.vault, &w, 10), Action::Idle, "loaded kit opens the commitment");
+        assert_eq!(decide(&f.vault, &w, 10, RecoveryFormat::Full), Action::Idle, "loaded kit opens the commitment");
         let _ = std::fs::remove_dir_all(&dir);
     }
 
@@ -623,11 +630,11 @@ mod tests {
         let f = fixture();
         let mut v = f.vault.clone();
         v.transfer(10, f.thief.clone(), 50 * MICRO_QTR).unwrap();
-        let Action::Notify(a) = decide(&v, &f.watched, 11) else { panic!() };
-        let Action::Notify(b) = decide(&v, &f.watched, 12) else { panic!() };
+        let Action::Notify(a) = decide(&v, &f.watched, 11, RecoveryFormat::Full) else { panic!() };
+        let Action::Notify(b) = decide(&v, &f.watched, 12, RecoveryFormat::Full) else { panic!() };
         assert_eq!(alert_key("notify", &a), alert_key("notify", &b));
         v.transfer(13, f.thief.clone(), 30 * MICRO_QTR).unwrap();
-        let Action::Notify(c) = decide(&v, &f.watched, 14) else { panic!() };
+        let Action::Notify(c) = decide(&v, &f.watched, 14, RecoveryFormat::Full) else { panic!() };
         assert_ne!(alert_key("notify", &a), alert_key("notify", &c), "new activity alerts again");
     }
 }

@@ -7,7 +7,7 @@ use crate::tx::{Transaction, TxError, CHAIN_ID, TX_FEE};
 /// Largest `data` payload a transaction may carry (a recovery is ~37 KB).
 pub const MAX_DATA_LEN: usize = 48 * 1024;
 use qtrc_crypto::Address;
-use qtrc_sentinel::{self as sn, Credit, Outcome, Policy, SentinelError, Vault};
+use qtrc_sentinel::{self as sn, Credit, Outcome, Policy, RecoveryFormat, SentinelError, Vault};
 use serde::{Deserialize, Serialize};
 use std::collections::{BTreeMap, BTreeSet, HashMap};
 
@@ -53,6 +53,10 @@ pub struct ChainState {
     /// First block height whose header must carry the witness root.
     #[serde(default = "never")]
     pub witness_root_from_height: u64,
+    /// First block height whose Sentinel recoveries are signed over the
+    /// full recovery message instead of a 32-byte digest of it.
+    #[serde(default = "never")]
+    pub recovery_v3_from_height: u64,
     /// First block height decided by the validators voting (BFT): from it
     /// on, any validator may propose and every block needs a commit proof.
     #[serde(default = "never")]
@@ -130,6 +134,11 @@ impl ChainState {
         height >= self.witness_root_from_height
     }
 
+    /// Recovery message encoding verified at block `height`.
+    pub fn recovery_format_at(&self, height: u64) -> RecoveryFormat {
+        if height >= self.recovery_v3_from_height { RecoveryFormat::Full } else { RecoveryFormat::LegacyDigest }
+    }
+
     /// Whether Sentinel operations are accepted at block `height`.
     pub fn sentinel_active_at(&self, height: u64) -> bool {
         height >= self.sentinel_from_height
@@ -193,7 +202,13 @@ impl ChainState {
             SentinelOp::Recover { cold_dest, salt, proof } => {
                 sn::ensure_recovery_target(self.vault(cold_dest)).map_err(sentinel_err)?;
                 active(&tx.to)?
-                    .check_recovery(CHAIN_ID.as_bytes(), cold_dest, salt, proof.as_ref())
+                    .check_recovery_with(
+                        self.recovery_format_at(self.height + 1),
+                        CHAIN_ID.as_bytes(),
+                        cold_dest,
+                        salt,
+                        proof.as_ref(),
+                    )
                     .map_err(sentinel_err)?;
             }
         }
@@ -376,9 +391,10 @@ impl ChainState {
             SentinelOp::Recover { cold_dest, salt, proof } => {
                 sn::ensure_recovery_target(self.vaults.get(&cold_dest.as_hex())).map_err(sentinel_err)?;
                 let target = tx.to.as_hex();
+                let format = self.recovery_format_at(height);
                 let v = self.vault_mut(j, &target).ok_or_else(no_vault)?;
                 let (dest, mut amount) = v
-                    .recover(CHAIN_ID.as_bytes(), &cold_dest, &salt, proof.as_ref())
+                    .recover_with(format, CHAIN_ID.as_bytes(), &cold_dest, &salt, proof.as_ref())
                     .map_err(sentinel_err)?;
                 self.sync(j, &target);
                 if fee_from_recovered {

@@ -79,7 +79,10 @@ use thiserror::Error;
 pub type Hash = [u8; 32];
 
 const DOM_COMMIT: &[u8] = b"QTR/SENTINEL/COMMIT/v2";
-const DOM_RECOVER: &[u8] = b"QTR/SENTINEL/RECOVER/v2";
+/// Domain of the legacy recovery digest. Kept only so blocks from before
+/// the v3 activation replay unchanged.
+const DOM_RECOVER_V2: &[u8] = b"QTR/SENTINEL/RECOVER/v2";
+const DOM_RECOVER: &[u8] = b"QTR/SENTINEL/RECOVER/v3";
 
 /// Smallest allowed time lock. Must exceed realistic inclusion latency.
 pub const MIN_DELAY_BLOCKS: u64 = 10;
@@ -130,20 +133,73 @@ pub fn recovery_commitment(
     h.finalize().into()
 }
 
+/// Length-prefixed append, the byte-string twin of [`absorb`].
+fn push_field(buf: &mut Vec<u8>, field: &[u8]) {
+    buf.extend_from_slice(&(field.len() as u64).to_le_bytes());
+    buf.extend_from_slice(field);
+}
+
+/// Which encoding of the recovery message the chain verifies.
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize, Deserialize)]
+pub enum RecoveryFormat {
+    /// Before the v3 activation: the recovery key signed a 32-byte SHA3-256
+    /// digest of the fields. Accepted only so old blocks replay.
+    LegacyDigest,
+    /// From the v3 activation on: the recovery key signs the full
+    /// length-prefixed encoding, with no pre-hash outside SLH-DSA.
+    Full,
+}
+
 /// Message the recovery key signs. Bound to the chain, the account, the
 /// current commitment and the guardian epoch (number of finalized
 /// rotations), so a recovery signature dies when the guardian is rotated,
 /// even if a later rotation returns to the same commitment, and never
 /// replays across networks or accounts.
+///
+/// These are the full bytes, not a digest of them. SLH-DSA-SHA2-256s and
+/// ML-DSA-87 hash the message internally at their own security level;
+/// signing a 32-byte SHA3-256 digest instead caps collision resistance at
+/// about 128 bits, below the category 5 the parameter sets are chosen for,
+/// and is the external pre-hash FIPS 205 section 10.2 asks to avoid with
+/// short digests on the 256-bit sets.
 #[must_use]
-pub fn recovery_message(chain_id: &[u8], account: &Address, commitment: &Hash, epoch: u64) -> Hash {
+pub fn recovery_message(chain_id: &[u8], account: &Address, commitment: &Hash, epoch: u64) -> Vec<u8> {
+    let mut m = Vec::with_capacity(5 * 8 + DOM_RECOVER.len() + chain_id.len() + 32 + 32 + 8);
+    push_field(&mut m, DOM_RECOVER);
+    push_field(&mut m, chain_id);
+    push_field(&mut m, &account.0);
+    push_field(&mut m, commitment);
+    m.extend_from_slice(&epoch.to_le_bytes());
+    m
+}
+
+/// The pre-v3 recovery message: a SHA3-256 digest of the fields. Only for
+/// verifying recoveries in blocks from before the v3 activation; never sign
+/// with it.
+#[must_use]
+pub fn recovery_message_legacy(chain_id: &[u8], account: &Address, commitment: &Hash, epoch: u64) -> Hash {
     let mut h = Sha3_256::new();
-    absorb(&mut h, DOM_RECOVER);
+    absorb(&mut h, DOM_RECOVER_V2);
     absorb(&mut h, chain_id);
     absorb(&mut h, &account.0);
     absorb(&mut h, commitment);
     h.update(epoch.to_le_bytes());
     h.finalize().into()
+}
+
+/// The recovery message in the encoding `format` asks for.
+#[must_use]
+pub fn recovery_message_for(
+    format: RecoveryFormat,
+    chain_id: &[u8],
+    account: &Address,
+    commitment: &Hash,
+    epoch: u64,
+) -> Vec<u8> {
+    match format {
+        RecoveryFormat::Full => recovery_message(chain_id, account, commitment, epoch),
+        RecoveryFormat::LegacyDigest => recovery_message_legacy(chain_id, account, commitment, epoch).to_vec(),
+    }
 }
 
 /// Proof that the holder of the recovery key authorized a recovery.
@@ -588,12 +644,29 @@ impl Vault {
     }
 
     /// Check a recovery without changing state (used by watchtowers to
-    /// detect a stale kit before they need it).
+    /// detect a stale kit before they need it). Verifies the current
+    /// ([`RecoveryFormat::Full`]) message.
     ///
     /// # Errors
     /// Recovered, no commitment, self recovery, mismatch, bad signature.
     pub fn check_recovery<P: RecoveryProof>(
         &self,
+        chain_id: &[u8],
+        cold_dest: &Address,
+        salt: &[u8; 32],
+        proof: &P,
+    ) -> Result<(), SentinelError> {
+        self.check_recovery_with(RecoveryFormat::Full, chain_id, cold_dest, salt, proof)
+    }
+
+    /// [`Vault::check_recovery`] against the message encoding the chain
+    /// uses at the height being checked.
+    ///
+    /// # Errors
+    /// Same as [`Vault::check_recovery`].
+    pub fn check_recovery_with<P: RecoveryProof>(
+        &self,
+        format: RecoveryFormat,
         chain_id: &[u8],
         cold_dest: &Address,
         salt: &[u8; 32],
@@ -609,7 +682,7 @@ impl Vault {
         if expected != opened {
             return Err(SentinelError::CommitmentMismatch);
         }
-        let msg = recovery_message(chain_id, &self.address, &expected, self.epoch);
+        let msg = recovery_message_for(format, chain_id, &self.address, &expected, self.epoch);
         if !proof.verify(&msg) {
             return Err(SentinelError::BadRecoverySignature);
         }
@@ -629,7 +702,23 @@ impl Vault {
         salt: &[u8; 32],
         proof: &P,
     ) -> Result<(Address, u64), SentinelError> {
-        self.check_recovery(chain_id, cold_dest, salt, proof)?;
+        self.recover_with(RecoveryFormat::Full, chain_id, cold_dest, salt, proof)
+    }
+
+    /// [`Vault::recover`] against the message encoding the chain uses at
+    /// the height being applied.
+    ///
+    /// # Errors
+    /// Same as [`Vault::check_recovery`].
+    pub fn recover_with<P: RecoveryProof>(
+        &mut self,
+        format: RecoveryFormat,
+        chain_id: &[u8],
+        cold_dest: &Address,
+        salt: &[u8; 32],
+        proof: &P,
+    ) -> Result<(Address, u64), SentinelError> {
+        self.check_recovery_with(format, chain_id, cold_dest, salt, proof)?;
         self.pending.clear();
         self.recent.clear();
         self.finalized.clear();
@@ -1117,7 +1206,61 @@ mod tests {
     #[test]
     fn commit_and_recover_domains_are_separate() {
         let c = commit(&SALT);
-        assert_ne!(c, recovery_message(CHAIN, &me(), &c, 0));
+        assert_ne!(c.to_vec(), recovery_message(CHAIN, &me(), &c, 0));
+        assert_ne!(c, recovery_message_legacy(CHAIN, &me(), &c, 0));
+    }
+
+    #[test]
+    fn recovery_message_is_the_full_encoding_not_a_digest() {
+        let c = commit(&SALT);
+        let m = recovery_message(CHAIN, &me(), &c, 7);
+        let mut want = Vec::new();
+        for f in [DOM_RECOVER, CHAIN, &me().0[..], &c[..]] {
+            want.extend_from_slice(&(f.len() as u64).to_le_bytes());
+            want.extend_from_slice(f);
+        }
+        want.extend_from_slice(&7u64.to_le_bytes());
+        assert_eq!(m, want);
+        assert!(m.len() > 64, "must not be a short digest");
+    }
+
+    #[test]
+    fn recovery_v3_and_legacy_never_share_a_signature() {
+        let c = commit(&SALT);
+        assert_ne!(
+            recovery_message(CHAIN, &me(), &c, 0),
+            recovery_message_legacy(CHAIN, &me(), &c, 0).to_vec()
+        );
+        assert_ne!(DOM_RECOVER, DOM_RECOVER_V2);
+    }
+
+    #[test]
+    fn each_format_only_accepts_its_own_message() {
+        let c = commit(&SALT);
+        let mut v = vault();
+        let full = MockProof::sign(&rec_key(), &recovery_message(CHAIN, &me(), &c, 0));
+        let legacy = MockProof::sign(&rec_key(), &recovery_message_legacy(CHAIN, &me(), &c, 0));
+        assert_eq!(
+            v.check_recovery_with(RecoveryFormat::Full, CHAIN, &cold(), &SALT, &legacy),
+            Err(SentinelError::BadRecoverySignature),
+            "a pre-v3 kit must not open a vault after the activation"
+        );
+        assert_eq!(
+            v.check_recovery_with(RecoveryFormat::LegacyDigest, CHAIN, &cold(), &SALT, &full),
+            Err(SentinelError::BadRecoverySignature)
+        );
+        assert!(v.check_recovery_with(RecoveryFormat::LegacyDigest, CHAIN, &cold(), &SALT, &legacy).is_ok());
+        assert!(v.recover_with(RecoveryFormat::Full, CHAIN, &cold(), &SALT, &full).is_ok());
+    }
+
+    #[test]
+    fn recovery_message_vector() {
+        // Pins the v3 wire format: changing it is a consensus change.
+        let c = [0x11u8; 32];
+        let m = recovery_message(b"quantar-testnet-2", &Address([0x22u8; 32]), &c, 3);
+        let digest: [u8; 32] = Sha3_256::digest(&m).into();
+        assert_eq!(m.len(), 8 + DOM_RECOVER.len() + 8 + 17 + 8 + 32 + 8 + 32 + 8);
+        assert_eq!(hex_of(&digest), RECOVERY_V3_VECTOR, "canonical recovery message changed");
     }
 
     #[test]
@@ -1380,6 +1523,7 @@ mod tests {
         b.iter().map(|x| format!("{x:02x}")).collect()
     }
 
+    const RECOVERY_V3_VECTOR: &str = "98b8e6686d6e5c2e3dc31443d8e135caf108bdbb6cce89bc3d430aeb32501e53";
     const VAULT_VECTOR: &str = "b62cde142bcd35f49c3f1d52cc072d85a3342cfd2e465c40f58428734a0394ee";
 
     // ---- real HYDRA-X -----------------------------------------------------

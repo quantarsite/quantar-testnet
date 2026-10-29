@@ -228,6 +228,7 @@ async fn cmd_start(
             init_state.sentinel_from_height = a.sentinel;
             init_state.state_root_from_height = a.state_root;
             init_state.witness_root_from_height = a.witness_root;
+            init_state.recovery_v3_from_height = a.recovery_v3;
             info!("Known network: activation heights fixed by the chain parameters");
         }
         None => {
@@ -235,6 +236,7 @@ async fn cmd_start(
             init_state.sentinel_from_height = store.sentinel_from_height()?;
             init_state.state_root_from_height = store.state_root_from_height()?;
             init_state.witness_root_from_height = store.witness_root_from_height()?;
+            init_state.recovery_v3_from_height = store.recovery_v3_from_height()?;
         }
     }
     // Several validators voting (BFT), on a network not fixed in code.
@@ -277,6 +279,10 @@ async fn cmd_start(
             keypair.address().as_hex()
         );
     }
+    info!(
+        recovery_v3_from_height = init_state.recovery_v3_from_height,
+        "Sentinel recoveries sign the full message from this height"
+    );
     info!(
         witness_root_from_height = init_state.witness_root_from_height,
         "Block headers commit to full transactions from this height"

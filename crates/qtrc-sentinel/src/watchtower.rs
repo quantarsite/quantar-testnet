@@ -38,7 +38,7 @@
 //! reaction window is `delay_blocks` minus inclusion latency. Findings are
 //! sorted by severity, then by fewest blocks left.
 
-use crate::{Hash, PendingKind, RecoveryProof, Vault, MAX_PENDING};
+use crate::{Hash, PendingKind, RecoveryFormat, RecoveryProof, Vault, MAX_PENDING};
 use qtrc_crypto::Address;
 use std::cmp::Reverse;
 
@@ -196,6 +196,19 @@ pub fn tick<P: RecoveryProof>(
     chain_id: &[u8],
     height: u64,
 ) -> Action {
+    tick_with(RecoveryFormat::Full, vault, policy, kit, chain_id, height)
+}
+
+/// [`tick`] checking the kit against the recovery message encoding the
+/// chain verifies in its next block.
+pub fn tick_with<P: RecoveryProof>(
+    format: RecoveryFormat,
+    vault: &mut Vault,
+    policy: &WatchPolicy,
+    kit: &RecoveryKit<P>,
+    chain_id: &[u8],
+    height: u64,
+) -> Action {
     if vault.is_recovered() {
         return Action::Idle;
     }
@@ -203,11 +216,11 @@ pub fn tick<P: RecoveryProof>(
         return Action::NoGuardian;
     }
     let findings = inspect(vault, policy, height);
-    if vault.check_recovery(chain_id, &kit.cold_dest, &kit.salt, &kit.proof).is_err() {
+    if vault.check_recovery_with(format, chain_id, &kit.cold_dest, &kit.salt, &kit.proof).is_err() {
         return Action::KitStale(findings);
     }
     if let Some(cause) = findings.iter().find(|f| f.severity == Severity::Recover).cloned() {
-        return match vault.recover(chain_id, &kit.cold_dest, &kit.salt, &kit.proof) {
+        return match vault.recover_with(format, chain_id, &kit.cold_dest, &kit.salt, &kit.proof) {
             Ok((to, amount)) => Action::Recovered { to, amount, cause },
             // Unreachable after a successful check, but never swallow findings.
             Err(_) => Action::KitStale(findings),

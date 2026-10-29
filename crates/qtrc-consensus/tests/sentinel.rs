@@ -8,7 +8,7 @@ use qtrc_common::state::ChainState;
 use qtrc_common::tx::{Transaction, CHAIN_ID, TX_FEE};
 use qtrc_consensus::ConsensusEngine;
 use qtrc_crypto::{Address, HydraXKeypair};
-use qtrc_sentinel::{recovery_commitment, recovery_message};
+use qtrc_sentinel::{recovery_commitment, recovery_message, recovery_message_legacy};
 
 const DELAY: u64 = 10;
 const ALLOWANCE: u64 = 50 * MICRO_QTR;
@@ -25,6 +25,10 @@ struct Net {
     faucet: HydraXKeypair,
     faucet_nonce: u64,
     sink: Address,
+    /// Starting state and node key, so a replica can replay `mined`.
+    start: ChainState,
+    node_key: Vec<u8>,
+    mined: std::cell::RefCell<Vec<qtrc_common::block::Block>>,
 }
 
 impl Net {
@@ -33,11 +37,15 @@ impl Net {
         let g = Genesis::testnet_with_faucet(Some(&faucet.address().as_hex()));
         let mut st = g.initial_state();
         mutate(&mut st);
+        let node_key = HydraXKeypair::generate().to_bytes().to_vec();
         Net {
-            engine: ConsensusEngine::new(st, HydraXKeypair::generate()),
+            engine: ConsensusEngine::new(st.clone(), HydraXKeypair::from_bytes(&node_key).unwrap()),
             faucet,
             faucet_nonce: 0,
             sink: HydraXKeypair::generate().address(),
+            start: st,
+            node_key,
+            mined: Default::default(),
         }
     }
 
@@ -49,6 +57,7 @@ impl Net {
     fn mine(&self) -> Result<qtrc_common::block::Block, String> {
         let b = self.engine.propose_block().map_err(|e| e.to_string())?;
         self.engine.commit_block(b.clone()).map_err(|e| e.to_string())?;
+        self.mined.borrow_mut().push(b.clone());
         Ok(b)
     }
 
@@ -103,6 +112,50 @@ fn guarded(net: &mut Net, qtr: u64) -> Guarded {
 fn recover_op(g: &Guarded, epoch: u64) -> Vec<u8> {
     let msg = recovery_message(CHAIN_ID.as_bytes(), &g.owner.address(), &g.commitment, epoch);
     SentinelOp::Recover { cold_dest: g.cold.clone(), salt: SALT, proof: Box::new(g.recovery.sign(&msg)) }.encode()
+}
+
+fn recover_op_legacy(g: &Guarded, epoch: u64) -> Vec<u8> {
+    let msg = recovery_message_legacy(CHAIN_ID.as_bytes(), &g.owner.address(), &g.commitment, epoch);
+    SentinelOp::Recover { cold_dest: g.cold.clone(), salt: SALT, proof: Box::new(g.recovery.sign(&msg)) }.encode()
+}
+
+/// Before the v3 activation only the legacy 32-byte digest opens a vault;
+/// from it on only the full message does. Blocks from both sides replay to
+/// the same state on a fresh node.
+#[test]
+fn recovery_message_switches_at_activation_and_replays() {
+    const V3: u64 = 7;
+    let mut net = Net::new(|st| st.recovery_v3_from_height = V3);
+    let a = guarded(&mut net, 100);
+    let b = guarded(&mut net, 100);
+    assert!(net.height() + 1 < V3);
+
+    // Before activation: the full message is refused, the digest works.
+    let err = net.submit(tx(&a.owner, &a.owner.address(), 0, net.nonce(&a.owner.address()), recover_op(&a, 0))).unwrap_err();
+    assert!(err.to_lowercase().contains("signature"), "{err}");
+    net.submit(tx(&a.owner, &a.owner.address(), 0, net.nonce(&a.owner.address()), recover_op_legacy(&a, 0))).unwrap();
+    net.mine().unwrap();
+    assert!(net.engine.state.read().vault(&a.owner.address()).unwrap().is_recovered());
+
+    while net.height() + 1 < V3 {
+        net.advance(1);
+    }
+
+    // From activation: an old-format kit no longer opens the vault.
+    let err = net.submit(tx(&b.owner, &b.owner.address(), 0, net.nonce(&b.owner.address()), recover_op_legacy(&b, 0))).unwrap_err();
+    assert!(err.to_lowercase().contains("signature"), "{err}");
+    net.submit(tx(&b.owner, &b.owner.address(), 0, net.nonce(&b.owner.address()), recover_op(&b, 0))).unwrap();
+    net.mine().unwrap();
+    assert!(net.engine.state.read().vault(&b.owner.address()).unwrap().is_recovered());
+
+    let replica = ConsensusEngine::new(net.start.clone(), HydraXKeypair::from_bytes(&net.node_key).unwrap());
+    for blk in net.mined.borrow().iter() {
+        replica.replay_block(blk.clone()).unwrap();
+    }
+    let (sa, sb) = (net.engine.state.read(), replica.state.read());
+    assert_eq!(serde_json::to_value(&sa.vaults).unwrap(), serde_json::to_value(&sb.vaults).unwrap());
+    assert_eq!(sa.account(&a.cold), sb.account(&a.cold));
+    assert_eq!(sa.account(&b.cold), sb.account(&b.cold));
 }
 
 #[test]

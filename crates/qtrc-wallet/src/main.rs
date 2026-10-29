@@ -33,6 +33,7 @@ use qtrc_common::genesis::MICRO_QTR;
 use qtrc_common::sentinel::SentinelOp;
 use qtrc_common::tx::{Transaction, CHAIN_ID};
 use qtrc_crypto::{Address, HydraXKeypair};
+use qtrc_sentinel::RecoveryFormat;
 use reqwest::blocking::Client;
 use serde_json::Value;
 use std::path::PathBuf;
@@ -394,6 +395,19 @@ struct RecoveryKitFile {
     proof:     qtrc_crypto::HydraXSignature,
 }
 
+/// Recovery message encoding the node will verify in its next block, and
+/// the height it switches to the full message (`None` if it never does).
+/// A node from before v3 reports no height and verifies the legacy digest.
+fn recovery_format(http: &Client, rpc: &str) -> Result<(RecoveryFormat, Option<u64>)> {
+    let status = get_json(http, &format!("{rpc}/status"))?;
+    let next = status["height"].as_u64().unwrap_or(0) + 1;
+    let Some(v3) = status["recovery_v3_from_height"].as_u64().filter(|h| *h != u64::MAX) else {
+        return Ok((RecoveryFormat::LegacyDigest, None));
+    };
+    let format = if next >= v3 { RecoveryFormat::Full } else { RecoveryFormat::LegacyDigest };
+    Ok((format, Some(v3)))
+}
+
 fn cmd_guardian(
     http: &Client,
     rpc: &str,
@@ -439,7 +453,15 @@ fn cmd_guardian(
         Some(v) => v["vault"]["epoch"].as_u64().unwrap_or(0) + 1,
         None => 0,
     };
-    let proof = recovery.sign(&qtrc_sentinel::recovery_message(CHAIN_ID.as_bytes(), &account, &commitment, epoch));
+    let (format, v3_from) = recovery_format(http, rpc)?;
+    let proof = recovery.sign(&qtrc_sentinel::recovery_message_for(format, CHAIN_ID.as_bytes(), &account, &commitment, epoch));
+    if let (RecoveryFormat::LegacyDigest, Some(h)) = (format, v3_from) {
+        eprintln!(
+            "note: the network switches recovery signatures to the full message at block {h}. \
+             After that this kit's proof no longer opens the vault: sign a fresh one then with \
+             `qtrc-wallet recover --recovery-key`, or rotate the guardian."
+        );
+    }
 
     // Write the secrets before anything goes on chain.
     write_secret_file(&rec_path, &recovery.to_bytes())?;
@@ -646,7 +668,8 @@ fn cmd_recover(
     let proof = match recovery_key {
         Some(path) => {
             let rec = load_wallet(path)?;
-            rec.sign(&qtrc_sentinel::recovery_message(CHAIN_ID.as_bytes(), &target, &commitment, epoch))
+            let (format, _) = recovery_format(http, rpc)?;
+            rec.sign(&qtrc_sentinel::recovery_message_for(format, CHAIN_ID.as_bytes(), &target, &commitment, epoch))
         }
         None => {
             if kit.epoch != epoch {

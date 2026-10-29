@@ -53,6 +53,8 @@ struct StatusResponse {
     state_root_from_height: u64,
     /// First block whose header commits to full transactions
     witness_root_from_height: u64,
+    /// First block whose Sentinel recoveries sign the full message (v3)
+    recovery_v3_from_height: u64,
     /// "validator" or "follower"
     role: &'static str,
 }
@@ -114,6 +116,7 @@ async fn get_status(State(AppState { engine, follower, .. }): State<AppState>) -
         sentinel_from_height: state.sentinel_from_height,
         state_root_from_height: state.state_root_from_height,
         witness_root_from_height: state.witness_root_from_height,
+        recovery_v3_from_height: state.recovery_v3_from_height,
         role,
     })
 }

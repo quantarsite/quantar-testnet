@@ -26,6 +26,7 @@ const FEE_FROM_KEY: &[u8] = b"fee_from_height";
 const SENTINEL_FROM_KEY: &[u8] = b"sentinel_from_height";
 const STATE_ROOT_FROM_KEY: &[u8] = b"state_root_from_height";
 const WITNESS_ROOT_FROM_KEY: &[u8] = b"witness_root_from_height";
+const RECOVERY_V3_FROM_KEY: &[u8] = b"recovery_v3_from_height";
 const MARKER_FILE: &str = "chain.marker";
 const MARKER_HEADER: &str = "quantar chain store v1";
 
@@ -164,6 +165,12 @@ impl BlockStore {
         self.activation_height(WITNESS_ROOT_FROM_KEY)
     }
 
+    /// First height whose Sentinel recoveries are verified over the full
+    /// message (v3), fixed once per data dir like the others.
+    pub fn recovery_v3_from_height(&self) -> Result<u64> {
+        self.activation_height(RECOVERY_V3_FROM_KEY)
+    }
+
     /// Use a known network's fixed activation heights. A data dir that
     /// recorded different ones followed other rules: refuse it rather than
     /// replay its blocks under the wrong ones.
@@ -173,6 +180,7 @@ impl BlockStore {
             (SENTINEL_FROM_KEY, a.sentinel),
             (STATE_ROOT_FROM_KEY, a.state_root),
             (WITNESS_ROOT_FROM_KEY, a.witness_root),
+            (RECOVERY_V3_FROM_KEY, a.recovery_v3),
         ] {
             if let Some(v) = self.meta.get(key)? {
                 let buf: [u8; 8] = v.as_ref().try_into().context("corrupt activation height")?;
@@ -816,7 +824,7 @@ mod tests {
         use qtrc_common::chain::Activations;
         let dir = tmp_dir("pin");
         let path = dir.to_str().unwrap();
-        let fixed = Activations { fee: 2, sentinel: 2, state_root: 2, witness_root: 5 };
+        let fixed = Activations { fee: 2, sentinel: 2, state_root: 2, witness_root: 5, recovery_v3: 7 };
         {
             let s = BlockStore::open(path).unwrap();
             s.save_genesis(&Genesis::testnet_with_faucet(None)).unwrap();
@@ -827,6 +835,7 @@ mod tests {
             assert_eq!(s.state_root_from_height().unwrap(), 2);
             s.pin_activations(&fixed).unwrap();
             assert_eq!(s.witness_root_from_height().unwrap(), 5);
+            assert_eq!(s.recovery_v3_from_height().unwrap(), 7);
             // A rule recorded at block 1, already used, disagrees: refuse.
             let other = Activations { fee: 1, ..fixed };
             let err = s.pin_activations(&other).unwrap_err().to_string();
