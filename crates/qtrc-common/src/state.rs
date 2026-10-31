@@ -57,6 +57,9 @@ pub struct ChainState {
     /// full recovery message instead of a 32-byte digest of it.
     #[serde(default = "never")]
     pub recovery_v3_from_height: u64,
+    /// First block height that accepts Sentinel `UpdatePolicy`.
+    #[serde(default = "never")]
+    pub policy_update_from_height: u64,
     /// First block height decided by the validators voting (BFT): from it
     /// on, any validator may propose and every block needs a commit proof.
     #[serde(default = "never")]
@@ -144,6 +147,11 @@ impl ChainState {
         height >= self.sentinel_from_height
     }
 
+    /// Whether Sentinel policy changes are accepted at block `height`.
+    pub fn policy_update_active_at(&self, height: u64) -> bool {
+        height >= self.policy_update_from_height
+    }
+
     /// Format checks shared by mempool admission and block application.
     /// Returns the decoded operation, or `None` for a plain transfer.
     pub fn parse_op(&self, tx: &Transaction, height: u64) -> Result<Option<SentinelOp>, TxError> {
@@ -160,6 +168,12 @@ impl ChainState {
             return Err(TxError::Sentinel(format!("data larger than {MAX_DATA_LEN} bytes")));
         }
         let op = SentinelOp::decode(&tx.data).map_err(TxError::Sentinel)?;
+        if matches!(op, SentinelOp::UpdatePolicy { .. }) && !self.policy_update_active_at(height) {
+            return Err(TxError::Sentinel(format!(
+                "policy changes are not active before block {}",
+                self.policy_update_from_height
+            )));
+        }
         if tx.amount != 0 {
             return Err(TxError::Sentinel("operation must carry amount 0".into()));
         }
@@ -193,6 +207,12 @@ impl ChainState {
             }
             SentinelOp::RotateGuardian { .. } => {
                 active(&tx.from)?;
+            }
+            SentinelOp::UpdatePolicy { delay_blocks, allowance_per_window } => {
+                let policy = Policy::new(*delay_blocks, *allowance_per_window).map_err(sentinel_err)?;
+                // Dry run on a copy: catches AllowanceInUse before the
+                // transaction takes a mempool slot.
+                active(&tx.from)?.clone().request_policy(self.height + 1, policy).map_err(sentinel_err)?;
             }
             SentinelOp::Finalize { id } => {
                 if !active(&tx.to)?.pending().iter().any(|p| p.id == *id) {
@@ -376,6 +396,12 @@ impl ChainState {
             SentinelOp::RotateGuardian { commitment } => {
                 let v = self.vault_mut(j, &from).ok_or_else(no_vault)?;
                 v.request_rotation(height, commitment).map_err(sentinel_err)?;
+                Ok(())
+            }
+            SentinelOp::UpdatePolicy { delay_blocks, allowance_per_window } => {
+                let policy = Policy::new(delay_blocks, allowance_per_window).map_err(sentinel_err)?;
+                let v = self.vault_mut(j, &from).ok_or_else(no_vault)?;
+                v.request_policy(height, policy).map_err(sentinel_err)?;
                 Ok(())
             }
             SentinelOp::Finalize { id } => {

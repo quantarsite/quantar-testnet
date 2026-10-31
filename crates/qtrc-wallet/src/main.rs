@@ -33,7 +33,7 @@ use qtrc_common::genesis::MICRO_QTR;
 use qtrc_common::sentinel::SentinelOp;
 use qtrc_common::tx::{Transaction, CHAIN_ID};
 use qtrc_crypto::{Address, HydraXKeypair};
-use qtrc_sentinel::RecoveryFormat;
+use qtrc_sentinel::{Policy, RecoveryFormat};
 use reqwest::blocking::Client;
 use serde_json::Value;
 use std::path::PathBuf;
@@ -139,6 +139,16 @@ enum GuardianCmd {
         #[arg(long)]
         out: PathBuf,
     },
+    /// Change the limits. Tightening (lower allowance, longer delay) applies
+    /// with the next block; anything else waits the current delay
+    Policy {
+        /// Blocks a large transfer waits (5 s per block; 720 = 1 hour)
+        #[arg(long)]
+        delay: u64,
+        /// QTR that may leave without delay per window of `delay` blocks
+        #[arg(long)]
+        allowance: String,
+    },
 }
 
 fn main() {
@@ -178,6 +188,9 @@ fn run(cli: Cli) -> Result<()> {
             cmd_guardian(&http, rpc, &key_path, &cold, Some((delay, &allowance)), out)
         }
         Command::Guardian(GuardianCmd::Rotate { cold, out }) => cmd_guardian(&http, rpc, &key_path, &cold, None, out),
+        Command::Guardian(GuardianCmd::Policy { delay, allowance }) => {
+            cmd_policy(&http, rpc, &key_path, delay, &allowance)
+        }
         Command::Proof { address } => {
             let addr = match address {
                 Some(a) => parse_address(&a)?,
@@ -628,11 +641,47 @@ fn cmd_vault(http: &Client, rpc: &str, addr: &Address) -> Result<()> {
         let when = if height >= unlock { "ready to finalize".to_string() } else { format!("{} blocks left", unlock - height) };
         let what = if let Some(t) = p["kind"].get("Transfer") {
             format!("send {} QTR to {}", format_qtr(t["amount"].as_u64().unwrap_or(0)), t["to"].as_str().unwrap_or("?"))
+        } else if let Some(c) = p["kind"].get("ChangePolicy") {
+            format!(
+                "change policy to {} QTR per {} blocks",
+                format_qtr(c["policy"]["allowance_per_window"].as_u64().unwrap_or(0)),
+                c["policy"]["delay_blocks"]
+            )
         } else {
             "replace recovery key".to_string()
         };
         println!("  #{} {what} ({when})", p["id"]);
     }
+    Ok(())
+}
+
+fn cmd_policy(http: &Client, rpc: &str, key_path: &PathBuf, delay: u64, allowance: &str) -> Result<()> {
+    let status = get_json(http, &format!("{rpc}/status"))?;
+    let next = status["height"].as_u64().unwrap_or(0) + 1;
+    match status["policy_update_from_height"].as_u64().filter(|h| *h != u64::MAX) {
+        None => bail!("this node does not accept policy changes yet"),
+        Some(from) if next < from => bail!("policy changes are accepted from block {from}; the next block is {next}"),
+        Some(_) => {}
+    }
+    let wallet = load_wallet(key_path)?;
+    let account = wallet.address();
+    let new = Policy::new(delay, parse_qtr(allowance)?).map_err(|e| anyhow!("{e}"))?;
+    let r = get_json(http, &format!("{rpc}/vault/{}", account.as_hex()))?;
+    let cur = &r["vault"]["policy"];
+    let (Some(cur_delay), Some(cur_allow)) = (cur["delay_blocks"].as_u64(), cur["allowance_per_window"].as_u64()) else {
+        bail!("this account has no guardian; run `qtrc-wallet guardian setup` first");
+    };
+    let current = Policy::new(cur_delay, cur_allow).map_err(|e| anyhow!("{e}"))?;
+    let op = SentinelOp::UpdatePolicy { delay_blocks: delay, allowance_per_window: new.allowance_per_window() };
+    let body = submit(http, rpc, &wallet, &account, 0, op.encode())?;
+    if new.is_at_least_as_strict_as(&current) {
+        println!("Stricter limits: up to {allowance} QTR per {delay} blocks, in force with the next block.");
+    } else {
+        println!("Looser limits queued: they take effect in {cur_delay} blocks, then anyone can finalize them.");
+        println!("Tell your watchtower first, or it will treat this as a theft and recover the account:");
+        println!("  \"expected_policy\": {{ \"delay_blocks\": {delay}, \"allowance\": \"{allowance}\" }}");
+    }
+    println!("tx: {}", body["tx_hash"].as_str().unwrap_or("?"));
     Ok(())
 }
 

@@ -253,6 +253,7 @@ fn sentinel_decode_never_panics_and_is_canonical() {
         SentinelOp::Finalize { id: 7 }.encode(),
         SentinelOp::RotateGuardian { commitment: [9; 32] }.encode(),
         SentinelOp::SetGuardian { commitment: [1; 32], delay_blocks: 10, allowance_per_window: 5 }.encode(),
+        SentinelOp::UpdatePolicy { delay_blocks: 10, allowance_per_window: 5 }.encode(),
     ];
     for i in 0..20_000u64 {
         let mut d = match rng.below(3) {
@@ -435,7 +436,7 @@ fn random_tx(rng: &mut Rng, st: &mut ChainState, accts: &[Address], recs: &[Reco
         1 => st.account(&from).nonce.wrapping_add(1),
         _ => st.account(&from).nonce,
     };
-    let (amount, data) = match rng.below(9) {
+    let (amount, data) = match rng.below(10) {
         0..=3 => (rng.amount(bal), vec![]),
         4 => {
             // SetGuardian: valid or hostile params, commitment of a known recovery when possible
@@ -454,6 +455,11 @@ fn random_tx(rng: &mut Rng, st: &mut ChainState, accts: &[Address], recs: &[Reco
             let cold = if rng.below(5) == 0 { rng.addr() } else { r.cold.clone() };
             let salt = if rng.below(5) == 0 { rng.bytes32() } else { r.salt };
             (0, SentinelOp::Recover { cold_dest: cold, salt, proof: Box::new(r.proof.clone()) }.encode())
+        }
+        8 => {
+            // UpdatePolicy: tighten, loosen, mixed or out of range
+            let delay = match rng.below(4) { 0 => 0, 1 => u64::MAX, 2 => 10_000_001, _ => 10 + rng.below(5) };
+            (0, SentinelOp::UpdatePolicy { delay_blocks: delay, allowance_per_window: rng.amount(bal) }.encode())
         }
         _ => {
             let mut d = b"QSN1".to_vec();

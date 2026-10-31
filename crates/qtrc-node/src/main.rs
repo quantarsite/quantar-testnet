@@ -229,6 +229,7 @@ async fn cmd_start(
             init_state.state_root_from_height = a.state_root;
             init_state.witness_root_from_height = a.witness_root;
             init_state.recovery_v3_from_height = a.recovery_v3;
+            init_state.policy_update_from_height = a.policy_update;
             info!("Known network: activation heights fixed by the chain parameters");
         }
         None => {
@@ -237,6 +238,7 @@ async fn cmd_start(
             init_state.state_root_from_height = store.state_root_from_height()?;
             init_state.witness_root_from_height = store.witness_root_from_height()?;
             init_state.recovery_v3_from_height = store.recovery_v3_from_height()?;
+            init_state.policy_update_from_height = store.policy_update_from_height()?;
         }
     }
     // Several validators voting (BFT), on a network not fixed in code.
@@ -279,6 +281,10 @@ async fn cmd_start(
             keypair.address().as_hex()
         );
     }
+    info!(
+        policy_update_from_height = init_state.policy_update_from_height,
+        "Sentinel policy changes accepted from this height"
+    );
     info!(
         recovery_v3_from_height = init_state.recovery_v3_from_height,
         "Sentinel recoveries sign the full message from this height"

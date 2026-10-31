@@ -41,7 +41,7 @@ use qtrc_common::sentinel::SentinelOp;
 use qtrc_common::tx::{Transaction, CHAIN_ID};
 use qtrc_crypto::{Address, HydraXKeypair, HydraXSignature};
 use qtrc_sentinel::watchtower::{tick_with, Action, Finding, RecoveryKit, Severity, Subject, WatchPolicy};
-use qtrc_sentinel::{RecoveryFormat, Vault};
+use qtrc_sentinel::{Policy, RecoveryFormat, Vault};
 use reqwest::blocking::Client;
 use serde::Deserialize;
 use serde_json::Value;
@@ -97,6 +97,17 @@ struct WatchEntry {
     /// Commitment (64 hex) of a rotation the owner announced
     #[serde(default)]
     expected_rotation: Option<String>,
+    /// Loosening policy change the owner announced (`qtrc-wallet guardian
+    /// policy`). Any other queued policy change triggers a recovery.
+    #[serde(default)]
+    expected_policy: Option<ExpectedPolicy>,
+}
+
+/// Policy as written in the config: allowance in QTR, like `recover_at`.
+#[derive(Deserialize, Debug, Clone)]
+struct ExpectedPolicy {
+    delay_blocks: u64,
+    allowance: String,
 }
 
 /// Same format `qtrc-wallet` writes.
@@ -152,10 +163,17 @@ fn load_watched(entry: &WatchEntry) -> Result<Watched> {
         ),
         None => None,
     };
+    let expected_policy = match &entry.expected_policy {
+        Some(p) => Some(
+            Policy::new(p.delay_blocks, parse_qtr(&p.allowance)?)
+                .map_err(|e| anyhow!("expected_policy: {e}"))?,
+        ),
+        None => None,
+    };
     Ok(Watched {
         name: entry.label.clone().unwrap_or_else(|| short(&account)),
         account,
-        policy: WatchPolicy { trusted, recover_at: parse_qtr(&entry.recover_at)?, expected_rotation },
+        policy: WatchPolicy { trusted, recover_at: parse_qtr(&entry.recover_at)?, expected_rotation, expected_policy },
         kit: RecoveryKit { cold_dest, salt, proof: kit.proof },
         kit_epoch: kit.epoch,
     })
@@ -543,7 +561,7 @@ mod tests {
             watched: Watched {
                 name: "test".into(),
                 account,
-                policy: WatchPolicy { trusted: vec![exchange.clone()], recover_at: 100 * MICRO_QTR, expected_rotation: None },
+                policy: WatchPolicy { trusted: vec![exchange.clone()], recover_at: 100 * MICRO_QTR, expected_rotation: None, expected_policy: None },
                 kit: RecoveryKit { cold_dest: cold, salt: SALT, proof },
                 kit_epoch: 0,
             },

@@ -18,6 +18,8 @@ pub struct Activations {
     pub witness_root: u64,
     /// Sentinel recoveries signed over the full message (no 32-byte digest).
     pub recovery_v3: u64,
+    /// Sentinel `UpdatePolicy` operations accepted.
+    pub policy_update: u64,
 }
 
 /// Genesis faucet of quantar-testnet-2, the live network.
@@ -37,12 +39,24 @@ pub const TESTNET2_VALIDATOR: &str = "809ae6fb45d3d7c9a2c2f3968c58cc55ad6bb2ca2c
 /// height above the live tip: every node must ship the same number, so it
 /// is set at deploy time, not guessed here.
 pub const TESTNET2: Activations =
-    Activations { fee: 5, sentinel: 6, state_root: 15, witness_root: 20, recovery_v3: RECOVERY_V3_TESTNET2 };
+    Activations {
+        fee: 5,
+        sentinel: 6,
+        state_root: 15,
+        witness_root: 20,
+        recovery_v3: RECOVERY_V3_TESTNET2,
+        policy_update: POLICY_UPDATE_TESTNET2,
+    };
 
 /// Height at which quantar-testnet-2 switches Sentinel recoveries to the
 /// full-message (v3) encoding. Set to a height above the live tip in the
 /// release that turns it on.
 pub const RECOVERY_V3_TESTNET2: u64 = u64::MAX;
+
+/// Height at which quantar-testnet-2 starts accepting Sentinel policy
+/// changes. Like `recovery_v3`, it stays at `u64::MAX` until a release
+/// fixes a real height above the live tip, the same on every node.
+pub const POLICY_UPDATE_TESTNET2: u64 = u64::MAX;
 
 /// The fixed activations of `genesis`, if it is a known network.
 #[must_use]

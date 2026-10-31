@@ -23,6 +23,12 @@
 //!    to the account are forwarded to `cold_dest`.
 //! 4. Replacing `R` is delayed as well, so a thief holding the main key
 //!    cannot swap the guardian silently. At most one rotation is pending.
+//! 5. The rate-limit policy can change, asymmetrically: a change that is
+//!    at least as strict on both axes (allowance not higher, delay not
+//!    shorter) applies at once, since a thief gains nothing from it. Any
+//!    other change waits the *current* `delay_blocks` in public, like a
+//!    large transfer, so the guardian can veto it. At most one policy
+//!    change is pending.
 //!
 //! ## What is and is not guaranteed
 //!
@@ -66,8 +72,8 @@
 //! * `overflow-checks = true` in release builds.
 //!
 //! `finalize` takes no authorization on purpose: once a time lock expires,
-//! anyone may settle it. There is no policy-change API; one added later
-//! must be time-locked too.
+//! anyone may settle it. Policy changes go through [`Vault::request_policy`]
+//! and are time-locked unless they only tighten.
 
 pub mod watchtower;
 
@@ -256,12 +262,22 @@ impl Policy {
     pub fn allowance_per_window(&self) -> u64 {
         self.allowance_per_window
     }
+
+    /// Whether `self` is at least as strict as `current` on both axes:
+    /// no higher allowance and no shorter delay. Only such a change may
+    /// skip the time lock.
+    #[must_use]
+    pub fn is_at_least_as_strict_as(&self, current: &Policy) -> bool {
+        self.allowance_per_window <= current.allowance_per_window && self.delay_blocks >= current.delay_blocks
+    }
 }
 
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
 pub enum PendingKind {
     Transfer { to: Address, amount: u64 },
     RotateCommitment { new_commitment: Hash },
+    /// Loosening policy change, waiting for its time lock.
+    ChangePolicy { policy: Policy },
 }
 
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
@@ -312,6 +328,8 @@ pub enum SentinelError {
     InvalidState,
     #[error("arithmetic overflow")]
     Overflow,
+    #[error("outflows in the current window exceed the new allowance; wait for the window to pass")]
+    AllowanceInUse,
 }
 
 #[derive(Debug, PartialEq, Eq)]
@@ -322,6 +340,8 @@ pub enum Outcome {
     Queued { id: u64, unlock_height: u64 },
     /// First guardian set, applied at once (nothing to protect yet).
     CommitmentSet,
+    /// Stricter (or equal) policy, applied at once.
+    PolicyApplied,
 }
 
 /// Where an incoming credit ends up.
@@ -337,8 +357,9 @@ pub enum Credit {
 ///
 /// Invariants, checked by [`Vault::validate`]:
 /// `reserved == sum of pending transfers <= balance`, at most
-/// [`MAX_PENDING`] pending transfers plus one pending rotation (the
-/// rotation has its own slot, so a flood of transfers cannot block it),
+/// [`MAX_PENDING`] pending transfers plus one pending rotation and one
+/// pending policy change (each has its own slot, so a flood of transfers
+/// cannot block them),
 /// consistent unlock heights, and a clean state after recovery.
 #[derive(Clone, Debug, Serialize, Deserialize)]
 pub struct Vault {
@@ -607,6 +628,74 @@ impl Vault {
         Ok(Outcome::Queued { id, unlock_height })
     }
 
+    /// Change the rate-limit policy.
+    ///
+    /// A policy at least as strict as the current one on both axes applies
+    /// at once. Anything else (including a mix, such as a lower allowance
+    /// with a shorter delay) is queued behind the *current* delay, so a
+    /// thief cannot shorten the veto window in the same step that loosens
+    /// it. A new request replaces any policy change already pending;
+    /// repeating the pending one keeps its deadline.
+    ///
+    /// Every pending operation is re-timed to `created_height + delay` of
+    /// the policy in force, so tightening the delay also extends what is
+    /// already queued.
+    ///
+    /// # Errors
+    /// Recovered, overflow, or [`SentinelError::AllowanceInUse`] when the
+    /// new allowance is below what already left in the current window.
+    pub fn request_policy(&mut self, height: u64, new: Policy) -> Result<Outcome, SentinelError> {
+        self.ensure_active()?;
+        new.check()?;
+        // Without a guardian nobody can veto, so delaying would only hurt.
+        if self.commitment.is_none() || new.is_at_least_as_strict_as(&self.policy) {
+            self.prune_recent(height);
+            let mut next = self.clone();
+            next.pending.retain(|p| !matches!(p.kind, PendingKind::ChangePolicy { .. }));
+            next.apply_policy(height, new)?;
+            *self = next;
+            return Ok(Outcome::PolicyApplied);
+        }
+        if let Some(p) = self.pending.iter().find(|p| {
+            matches!(&p.kind, PendingKind::ChangePolicy { policy } if *policy == new)
+        }) {
+            return Ok(Outcome::Queued { id: p.id, unlock_height: p.unlock_height });
+        }
+        let unlock_height = self.next_unlock(height)?;
+        self.pending.retain(|p| !matches!(p.kind, PendingKind::ChangePolicy { .. }));
+        let id = self.next_id;
+        self.next_id += 1;
+        self.pending.push(Pending {
+            id,
+            kind: PendingKind::ChangePolicy { policy: new },
+            created_height: height,
+            unlock_height,
+        });
+        Ok(Outcome::Queued { id, unlock_height })
+    }
+
+    /// Install `policy` at `height` and re-time every pending operation to
+    /// it. The window spend is measured with the new policy's window, the
+    /// one it will be enforced over. Callers apply this to a clone and
+    /// keep it only on success.
+    fn apply_policy(&mut self, height: u64, policy: Policy) -> Result<(), SentinelError> {
+        let unlocks = self
+            .pending
+            .iter()
+            .map(|p| p.created_height.checked_add(policy.delay_blocks).ok_or(SentinelError::Overflow))
+            .collect::<Result<Vec<_>, _>>()?;
+        for (p, unlock) in self.pending.iter_mut().zip(unlocks) {
+            p.unlock_height = unlock;
+        }
+        self.policy = policy;
+        self.prune_recent(height);
+        let spent = self.recent.iter().try_fold(0u64, |a, o| a.checked_add(o.amount));
+        if spent.is_none_or(|s| s > policy.allowance_per_window) {
+            return Err(SentinelError::AllowanceInUse);
+        }
+        Ok(())
+    }
+
     /// Settle a pending operation whose time lock expired. Returns the
     /// transfer, if the operation was one.
     ///
@@ -638,6 +727,15 @@ impl Vault {
                 self.commitment = Some(*new_commitment);
                 self.pending.remove(idx);
                 self.epoch += 1;
+                Ok(None)
+            }
+            PendingKind::ChangePolicy { policy } => {
+                let policy = *policy;
+                self.prune_recent(height);
+                let mut next = self.clone();
+                next.pending.remove(idx);
+                next.apply_policy(height, policy)?;
+                *self = next;
                 Ok(None)
             }
         }
@@ -788,6 +886,13 @@ impl Vault {
                     out.push(2);
                     out.extend_from_slice(new_commitment);
                 }
+                // New tag: vaults that never queued a policy change encode
+                // exactly as before, so past state roots are unchanged.
+                PendingKind::ChangePolicy { policy: Policy { delay_blocks, allowance_per_window } } => {
+                    out.push(3);
+                    u64le(&mut out, *delay_blocks);
+                    u64le(&mut out, *allowance_per_window);
+                }
             }
         }
         outflows(&mut out, recent);
@@ -816,6 +921,7 @@ impl Vault {
         let bad = SentinelError::InvalidState;
         let mut sum: u64 = 0;
         let mut rotations = 0;
+        let mut changes = 0;
         for (i, p) in self.pending.iter().enumerate() {
             let expected_unlock = p.created_height.checked_add(self.policy.delay_blocks);
             if p.id >= self.next_id
@@ -829,13 +935,18 @@ impl Vault {
                     sum = sum.checked_add(amount).ok_or(SentinelError::InvalidState)?;
                 }
                 PendingKind::RotateCommitment { .. } => rotations += 1,
+                PendingKind::ChangePolicy { policy } => {
+                    policy.check()?;
+                    changes += 1;
+                }
             }
         }
         let recent_sum = self.recent.iter().try_fold(0u64, |a, o| a.checked_add(o.amount));
         let ok = sum == self.reserved
             && self.reserved <= self.balance
-            && self.pending.len() - rotations <= MAX_PENDING
+            && self.pending.len() - rotations - changes <= MAX_PENDING
             && rotations <= 1
+            && changes <= 1
             && self.recent.len() <= MAX_RECENT
             && self.finalized.len() <= MAX_HISTORY
             && recent_sum.is_some_and(|s| s <= self.policy.allowance_per_window)
@@ -1525,6 +1636,204 @@ mod tests {
 
     const RECOVERY_V3_VECTOR: &str = "98b8e6686d6e5c2e3dc31443d8e135caf108bdbb6cce89bc3d430aeb32501e53";
     const VAULT_VECTOR: &str = "b62cde142bcd35f49c3f1d52cc072d85a3342cfd2e465c40f58428734a0394ee";
+
+    // ---- policy change ----------------------------------------------------
+
+    fn pol(delay: u64, allowance: u64) -> Policy {
+        Policy::new(delay, allowance).unwrap()
+    }
+
+    #[test]
+    fn stricter_policy_applies_at_once() {
+        let mut v = vault();
+        assert_eq!(v.request_policy(10, pol(200, 20)).unwrap(), Outcome::PolicyApplied);
+        assert_eq!(v.policy(), pol(200, 20));
+        assert!(v.pending().is_empty());
+        v.validate().unwrap();
+        // The new allowance is in force right away.
+        assert!(matches!(v.transfer(11, thief(), 30).unwrap(), Outcome::Queued { unlock_height: 211, .. }));
+        v.validate().unwrap();
+    }
+
+    #[test]
+    fn equal_policy_is_a_no_op_that_applies() {
+        let mut v = vault();
+        assert_eq!(v.request_policy(10, policy()).unwrap(), Outcome::PolicyApplied);
+        assert_eq!(v.policy(), policy());
+    }
+
+    /// A thief with the main key loosens the limits: it waits the OLD
+    /// delay, not the shorter one it asked for.
+    #[test]
+    fn loosening_waits_the_current_delay() {
+        let mut v = vault();
+        let (id, unlock) = queued(v.request_policy(10, pol(MIN_DELAY_BLOCKS, 1_000)).unwrap());
+        assert_eq!(unlock, 110);
+        assert_eq!(v.policy(), policy(), "nothing changes before the unlock");
+        assert_eq!(v.finalize(109, id), Err(SentinelError::StillLocked));
+        // Still limited by the old allowance while queued.
+        assert!(matches!(v.transfer(50, thief(), 60).unwrap(), Outcome::Queued { .. }));
+        v.validate().unwrap();
+        assert_eq!(v.finalize(110, id).unwrap(), None);
+        assert_eq!(v.policy(), pol(MIN_DELAY_BLOCKS, 1_000));
+        v.validate().unwrap();
+    }
+
+    #[test]
+    fn mixed_change_counts_as_loosening() {
+        let mut v = vault();
+        // Lower allowance but shorter delay.
+        assert!(matches!(v.request_policy(10, pol(50, 10)).unwrap(), Outcome::Queued { unlock_height: 110, .. }));
+        // Higher allowance but longer delay.
+        assert!(matches!(v.request_policy(10, pol(500, 60)).unwrap(), Outcome::Queued { unlock_height: 110, .. }));
+        assert_eq!(v.policy(), policy());
+    }
+
+    #[test]
+    fn repeating_the_pending_change_keeps_its_deadline() {
+        let mut v = vault();
+        let first = queued(v.request_policy(10, pol(100, 500)).unwrap());
+        assert_eq!(queued(v.request_policy(90, pol(100, 500)).unwrap()), first);
+        v.validate().unwrap();
+    }
+
+    #[test]
+    fn new_request_replaces_the_pending_change() {
+        let mut v = vault();
+        queued(v.request_policy(10, pol(100, 500)).unwrap());
+        let (id, unlock) = queued(v.request_policy(20, pol(100, 700)).unwrap());
+        assert_eq!(unlock, 120);
+        assert_eq!(v.pending().len(), 1);
+        assert_eq!(v.pending()[0].id, id);
+        v.validate().unwrap();
+    }
+
+    /// The owner, seeing a hostile loosening, can also simply tighten: the
+    /// pending change is dropped. (Recovery remains the real answer.)
+    #[test]
+    fn tightening_drops_a_pending_loosening() {
+        let mut v = vault();
+        queued(v.request_policy(10, pol(10, 1_000)).unwrap());
+        assert_eq!(v.request_policy(11, pol(100, 50)).unwrap(), Outcome::PolicyApplied);
+        assert!(v.pending().is_empty());
+        v.validate().unwrap();
+    }
+
+    #[test]
+    fn lower_allowance_than_window_spend_is_refused() {
+        let mut v = vault();
+        v.transfer(10, thief(), 40).unwrap();
+        let before = v.canonical_encoding();
+        assert_eq!(v.request_policy(20, pol(100, 30)), Err(SentinelError::AllowanceInUse));
+        assert_eq!(v.canonical_encoding(), before, "a refused change leaves no trace");
+        // Once the outflow leaves the window, the same request works.
+        assert_eq!(v.request_policy(110, pol(100, 30)).unwrap(), Outcome::PolicyApplied);
+        v.validate().unwrap();
+    }
+
+    #[test]
+    fn longer_delay_extends_everything_already_queued() {
+        let mut v = vault();
+        let (t, _) = queued(v.transfer(10, thief(), 500).unwrap());
+        let (r, _) = queued(v.request_rotation(12, commit(&[3u8; 32])).unwrap());
+        v.request_policy(20, pol(300, 50)).unwrap();
+        let unlock = |id| v.pending().iter().find(|p| p.id == id).unwrap().unlock_height;
+        assert_eq!(unlock(t), 310);
+        assert_eq!(unlock(r), 312);
+        v.validate().unwrap();
+        assert_eq!(v.finalize(309, t), Err(SentinelError::StillLocked));
+    }
+
+    #[test]
+    fn finalized_shorter_delay_retimes_the_queue() {
+        let mut v = vault();
+        let (t, _) = queued(v.transfer(10, thief(), 500).unwrap());
+        let (c, _) = queued(v.request_policy(20, pol(40, 50)).unwrap());
+        v.finalize(120, c).unwrap();
+        assert_eq!(v.pending()[0].unlock_height, 50);
+        v.validate().unwrap();
+        assert_eq!(v.finalize(120, t).unwrap(), Some((thief(), 500)));
+    }
+
+    #[test]
+    fn finalize_refuses_while_the_window_is_over_the_new_allowance() {
+        let mut v = vault();
+        let (c, _) = queued(v.request_policy(10, pol(50, 10)).unwrap());
+        v.transfer(105, thief(), 40).unwrap(); // under the old allowance
+        assert_eq!(v.finalize(110, c), Err(SentinelError::AllowanceInUse));
+        assert_eq!(v.pending().len(), 1, "stays queued, anyone may retry");
+        v.validate().unwrap();
+        // Measured over the new 50-block window: the outflow at 105 still
+        // counts at 154 and is gone at 155.
+        assert_eq!(v.finalize(154, c), Err(SentinelError::AllowanceInUse));
+        assert_eq!(v.finalize(155, c).unwrap(), None);
+        assert_eq!(v.policy(), pol(50, 10));
+        v.validate().unwrap();
+    }
+
+    #[test]
+    fn policy_change_has_its_own_slot() {
+        let mut v = Vault::new(me(), 1_000_000, Some(commit(&SALT)), pol(100, 0));
+        for i in 0..MAX_PENDING as u64 {
+            queued(v.transfer(10 + i, thief(), 1).unwrap());
+        }
+        queued(v.request_rotation(80, commit(&[3u8; 32])).unwrap());
+        queued(v.request_policy(81, pol(100, 10)).unwrap());
+        v.validate().unwrap();
+    }
+
+    #[test]
+    fn recovery_cancels_a_pending_change() {
+        let mut v = vault();
+        queued(v.request_policy(10, pol(10, 1_000)).unwrap());
+        assert_eq!(v.recover(CHAIN, &cold(), &SALT, &rec_proof()).unwrap(), (cold(), 1_000));
+        v.validate().unwrap();
+        assert_eq!(v.request_policy(20, policy()), Err(SentinelError::Recovered));
+    }
+
+    #[test]
+    fn out_of_range_policy_is_rejected() {
+        let mut v = vault();
+        let bad = Policy { delay_blocks: MIN_DELAY_BLOCKS - 1, allowance_per_window: 0 };
+        assert_eq!(v.request_policy(10, bad), Err(SentinelError::InvalidPolicy));
+    }
+
+    #[test]
+    fn without_guardian_any_change_applies() {
+        let mut v = Vault::new(me(), 1_000, None, policy());
+        assert_eq!(v.request_policy(10, pol(10, 1_000)).unwrap(), Outcome::PolicyApplied);
+    }
+
+    #[test]
+    fn validate_rejects_two_pending_changes_and_bad_policies() {
+        let mut v = vault();
+        queued(v.request_policy(10, pol(100, 500)).unwrap());
+        let mut two = v.clone();
+        let mut dup = two.pending[0].clone();
+        dup.id = two.next_id;
+        two.next_id += 1;
+        two.pending.push(dup);
+        assert_eq!(two.validate(), Err(SentinelError::InvalidState));
+        let mut bad = v.clone();
+        bad.pending[0].kind = PendingKind::ChangePolicy { policy: Policy { delay_blocks: 0, allowance_per_window: 1 } };
+        assert_eq!(bad.validate(), Err(SentinelError::InvalidPolicy));
+    }
+
+    /// Locks the encoding of the new pending kind. The v1 vector above is
+    /// untouched, so vaults without a policy change keep their state root.
+    #[test]
+    fn canonical_encoding_with_policy_change_vector() {
+        let mut v = vault();
+        v.transfer(10, thief(), 30).unwrap();
+        queued(v.request_policy(12, pol(100, 500)).unwrap());
+        let digest: [u8; 32] = Sha3_256::digest(v.canonical_encoding()).into();
+        assert_eq!(hex_of(&digest), POLICY_CHANGE_VECTOR, "canonical vault encoding changed");
+        let mut other = v.clone();
+        other.pending[0].kind = PendingKind::ChangePolicy { policy: pol(100, 501) };
+        assert_ne!(other.canonical_encoding(), v.canonical_encoding());
+    }
+
+    const POLICY_CHANGE_VECTOR: &str = "3c32c18280c48511e2294bd2de0a649644f7d11370b79a708fd494e057fcfa5a";
 
     // ---- real HYDRA-X -----------------------------------------------------
 

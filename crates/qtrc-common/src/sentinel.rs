@@ -8,6 +8,7 @@
 //! |------------------|---------------|------------------|----------|
 //! | `SetGuardian`    | account owner | same as `from`   | 0        |
 //! | `RotateGuardian` | account owner | same as `from`   | 0        |
+//! | `UpdatePolicy`   | account owner | same as `from`   | 0        |
 //! | `Finalize`       | anyone (pays the fee) | guarded account | 0 |
 //! | `Recover`        | anyone (pays the fee) | guarded account | 0 |
 //!
@@ -32,6 +33,10 @@ pub enum SentinelOp {
     /// Recover the account in `to` to its committed cold destination.
     /// The proof is boxed: it is ~37 KB, the other variants are tiny.
     Recover { cold_dest: Address, salt: [u8; 32], proof: Box<HydraXSignature> },
+    /// Change the rate-limit policy: at once if it only tightens, otherwise
+    /// after the current delay. Last variant on purpose: bincode encodes
+    /// the variant index, so every earlier payload keeps its bytes.
+    UpdatePolicy { delay_blocks: u64, allowance_per_window: u64 },
 }
 
 impl SentinelOp {
@@ -55,7 +60,7 @@ impl SentinelOp {
     /// Whether the guarded account is `from` (owner operations) rather
     /// than `to` (operations anyone may submit).
     pub fn is_owner_op(&self) -> bool {
-        matches!(self, Self::SetGuardian { .. } | Self::RotateGuardian { .. })
+        matches!(self, Self::SetGuardian { .. } | Self::RotateGuardian { .. } | Self::UpdatePolicy { .. })
     }
 }
 

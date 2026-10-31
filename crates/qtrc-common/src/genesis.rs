@@ -103,6 +103,7 @@ impl Genesis {
             state_root_from_height: 1,
             witness_root_from_height: 1,
             recovery_v3_from_height: 1,
+            policy_update_from_height: 1,
             // One validator unless a network sets a height for voting.
             bft_from_height: u64::MAX,
             vaults: Default::default(),

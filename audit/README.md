@@ -103,6 +103,18 @@ activate v3 at block 1. On quantar-testnet-2 the height is
 `RECOVERY_V3_TESTNET2` in `crates/qtrc-common/src/chain.rs`, set to a real
 height above the live tip in the release that enables it.
 
+## Sentinel policy changes
+
+`SentinelOp::UpdatePolicy { delay_blocks, allowance_per_window }` is the
+fifth variant (bincode index 4), carried like every operation as
+`QSN1 || bincode(op)` in the signed `data` field, sent by the owner to
+itself with amount 0. It is accepted from `policy_update_from_height`
+(`POLICY_UPDATE_TESTNET2` in `crates/qtrc-common/src/chain.rs`, `u64::MAX`
+until a release fixes it). A queued loosening is committed in the vault's
+canonical encoding as pending tag `3` followed by `u64le(delay_blocks) ||
+u64le(allowance_per_window)`; tags `1` and `2` are unchanged (vector
+`canonical_encoding_with_policy_change_vector`).
+
 ## AND-composition vectors
 
 `and_composition` in `vectors.json` holds two test keypairs (serialized key

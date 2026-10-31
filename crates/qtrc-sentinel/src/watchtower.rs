@@ -38,7 +38,7 @@
 //! reaction window is `delay_blocks` minus inclusion latency. Findings are
 //! sorted by severity, then by fewest blocks left.
 
-use crate::{Hash, PendingKind, RecoveryFormat, RecoveryProof, Vault, MAX_PENDING};
+use crate::{Hash, PendingKind, Policy, RecoveryFormat, RecoveryProof, Vault, MAX_PENDING};
 use qtrc_crypto::Address;
 use std::cmp::Reverse;
 
@@ -56,6 +56,10 @@ pub struct WatchPolicy {
     /// Rotation the owner announced off-chain. Any other rotation is
     /// hostile. Hand the watchtower a new kit for it before it finalizes.
     pub expected_rotation: Option<Hash>,
+    /// Loosening policy change the owner announced off-chain. Any other
+    /// queued policy change is hostile: loosening the limits is exactly
+    /// what a thief holding the main key would do first.
+    pub expected_policy: Option<Policy>,
 }
 
 /// Material that lets a watchtower veto without any secret key.
@@ -69,7 +73,7 @@ pub struct RecoveryKit<P: RecoveryProof> {
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq, PartialOrd, Ord)]
 pub enum Severity {
-    /// Known destination or expected rotation.
+    /// Known destination, expected rotation or expected policy change.
     Info,
     /// Notify the owner.
     Alert,
@@ -138,6 +142,10 @@ pub fn inspect(vault: &Vault, policy: &WatchPolicy, height: u64) -> Vec<Finding>
                     (Severity::Info, "expected guardian rotation")
                 }
                 PendingKind::RotateCommitment { .. } => (Severity::Recover, "unexpected guardian rotation"),
+                PendingKind::ChangePolicy { policy: new } if policy.expected_policy.as_ref() == Some(new) => {
+                    (Severity::Info, "expected policy change")
+                }
+                PendingKind::ChangePolicy { .. } => (Severity::Recover, "unexpected policy change"),
             };
             Finding { subject: Subject::Pending(p.id), severity, blocks_left: p.unlock_height.saturating_sub(height), reason }
         })
@@ -241,7 +249,7 @@ mod tests {
     }
 
     fn wpol() -> WatchPolicy {
-        WatchPolicy { trusted: vec![exchange()], recover_at: 200, expected_rotation: None }
+        WatchPolicy { trusted: vec![exchange()], recover_at: 200, expected_rotation: None, expected_policy: None }
     }
 
     fn kit() -> RecoveryKit<MockProof> {
@@ -471,5 +479,26 @@ mod tests {
         v.transfer(60, exchange(), 1).unwrap();
         let Action::Recovered { cause, .. } = tick(&mut v, &wpol(), &kit(), CHAIN, 61) else { panic!() };
         assert_eq!(cause.reason, "queue flood");
+    }
+
+    #[test]
+    fn hostile_policy_change_is_vetoed() {
+        let mut v = vault();
+        queued(v.request_policy(10, Policy::new(10, 1_000).unwrap()).unwrap());
+        let Action::Recovered { cause, amount, .. } = tick(&mut v, &wpol(), &kit(), CHAIN, 11) else { panic!() };
+        assert_eq!(cause.reason, "unexpected policy change");
+        assert_eq!(amount, 1_000);
+    }
+
+    #[test]
+    fn announced_policy_change_is_left_alone() {
+        let mut v = vault();
+        let mine = Policy::new(100, 500).unwrap();
+        queued(v.request_policy(10, mine).unwrap());
+        let p = WatchPolicy { expected_policy: Some(mine), ..wpol() };
+        assert_eq!(tick(&mut v, &p, &kit(), CHAIN, 11), Action::Idle);
+        // A thief replacing the owner's change is itself unexpected.
+        queued(v.request_policy(12, Policy::new(10, 1_000).unwrap()).unwrap());
+        assert!(matches!(tick(&mut v, &p, &kit(), CHAIN, 13), Action::Recovered { .. }));
     }
 }

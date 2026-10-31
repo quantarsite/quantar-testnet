@@ -558,3 +558,140 @@ fn recoveries_are_capped_per_block_without_losing_txs() {
     }
     assert_eq!(net.balance(&tail), MICRO_QTR);
 }
+
+// ---- policy changes (UpdatePolicy) ------------------------------------------
+
+fn policy_op(delay_blocks: u64, allowance_qtr: u64) -> Vec<u8> {
+    SentinelOp::UpdatePolicy { delay_blocks, allowance_per_window: allowance_qtr * MICRO_QTR }.encode()
+}
+
+fn policy_of(net: &Net, a: &Address) -> (u64, u64) {
+    let p = net.engine.state.read().vault(a).unwrap().policy();
+    (p.delay_blocks(), p.allowance_per_window())
+}
+
+/// The Binance-style attack: the thief holds a valid signing key and first
+/// tries to loosen the limits. The change waits in public, the large
+/// transfer stays queued under the old allowance, and the recovery takes
+/// everything else to cold storage.
+#[test]
+fn thief_loosening_the_limits_is_vetoed() {
+    let mut net = Net::new(|_| {});
+    let g = guarded(&mut net, 1_000);
+    let owner = g.owner.address();
+    let thief = HydraXKeypair::generate().address();
+
+    net.submit(tx(&g.owner, &owner, 0, net.nonce(&owner), policy_op(DELAY, 1_000_000))).unwrap();
+    net.submit(tx(&g.owner, &thief, 900 * MICRO_QTR, net.nonce(&owner), vec![])).unwrap();
+    net.mine().unwrap();
+    assert_eq!(policy_of(&net, &owner), (DELAY, ALLOWANCE), "loosening is not in force yet");
+    assert_eq!(net.balance(&thief), 0, "still limited by the old allowance");
+    assert_eq!(net.engine.state.read().vault(&owner).unwrap().pending().len(), 2);
+
+    let rescuer = HydraXKeypair::generate();
+    net.fund(&rescuer.address(), 1);
+    net.mine().unwrap();
+    net.submit(tx(&rescuer, &owner, 0, 0, recover_op(&g, 0))).unwrap();
+    net.mine().unwrap();
+    assert_eq!(net.balance(&thief), 0);
+    assert_eq!(net.balance(&g.cold), 1_000 * MICRO_QTR - 3 * TX_FEE);
+}
+
+#[test]
+fn tightening_is_in_force_from_the_next_block() {
+    let mut net = Net::new(|_| {});
+    let g = guarded(&mut net, 1_000);
+    let owner = g.owner.address();
+    let shop = HydraXKeypair::generate().address();
+
+    net.submit(tx(&g.owner, &owner, 0, net.nonce(&owner), policy_op(DELAY * 3, 10))).unwrap();
+    net.mine().unwrap();
+    assert_eq!(policy_of(&net, &owner), (DELAY * 3, 10 * MICRO_QTR));
+    let v = net.engine.state.read().vault(&owner).cloned().unwrap();
+    assert!(v.pending().is_empty());
+
+    net.submit(tx(&g.owner, &shop, 20 * MICRO_QTR, net.nonce(&owner), vec![])).unwrap();
+    net.mine().unwrap();
+    assert_eq!(net.balance(&shop), 0, "20 QTR is over the new 10 QTR allowance");
+    let p = net.engine.state.read().vault(&owner).unwrap().pending()[0].clone();
+    assert_eq!(p.unlock_height, p.created_height + DELAY * 3);
+}
+
+#[test]
+fn loosening_settles_after_the_delay() {
+    let mut net = Net::new(|_| {});
+    let g = guarded(&mut net, 1_000);
+    let owner = g.owner.address();
+    let shop = HydraXKeypair::generate().address();
+
+    net.submit(tx(&g.owner, &owner, 0, net.nonce(&owner), policy_op(DELAY, 500))).unwrap();
+    net.mine().unwrap();
+    let queued_at = net.height();
+    let id = net.engine.state.read().vault(&owner).unwrap().pending()[0].id;
+
+    let stranger = HydraXKeypair::generate();
+    net.fund(&stranger.address(), 1);
+    net.mine().unwrap();
+    while net.height() + 1 < queued_at + DELAY {
+        net.advance(1);
+    }
+    net.submit(tx(&stranger, &owner, 0, 0, SentinelOp::Finalize { id }.encode())).unwrap();
+    net.mine().unwrap();
+    assert_eq!(policy_of(&net, &owner), (DELAY, 500 * MICRO_QTR));
+
+    net.submit(tx(&g.owner, &shop, 400 * MICRO_QTR, net.nonce(&owner), vec![])).unwrap();
+    net.mine().unwrap();
+    assert_eq!(net.balance(&shop), 400 * MICRO_QTR, "now within the allowance");
+}
+
+#[test]
+fn lowering_below_the_window_spend_is_refused_at_admission() {
+    let mut net = Net::new(|_| {});
+    let g = guarded(&mut net, 1_000);
+    let owner = g.owner.address();
+    let shop = HydraXKeypair::generate().address();
+
+    net.submit(tx(&g.owner, &shop, 40 * MICRO_QTR, net.nonce(&owner), vec![])).unwrap();
+    net.mine().unwrap();
+    let err = net.submit(tx(&g.owner, &owner, 0, net.nonce(&owner), policy_op(DELAY, 30))).unwrap_err();
+    assert!(err.contains("allowance"), "{err}");
+    // Out of range is refused too.
+    let err = net.submit(tx(&g.owner, &owner, 0, net.nonce(&owner), policy_op(1, 30))).unwrap_err();
+    assert!(err.contains("policy"), "{err}");
+    // Only the owner, to itself.
+    let other = HydraXKeypair::generate();
+    net.fund(&other.address(), 1);
+    net.mine().unwrap();
+    assert!(net.submit(tx(&other, &owner, 0, 0, policy_op(DELAY, 10))).is_err());
+}
+
+/// Refused before the activation height, accepted from it, and a fresh
+/// node replays every block to the same vaults.
+#[test]
+fn policy_update_activates_at_height_and_replays() {
+    const P: u64 = 9;
+    let mut net = Net::new(|st| st.policy_update_from_height = P);
+    let g = guarded(&mut net, 1_000);
+    let owner = g.owner.address();
+    assert!(net.height() + 1 < P);
+
+    let err = net.submit(tx(&g.owner, &owner, 0, net.nonce(&owner), policy_op(DELAY * 2, 10))).unwrap_err();
+    assert!(err.contains("not active"), "{err}");
+    while net.height() + 1 < P {
+        net.advance(1);
+    }
+    net.submit(tx(&g.owner, &owner, 0, net.nonce(&owner), policy_op(DELAY * 2, 10))).unwrap();
+    net.submit(tx(&g.owner, &owner, 0, net.nonce(&owner), policy_op(DELAY, 900))).unwrap();
+    net.mine().unwrap();
+    assert_eq!(policy_of(&net, &owner), (DELAY * 2, 10 * MICRO_QTR));
+    assert_eq!(net.engine.state.read().vault(&owner).unwrap().pending().len(), 1);
+
+    let replica = ConsensusEngine::new(net.start.clone(), HydraXKeypair::from_bytes(&net.node_key).unwrap());
+    for blk in net.mined.borrow().iter() {
+        replica.replay_block(blk.clone()).unwrap();
+    }
+    let (sa, sb) = (net.engine.state.read(), replica.state.read());
+    assert_eq!(serde_json::to_value(&sa.vaults).unwrap(), serde_json::to_value(&sb.vaults).unwrap());
+    assert_eq!(sa.account(&owner), sb.account(&owner));
+    assert_eq!(sa.block_hash, sb.block_hash);
+}

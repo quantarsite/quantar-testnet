@@ -55,6 +55,8 @@ struct StatusResponse {
     witness_root_from_height: u64,
     /// First block whose Sentinel recoveries sign the full message (v3)
     recovery_v3_from_height: u64,
+    /// First block that accepts Sentinel policy changes
+    policy_update_from_height: u64,
     /// "validator" or "follower"
     role: &'static str,
 }
@@ -117,6 +119,7 @@ async fn get_status(State(AppState { engine, follower, .. }): State<AppState>) -
         state_root_from_height: state.state_root_from_height,
         witness_root_from_height: state.witness_root_from_height,
         recovery_v3_from_height: state.recovery_v3_from_height,
+        policy_update_from_height: state.policy_update_from_height,
         role,
     })
 }
