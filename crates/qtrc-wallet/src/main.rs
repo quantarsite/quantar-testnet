@@ -19,6 +19,8 @@
 //! Sentinel (recovery + delayed large transfers):
 //! qtrc-wallet guardian setup --cold <ADDR>   protect this account
 //! qtrc-wallet guardian rotate --cold <ADDR>  replace the recovery key (delayed)
+//! qtrc-wallet guardian kit --from <KIT> --recovery-key <KEY>
+//!                                            remake a kit (adds the v3 signature)
 //! qtrc-wallet vault [ADDRESS]                show a vault and its queue
 //! qtrc-wallet finalize <ACCOUNT> <ID>        settle a matured queued operation
 //! qtrc-wallet recover <ACCOUNT> --kit <FILE> send a guarded account to its cold address
@@ -139,6 +141,21 @@ enum GuardianCmd {
         #[arg(long)]
         out: PathBuf,
     },
+    /// Remake a recovery kit from the recovery key, for the vault as it is
+    /// now. Adds the full-message (v3) signature to kits made before it
+    /// existed, so they keep working after the v3 activation. Needs no
+    /// wallet key and sends nothing to the chain
+    Kit {
+        /// The existing kit (gives the account, cold address and salt)
+        #[arg(long)]
+        from: PathBuf,
+        /// The recovery key file written by `guardian setup|rotate`
+        #[arg(long)]
+        recovery_key: PathBuf,
+        /// Where to write the new kit (default: replace the old one)
+        #[arg(long)]
+        out: Option<PathBuf>,
+    },
     /// Change the limits. Tightening (lower allowance, longer delay) applies
     /// with the next block; anything else waits the current delay
     Policy {
@@ -188,6 +205,9 @@ fn run(cli: Cli) -> Result<()> {
             cmd_guardian(&http, rpc, &key_path, &cold, Some((delay, &allowance)), out)
         }
         Command::Guardian(GuardianCmd::Rotate { cold, out }) => cmd_guardian(&http, rpc, &key_path, &cold, None, out),
+        Command::Guardian(GuardianCmd::Kit { from, recovery_key, out }) => {
+            cmd_kit(&http, rpc, &from, &recovery_key, out)
+        }
         Command::Guardian(GuardianCmd::Policy { delay, allowance }) => {
             cmd_policy(&http, rpc, &key_path, delay, &allowance)
         }
@@ -402,10 +422,53 @@ struct RecoveryKitFile {
     account:   String,
     cold_dest: String,
     salt:      String,
-    /// Guardian epoch the signature is valid for
+    /// Guardian epoch the signatures are valid for
     epoch:     u64,
-    /// Pre-made recovery signature (for you or a watchtower)
+    /// Pre-made recovery signature over the message the network verified
+    /// when the kit was written (the legacy digest before the v3
+    /// activation). Old watchtowers and wallets only read this one.
     proof:     qtrc_crypto::HydraXSignature,
+    /// The same recovery, signed over the full message (v3). Missing in
+    /// kits made before v2.9.0: remake them with `guardian kit`.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    proof_v3:  Option<qtrc_crypto::HydraXSignature>,
+}
+
+impl RecoveryKitFile {
+    /// The signature the chain accepts in a block verified with `format`.
+    /// Before the activation that is `proof`; from it on, `proof_v3`, or
+    /// `proof` for kits written by a wallet already past the activation
+    /// (the chain checks it either way).
+    fn proof_for(&self, format: RecoveryFormat) -> &qtrc_crypto::HydraXSignature {
+        match format {
+            RecoveryFormat::LegacyDigest => &self.proof,
+            RecoveryFormat::Full => self.proof_v3.as_ref().unwrap_or(&self.proof),
+        }
+    }
+}
+
+/// Both recovery signatures for one commitment and epoch: the one the
+/// network verifies in its next block, and the full-message (v3) one.
+/// Once the network is past the activation they are the same signature.
+fn sign_recovery(
+    recovery: &HydraXKeypair,
+    format: RecoveryFormat,
+    account: &Address,
+    commitment: &[u8; 32],
+    epoch: u64,
+) -> (qtrc_crypto::HydraXSignature, qtrc_crypto::HydraXSignature) {
+    let full = recovery.sign(&qtrc_sentinel::recovery_message(CHAIN_ID.as_bytes(), account, commitment, epoch));
+    let now = match format {
+        RecoveryFormat::Full => full.clone(),
+        RecoveryFormat::LegacyDigest => recovery.sign(&qtrc_sentinel::recovery_message_for(
+            format,
+            CHAIN_ID.as_bytes(),
+            account,
+            commitment,
+            epoch,
+        )),
+    };
+    (now, full)
 }
 
 /// Recovery message encoding the node will verify in its next block, and
@@ -466,15 +529,8 @@ fn cmd_guardian(
         Some(v) => v["vault"]["epoch"].as_u64().unwrap_or(0) + 1,
         None => 0,
     };
-    let (format, v3_from) = recovery_format(http, rpc)?;
-    let proof = recovery.sign(&qtrc_sentinel::recovery_message_for(format, CHAIN_ID.as_bytes(), &account, &commitment, epoch));
-    if let (RecoveryFormat::LegacyDigest, Some(h)) = (format, v3_from) {
-        eprintln!(
-            "note: the network switches recovery signatures to the full message at block {h}. \
-             After that this kit's proof no longer opens the vault: sign a fresh one then with \
-             `qtrc-wallet recover --recovery-key`, or rotate the guardian."
-        );
-    }
+    let (format, _) = recovery_format(http, rpc)?;
+    let (proof, proof_v3) = sign_recovery(&recovery, format, &account, &commitment, epoch);
 
     // Write the secrets before anything goes on chain.
     write_secret_file(&rec_path, &recovery.to_bytes())?;
@@ -485,6 +541,7 @@ fn cmd_guardian(
         salt: hex::encode(salt),
         epoch,
         proof,
+        proof_v3: Some(proof_v3),
     };
     write_secret_file(&kit_path, &serde_json::to_vec_pretty(&kit)?)?;
 
@@ -685,6 +742,81 @@ fn cmd_policy(http: &Client, rpc: &str, key_path: &PathBuf, delay: u64, allowanc
     Ok(())
 }
 
+/// `guardian kit`: rebuild a kit from the recovery key for the vault's
+/// current commitment and epoch, with both signatures, and check both
+/// against the vault before writing anything.
+fn cmd_kit(http: &Client, rpc: &str, from: &PathBuf, recovery_key: &PathBuf, out: Option<PathBuf>) -> Result<()> {
+    let old: RecoveryKitFile = serde_json::from_slice(
+        &std::fs::read(from).with_context(|| format!("cannot read {}", from.display()))?,
+    )
+    .context("invalid kit file")?;
+    if old.chain_id != CHAIN_ID {
+        bail!("this kit is for {}, this wallet runs {CHAIN_ID}", old.chain_id);
+    }
+    let account = parse_address(&old.account)?;
+    let cold = parse_address(&old.cold_dest)?;
+    let salt: [u8; 32] = hex::decode(&old.salt)
+        .ok()
+        .and_then(|b| b.try_into().ok())
+        .ok_or_else(|| anyhow!("invalid salt in kit"))?;
+    let recovery = load_wallet(recovery_key)?;
+
+    let r = get_json(http, &format!("{rpc}/vault/{}", account.as_hex()))?;
+    let vault: qtrc_sentinel::Vault =
+        serde_json::from_value(r["vault"].clone()).context("unexpected vault format from the node")?;
+    if vault.is_recovered() {
+        bail!("this account was already recovered; there is nothing left to protect");
+    }
+    let commitment = *vault.commitment().ok_or_else(|| anyhow!("the account has no active guardian"))?;
+    if qtrc_sentinel::recovery_commitment(CHAIN_ID.as_bytes(), &account, &recovery.address(), &cold, &salt) != commitment {
+        bail!(
+            "this recovery key and kit do not open the vault's current commitment. \
+             If a rotation already took effect, use the key and kit from that rotation."
+        );
+    }
+
+    let (format, v3_from) = recovery_format(http, rpc)?;
+    let epoch = vault.epoch();
+    let (proof, proof_v3) = sign_recovery(&recovery, format, &account, &commitment, epoch);
+    // Same checks the chain runs, for both encodings, before replacing anything.
+    vault
+        .check_recovery_with(format, CHAIN_ID.as_bytes(), &cold, &salt, &proof)
+        .map_err(|e| anyhow!("the new signature does not open the vault ({e}); nothing was written"))?;
+    vault
+        .check_recovery_with(RecoveryFormat::Full, CHAIN_ID.as_bytes(), &cold, &salt, &proof_v3)
+        .map_err(|e| anyhow!("the v3 signature does not open the vault ({e}); nothing was written"))?;
+
+    let kit = RecoveryKitFile {
+        chain_id: CHAIN_ID.into(),
+        account: account.as_hex(),
+        cold_dest: cold.as_hex(),
+        salt: old.salt.clone(),
+        epoch,
+        proof,
+        proof_v3: Some(proof_v3),
+    };
+    let bytes = serde_json::to_vec_pretty(&kit)?;
+    let dest = out.unwrap_or_else(|| from.clone());
+    if dest == *from {
+        // Write next to it, then swap, so a failure never leaves no kit.
+        let tmp = from.with_extension("new.tmp");
+        let _ = std::fs::remove_file(&tmp);
+        write_secret_file(&tmp, &bytes)?;
+        std::fs::rename(&tmp, from).with_context(|| format!("cannot replace {}", from.display()))?;
+    } else {
+        write_secret_file(&dest, &bytes)?;
+    }
+
+    println!("Kit for {} written to {}.", account.as_hex(), dest.display());
+    println!("Guardian epoch {epoch}; it opens the vault before and after the v3 activation.");
+    match v3_from {
+        Some(h) => println!("The network verifies the full message from block {h}."),
+        None => println!("The network has not fixed a v3 activation height yet."),
+    }
+    println!("If a watchtower uses this account, point it at the new kit (it reloads by itself).");
+    Ok(())
+}
+
 fn cmd_recover(
     http: &Client,
     rpc: &str,
@@ -714,17 +846,23 @@ fn cmd_recover(
         .flatten()
         .ok_or_else(|| anyhow!("the account has no active guardian"))?;
 
+    let (format, _) = recovery_format(http, rpc)?;
     let proof = match recovery_key {
         Some(path) => {
             let rec = load_wallet(path)?;
-            let (format, _) = recovery_format(http, rpc)?;
             rec.sign(&qtrc_sentinel::recovery_message_for(format, CHAIN_ID.as_bytes(), &target, &commitment, epoch))
         }
         None => {
             if kit.epoch != epoch {
                 bail!("this kit is for epoch {}, the vault is at {epoch}; pass --recovery-key to sign now", kit.epoch);
             }
-            kit.proof
+            if format == RecoveryFormat::Full && kit.proof_v3.is_none() {
+                eprintln!(
+                    "note: this kit predates v3 and the network now verifies the full message; \
+                     if the node refuses it, remake it with `qtrc-wallet guardian kit` or pass --recovery-key"
+                );
+            }
+            kit.proof_for(format).clone()
         }
     };
     let op = SentinelOp::Recover { cold_dest: cold.clone(), salt, proof: Box::new(proof) };
@@ -832,6 +970,52 @@ fn format_qtr(micro: u64) -> String {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// A kit written before the activation opens the vault on both sides of
+    /// it, each with the signature the chain checks then; an old kit file
+    /// without `proof_v3` still parses and keeps its legacy behaviour.
+    #[test]
+    fn dual_kit_opens_the_vault_before_and_after_v3() {
+        use qtrc_sentinel::Vault;
+        let account = HydraXKeypair::generate().address();
+        let recovery = HydraXKeypair::generate();
+        let cold = HydraXKeypair::generate().address();
+        let salt = [3u8; 32];
+        let c = qtrc_sentinel::recovery_commitment(CHAIN_ID.as_bytes(), &account, &recovery.address(), &cold, &salt);
+        let vault = Vault::new(account.clone(), 10 * MICRO_QTR, Some(c), Policy::new(20, MICRO_QTR).unwrap());
+
+        let (proof, proof_v3) = sign_recovery(&recovery, RecoveryFormat::LegacyDigest, &account, &c, 0);
+        let kit = RecoveryKitFile {
+            chain_id: CHAIN_ID.into(),
+            account: account.as_hex(),
+            cold_dest: cold.as_hex(),
+            salt: hex::encode(salt),
+            epoch: 0,
+            proof,
+            proof_v3: Some(proof_v3),
+        };
+        let kit: RecoveryKitFile = serde_json::from_slice(&serde_json::to_vec(&kit).unwrap()).unwrap();
+        for f in [RecoveryFormat::LegacyDigest, RecoveryFormat::Full] {
+            vault.check_recovery_with(f, CHAIN_ID.as_bytes(), &cold, &salt, kit.proof_for(f)).unwrap();
+        }
+
+        // Kit from before v2.9.0: no proof_v3 field at all.
+        let mut old = serde_json::to_value(&kit).unwrap();
+        old.as_object_mut().unwrap().remove("proof_v3");
+        let old: RecoveryKitFile = serde_json::from_value(old).unwrap();
+        assert!(old.proof_v3.is_none());
+        let legacy = RecoveryFormat::LegacyDigest;
+        vault.check_recovery_with(legacy, CHAIN_ID.as_bytes(), &cold, &salt, old.proof_for(legacy)).unwrap();
+        assert!(
+            vault.check_recovery_with(RecoveryFormat::Full, CHAIN_ID.as_bytes(), &cold, &salt, old.proof_for(RecoveryFormat::Full)).is_err(),
+            "an old kit must not open the vault after the activation"
+        );
+
+        // Signed once the network is past the activation: one signature.
+        let (now, full) = sign_recovery(&recovery, RecoveryFormat::Full, &account, &c, 0);
+        assert_eq!(serde_json::to_value(&now).unwrap(), serde_json::to_value(&full).unwrap());
+        vault.check_recovery_with(RecoveryFormat::Full, CHAIN_ID.as_bytes(), &cold, &salt, &now).unwrap();
+    }
 
     #[test]
     fn qtr_amounts_parse_exactly() {

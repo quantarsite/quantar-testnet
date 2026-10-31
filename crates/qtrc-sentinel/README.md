@@ -17,7 +17,7 @@ HYDRA-X requires ML-DSA-87 AND SLH-DSA-SHA2-256s, which defends against one sign
 
 The recovery key signs the full message `DOM || chain_id || account || R || epoch` (fields length-prefixed, epoch little-endian), not a digest of it. Earlier releases signed `SHA3-256` of the same fields, a 32-byte external pre-hash that caps collision resistance near 128 bits, below the category 5 that ML-DSA-87 and SLH-DSA-SHA2-256s are chosen for, and that FIPS 205 section 10.2 asks to avoid with short digests on the 256-bit sets. Both schemes now hash the message internally at their own level.
 
-The switch is a consensus change with its own activation height (`recovery_v3_from_height`). Blocks before it are verified with the legacy digest so history replays unchanged; from it on only the full message is accepted. A kit signed before the activation stops opening the vault at that height: the watchtower reports it as `KitStale`, and the owner signs a new proof with `qtrc-wallet recover --recovery-key` or rotates the guardian. The encoding is pinned by the `recovery_message_vector` test.
+The switch is a consensus change with its own activation height (`recovery_v3_from_height`). Blocks before it are verified with the legacy digest so history replays unchanged; from it on only the full message is accepted. Since v2.9.0 a kit carries both signatures (`proof` for the legacy digest, `proof_v3` for the full message) and the wallet and watchtower use the one the next block is verified with, so a kit made before the activation keeps working across it. A kit from before v2.9.0 has only `proof`: the watchtower warns before the activation (`the kit has no v3 signature and stops working at block N`), the owner remakes it with `qtrc-wallet guardian kit --from <kit> --recovery-key <key>`, and if nobody does it is reported as `KitStale` from the activation on. The encoding is pinned by the `recovery_message_vector` test.
 
 ## Watchtower
 
@@ -63,7 +63,7 @@ Wired into consensus (`qtrc-common::state`, `qtrc-consensus`, `qtrc-node`, `qtrc
 * `apply_tx` is all-or-nothing (journal + rollback). Finalize and Recover are paid by the submitter. Recovery into a recovered vault is refused; credits follow forwarding to the final holder.
 * `UpdatePolicy` has its own activation height (`policy_update_from_height`, `POLICY_UPDATE_TESTNET2` on the live network, `u64::MAX` until a release fixes it above the tip). It is the last `SentinelOp` variant, so every earlier payload keeps its bytes, and the new pending kind has its own tag in the canonical vault encoding, so vaults that never queue a policy change keep their state root (`canonical_encoding_test_vector` is unchanged).
 * RPC: `GET /vault/:address`; `/status` reports `sentinel_from_height` and `policy_update_from_height`.
-* Wallet: `guardian setup|rotate|policy`, `vault`, `finalize`, `recover --kit [--recovery-key]`. Watchtower config: `expected_policy` to announce a loosening.
+* Wallet: `guardian setup|rotate|policy|kit`, `vault`, `finalize`, `recover --kit [--recovery-key]`. Watchtower config: `expected_policy` to announce a loosening.
 
 `finalize` is intentionally permissionless. Policy changes are time-locked unless they only tighten.
 

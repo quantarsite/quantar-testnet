@@ -34,11 +34,10 @@ pub const TESTNET2_VALIDATOR: &str = "809ae6fb45d3d7c9a2c2f3968c58cc55ad6bb2ca2c
 /// Rules of quantar-testnet-2 as they happened on the live node: fee from
 /// block 5 (v2.0.2), Sentinel from 6 (v2.1.0), state root from 15
 /// (v2.3.0), witness root from 20 (v2.4.0), policy changes from 40
-/// (v2.8.0).
+/// (v2.8.0), full-message recoveries from 60 (v2.9.0).
 ///
-/// `recovery_v3` stays at `u64::MAX` (never) until a release fixes a real
-/// height above the live tip: every node must ship the same number, so it
-/// is set at deploy time, not guessed here.
+/// Every node must ship the same numbers, so each one is fixed in the
+/// release that turns its rule on, above the live tip at that moment.
 pub const TESTNET2: Activations =
     Activations {
         fee: 5,
@@ -50,9 +49,10 @@ pub const TESTNET2: Activations =
     };
 
 /// Height at which quantar-testnet-2 switches Sentinel recoveries to the
-/// full-message (v3) encoding. Set to a height above the live tip in the
-/// release that turns it on.
-pub const RECOVERY_V3_TESTNET2: u64 = u64::MAX;
+/// full-message (v3) encoding. Fixed in v2.9.0 above the live tip (21 when
+/// it was chosen, with the policy change at 40 still ahead), leaving room
+/// to remake the watchtower's kits after the deploy and before the switch.
+pub const RECOVERY_V3_TESTNET2: u64 = 60;
 
 /// Height at which quantar-testnet-2 starts accepting Sentinel policy
 /// changes. Fixed in v2.8.0 above the live tip (21 when it was chosen),

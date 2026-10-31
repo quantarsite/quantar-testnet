@@ -453,3 +453,52 @@ Deploy, seguidor primeiro (207.154.219.21), depois validador
 
 Volta atrás: o binário anterior lê os dados até o primeiro bloco com uma
 `UpdatePolicy`; depois dele, só com o backup.
+
+## v2.9.0: recuperação v3 ligada no bloco 60, kits com as duas assinaturas (sem reset)
+
+- A recuperação passa a assinar a mensagem inteira (v3) a partir do bloco
+  60 da quantar-testnet-2 (`RECOVERY_V3_TESTNET2`). Até o 59 vale o resumo
+  de 32 bytes; blocos antigos refazem igual. Com isso a recuperação deixa
+  de ficar presa em uns 128 bits de resistência a colisão, abaixo da
+  categoria 5 do ML-DSA-87 e do SLH-DSA-SHA2-256s.
+- Kit de recuperação com as duas assinaturas: `proof` (a que a rede
+  verifica quando o kit é feito, o resumo antigo até o bloco 60) e
+  `proof_v3` (mensagem inteira). Carteira e watchtower usam a que o
+  próximo bloco pede, então um kit feito agora atravessa a ativação sem
+  ninguém mexer. Watchtower e carteira antigos continuam lendo `proof`.
+- `qtrc-wallet guardian kit --from <kit> --recovery-key <chave> [--out <arquivo>]`
+  refaz um kit antigo para o cofre como ele está, com as duas assinaturas.
+  Confere as duas contra o cofre antes de gravar; sem `--out` troca o
+  arquivo no lugar, sem nunca deixar a conta sem kit. Não precisa da
+  chave da carteira e não manda nada para a rede.
+- O watchtower avisa antes da ativação, uma vez por conta, se um kit não
+  tem a assinatura v3 ou se ela não abre o cofre (`stops working at block 60`),
+  e avisa de novo quando estiver resolvido. Depois da ativação, um kit
+  antigo aparece como `KitStale`, inclusive junto de um ataque.
+- `recover --kit` usa a assinatura certa sozinho; com um kit antigo depois
+  da ativação, avisa para refazer o kit ou usar `--recovery-key`.
+
+Deploy, seguidor primeiro (207.154.219.21), depois validador
+(164.90.145.184). Os dois com a rede abaixo do bloco 55, para sobrar
+tempo para os kits. Se a rede já estiver perto de 60, não faça o deploy:
+a altura precisa subir no código antes.
+
+1. `curl -s https://testnet.quantarnetwork.com/rpc/status`: `height` abaixo de 55.
+2. Backup: `systemctl stop <serviços>` e
+   `cp -a /var/lib/quantar /root/backup-quantar-$(date +%F)-v2.8`
+3. Validador: `cd ~/hx-mempool && git pull`, `cd ~/quantar-testnet && git pull && cargo build --release`.
+   O seguidor não compila: recebe o `qtrc-node` e o `qtrc-wallet` do validador por `scp`.
+4. Seguidor: `install -m 755 qtrc-{node,wallet} /usr/local/bin/`.
+   Validador: `install -m 755 target/release/qtrc-{node,faucet,wallet,watchtower} /usr/local/bin/`
+5. Iniciar os serviços e conferir `systemctl is-active`.
+6. `/status` mostra `version 0.9.0` e `recovery_v3_from_height 60`.
+7. Kits do watchtower, antes do bloco 60: para cada conta em
+   `/etc/quantar/watchtower.json`, rodar
+   `qtrc-wallet guardian kit --from <kit> --recovery-key <chave>`
+   onde a chave de recuperação estiver guardada, e copiar o kit novo
+   para o caminho da config. O watchtower recarrega sozinho; o log
+   (`journalctl -u quantar-watchtower`) mostra `kit ready for the v3 activation`.
+
+Volta atrás: até o bloco 59 o binário anterior refaz a mesma chain (a
+v0.8.0 tem a v3 em `u64::MAX`, mas nenhum bloco abaixo de 60 muda). Do
+bloco 60 em diante, só com o backup.

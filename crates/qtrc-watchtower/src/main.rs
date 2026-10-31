@@ -119,6 +119,9 @@ struct KitFile {
     salt: String,
     epoch: u64,
     proof: HydraXSignature,
+    /// Full-message (v3) signature. Kits from before v2.9.0 lack it.
+    #[serde(default)]
+    proof_v3: Option<HydraXSignature>,
 }
 
 /// Everything needed to judge and protect one account.
@@ -126,8 +129,34 @@ struct Watched {
     name: String,
     account: Address,
     policy: WatchPolicy,
+    /// The kit with the signature written as `proof`
     kit: RecoveryKit<HydraXSignature>,
+    /// The same kit with the full-message (v3) signature, if the file has it
+    kit_v3: Option<RecoveryKit<HydraXSignature>>,
     kit_epoch: u64,
+}
+
+impl Watched {
+    /// The kit whose signature the chain accepts in a block verified with
+    /// `format`. Past the activation a kit without `proof_v3` falls back
+    /// to `proof` (right for kits written after the activation, and
+    /// reported as stale by `tick` otherwise).
+    fn kit_for(&self, format: RecoveryFormat) -> &RecoveryKit<HydraXSignature> {
+        match format {
+            RecoveryFormat::LegacyDigest => &self.kit,
+            RecoveryFormat::Full => self.kit_v3.as_ref().unwrap_or(&self.kit),
+        }
+    }
+}
+
+/// Network status the watchtower needs each cycle.
+#[derive(Clone, Copy, Debug)]
+struct Status {
+    height: u64,
+    /// Encoding the node verifies in its next block
+    format: RecoveryFormat,
+    /// First block verified with the full message, if one is fixed
+    v3_from: Option<u64>,
 }
 
 fn load_config(path: &Path) -> Result<Config> {
@@ -174,7 +203,8 @@ fn load_watched(entry: &WatchEntry) -> Result<Watched> {
         name: entry.label.clone().unwrap_or_else(|| short(&account)),
         account,
         policy: WatchPolicy { trusted, recover_at: parse_qtr(&entry.recover_at)?, expected_rotation, expected_policy },
-        kit: RecoveryKit { cold_dest, salt, proof: kit.proof },
+        kit: RecoveryKit { cold_dest: cold_dest.clone(), salt, proof: kit.proof },
+        kit_v3: kit.proof_v3.map(|proof| RecoveryKit { cold_dest, salt, proof }),
         kit_epoch: kit.epoch,
     })
 }
@@ -187,7 +217,25 @@ fn load_watched(entry: &WatchEntry) -> Result<Watched> {
 /// audited `tick` on a copy, so nothing here can diverge from it.
 fn decide(vault: &Vault, w: &Watched, height: u64, format: RecoveryFormat) -> Action {
     let mut copy = vault.clone();
-    tick_with(format, &mut copy, &w.policy, &w.kit, CHAIN_ID.as_bytes(), height)
+    tick_with(format, &mut copy, &w.policy, w.kit_for(format), CHAIN_ID.as_bytes(), height)
+}
+
+/// Before the v3 activation: will this kit still recover once the network
+/// verifies the full message? `Some(reason)` if not, so the owner can fix
+/// it while there is time. `None` once the activation has passed (then
+/// `tick` itself reports a stale kit) or when no height is fixed yet.
+fn v3_readiness(vault: &Vault, w: &Watched, st: Status) -> Option<String> {
+    let v3 = st.v3_from?;
+    if st.format == RecoveryFormat::Full || vault.is_recovered() || vault.commitment().is_none() {
+        return None;
+    }
+    let Some(kit) = &w.kit_v3 else {
+        return Some(format!("the kit has no v3 signature and stops working at block {v3}"));
+    };
+    vault
+        .check_recovery_with(RecoveryFormat::Full, CHAIN_ID.as_bytes(), &kit.cold_dest, &kit.salt, &kit.proof)
+        .err()
+        .map(|e| format!("the kit's v3 signature does not open the vault ({e}); it stops working at block {v3}"))
 }
 
 /// Stable text for a set of findings, so the same situation alerts once.
@@ -228,9 +276,10 @@ impl Rpc {
         Ok((code, resp.json().unwrap_or(Value::Null)))
     }
 
-    /// Current height, and the recovery message encoding the node verifies
-    /// in its next block (legacy digest on a node from before v3).
-    fn height(&self) -> Result<(u64, RecoveryFormat)> {
+    /// Current height, the recovery message encoding the node verifies in
+    /// its next block (legacy digest on a node from before v3) and the
+    /// height it switches at.
+    fn status(&self) -> Result<Status> {
         let (code, s) = self.get("/status")?;
         if code != 200 {
             bail!("status returned {code}");
@@ -242,11 +291,12 @@ impl Rpc {
             bail!("node does not support Sentinel");
         }
         let height = s["height"].as_u64().ok_or_else(|| anyhow!("status has no height"))?;
-        let format = match s["recovery_v3_from_height"].as_u64() {
+        let v3_from = s["recovery_v3_from_height"].as_u64().filter(|h| *h != u64::MAX);
+        let format = match v3_from {
             Some(v3) if height + 1 >= v3 => RecoveryFormat::Full,
             _ => RecoveryFormat::LegacyDigest,
         };
-        Ok((height, format))
+        Ok(Status { height, format, v3_from })
     }
 
     /// The account's vault, or None if it has no guardian.
@@ -273,16 +323,17 @@ impl Rpc {
         Ok((bal, nonce))
     }
 
-    fn submit_recovery(&self, payer: &HydraXKeypair, w: &Watched) -> Result<String> {
+    fn submit_recovery(&self, payer: &HydraXKeypair, w: &Watched, format: RecoveryFormat) -> Result<String> {
+        let kit = w.kit_for(format);
         let from = payer.address();
         let (balance, nonce) = self.account(&from)?;
         if balance == 0 {
             bail!("watchtower wallet {} has no QTR for the recovery fee", from.as_hex());
         }
         let op = SentinelOp::Recover {
-            cold_dest: w.kit.cold_dest.clone(),
-            salt: w.kit.salt,
-            proof: Box::new(w.kit.proof.clone()),
+            cold_dest: kit.cold_dest.clone(),
+            salt: kit.salt,
+            proof: Box::new(kit.proof.clone()),
         };
         let data = op.encode();
         let payload = Transaction::signing_payload_with_data(&from, &w.account, 0, nonce, &data);
@@ -316,6 +367,9 @@ struct Memory {
     last_alert: HashMap<String, String>,
     /// Recovery submitted per account: height it was sent at
     submitted: HashMap<String, u64>,
+    /// Last v3 readiness warning per account (kept apart from `last_alert`
+    /// so it neither hides nor repeats the attack alerts)
+    v3_warned: HashMap<String, String>,
 }
 
 /// Blocks to wait for a submitted recovery before trying again.
@@ -347,8 +401,41 @@ impl Service {
         self.mem.last_alert.remove(account);
     }
 
+    /// Report a kit that will stop working at the v3 activation, once per
+    /// reason, and say when it is fixed.
+    fn warn_v3(&mut self, w: &Watched, key: &str, problem: Option<String>) {
+        match problem {
+            Some(why) => {
+                if self.mem.v3_warned.get(key) == Some(&why) {
+                    return;
+                }
+                let text = format!(
+                    "⚠️ {}: {why}. Remake it now with `qtrc-wallet guardian kit --from <kit> --recovery-key <key>`; the watchtower reloads it by itself.",
+                    w.name
+                );
+                self.mem.v3_warned.insert(key.to_string(), why);
+                self.notify(&text, true);
+            }
+            None => {
+                if self.mem.v3_warned.remove(key).is_some() {
+                    self.notify(&format!("✅ {}: kit ready for the v3 activation", w.name), false);
+                }
+            }
+        }
+    }
+
+    fn notify(&self, text: &str, loud: bool) {
+        if loud { error!("{text}") } else { info!("{text}") }
+        if let Some(url) = &self.webhook {
+            let body = serde_json::json!({ "text": text, "content": text });
+            if let Err(e) = self.rpc.http.post(url).json(&body).send() {
+                warn!("webhook failed: {e}");
+            }
+        }
+    }
+
     fn cycle(&mut self, cfg: &Config) -> Result<()> {
-        let (height, recovery) = self.rpc.height()?;
+        let st = self.rpc.status()?;
         for entry in &cfg.accounts {
             let w = match load_watched(entry) {
                 Ok(w) => w,
@@ -358,14 +445,15 @@ impl Service {
                     continue;
                 }
             };
-            if let Err(e) = self.check(&w, height, recovery) {
+            if let Err(e) = self.check(&w, st) {
                 warn!(account = %w.name, "check failed: {e:#}");
             }
         }
         Ok(())
     }
 
-    fn check(&mut self, w: &Watched, height: u64, recovery: RecoveryFormat) -> Result<()> {
+    fn check(&mut self, w: &Watched, st: Status) -> Result<()> {
+        let (height, recovery) = (st.height, st.format);
         let key = w.account.as_hex();
         let Some(vault) = self.rpc.vault(&w.account)? else {
             self.alert(&key, "noguardian".into(), format!("⚠️ {}: account has no guardian; nothing to protect", w.name), false);
@@ -378,6 +466,7 @@ impl Service {
             self.alert(&key, "recovered".into(), format!("✅ {}: recovered, everything forwards to {}", w.name, short(to)), false);
             return Ok(());
         }
+        self.warn_v3(w, &key, v3_readiness(&vault, w, st));
         match decide(&vault, w, height, recovery) {
             Action::Idle => self.clear(&key),
             Action::NoGuardian => {
@@ -406,7 +495,10 @@ impl Service {
                         w.account.as_hex()
                     )
                 } else {
-                    format!("⚠️ {}: watchtower disarmed, {why}. Send it the new kit.", w.name)
+                    format!(
+                        "⚠️ {}: watchtower disarmed, {why}. Make a new kit with `qtrc-wallet guardian kit --from <kit> --recovery-key <key>`; the watchtower reloads it by itself.",
+                        w.name
+                    )
                 };
                 self.alert(&key, alert_key("stale", &findings), text, hostile);
             }
@@ -417,7 +509,7 @@ impl Service {
                     }
                     warn!(account = %w.name, "recovery not confirmed after {RESUBMIT_AFTER} blocks, sending again");
                 }
-                match self.rpc.submit_recovery(&self.payer, w) {
+                match self.rpc.submit_recovery(&self.payer, w, recovery) {
                     Ok(tx) => {
                         self.mem.submitted.insert(key.clone(), height);
                         self.alert(
@@ -427,7 +519,7 @@ impl Service {
                                 "🛡️ {}: {}. Recovery submitted, everything goes to {}. tx {tx}",
                                 w.name,
                                 describe(&cause),
-                                short(&w.kit.cold_dest)
+                                short(&w.kit_for(recovery).cold_dest)
                             ),
                             true,
                         );
@@ -537,7 +629,7 @@ fn short(a: &Address) -> String {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use qtrc_sentinel::{recovery_commitment, recovery_message, Policy};
+    use qtrc_sentinel::{recovery_commitment, recovery_message, recovery_message_legacy, Policy};
 
     const SALT: [u8; 32] = [7u8; 32];
 
@@ -554,7 +646,9 @@ mod tests {
         let recovery = HydraXKeypair::generate();
         let cold = HydraXKeypair::generate().address();
         let c = recovery_commitment(CHAIN_ID.as_bytes(), &account, &recovery.address(), &cold, &SALT);
-        let proof = recovery.sign(&recovery_message(CHAIN_ID.as_bytes(), &account, &c, 0));
+        // Same pair `qtrc-wallet` writes before the activation.
+        let proof = recovery.sign(&recovery_message_legacy(CHAIN_ID.as_bytes(), &account, &c, 0));
+        let proof_v3 = recovery.sign(&recovery_message(CHAIN_ID.as_bytes(), &account, &c, 0));
         let exchange = Address([2u8; 32]);
         Fixture {
             vault: Vault::new(account.clone(), 1_000 * MICRO_QTR, Some(c), Policy::new(20, 5 * MICRO_QTR).unwrap()),
@@ -562,7 +656,8 @@ mod tests {
                 name: "test".into(),
                 account,
                 policy: WatchPolicy { trusted: vec![exchange.clone()], recover_at: 100 * MICRO_QTR, expected_rotation: None, expected_policy: None },
-                kit: RecoveryKit { cold_dest: cold, salt: SALT, proof },
+                kit: RecoveryKit { cold_dest: cold.clone(), salt: SALT, proof },
+                kit_v3: Some(RecoveryKit { cold_dest: cold, salt: SALT, proof: proof_v3 }),
                 kit_epoch: 0,
             },
             thief: Address([6u8; 32]),
@@ -597,11 +692,67 @@ mod tests {
         assert_eq!(serde_json::to_value(&v).unwrap(), before);
     }
 
+    fn theft(f: &Fixture) -> Vault {
+        let mut v = f.vault.clone();
+        v.transfer(10, f.thief.clone(), 500 * MICRO_QTR).unwrap();
+        v
+    }
+
+    const BEFORE: Status = Status { height: 30, format: RecoveryFormat::LegacyDigest, v3_from: Some(50) };
+    const AFTER: Status = Status { height: 60, format: RecoveryFormat::Full, v3_from: Some(50) };
+
+    #[test]
+    fn dual_kit_recovers_on_both_sides_of_the_activation() {
+        let f = fixture();
+        let v = theft(&f);
+        for st in [BEFORE, AFTER] {
+            assert!(matches!(decide(&v, &f.watched, 11, st.format), Action::Recovered { .. }), "{st:?}");
+            // The proof it would send is the one the chain checks then.
+            let kit = f.watched.kit_for(st.format);
+            v.check_recovery_with(st.format, CHAIN_ID.as_bytes(), &kit.cold_dest, &kit.salt, &kit.proof).unwrap();
+            assert_eq!(v3_readiness(&v, &f.watched, st), None);
+        }
+        // The two signatures are not interchangeable.
+        let k = &f.watched.kit;
+        assert!(v.check_recovery_with(RecoveryFormat::Full, CHAIN_ID.as_bytes(), &k.cold_dest, &k.salt, &k.proof).is_err());
+    }
+
+    #[test]
+    fn kit_without_v3_is_flagged_before_and_stale_after() {
+        let f = fixture();
+        let v = theft(&f);
+        let mut w = f.watched;
+        w.kit_v3 = None; // a kit from before v2.9.0
+        // Still protects before the activation, but says it will stop.
+        assert!(matches!(decide(&v, &w, 11, BEFORE.format), Action::Recovered { .. }));
+        let warn = v3_readiness(&v, &w, BEFORE).expect("must warn before the activation");
+        assert!(warn.contains("block 50"), "{warn}");
+        // After it, the old kit cannot recover and says so with the attack.
+        let Action::KitStale(findings) = decide(&v, &w, 11, AFTER.format) else { panic!() };
+        assert_eq!(findings[0].severity, Severity::Recover);
+        // No height fixed yet: nothing to warn about.
+        let none = Status { v3_from: None, ..BEFORE };
+        assert_eq!(v3_readiness(&v, &w, none), None);
+    }
+
+    #[test]
+    fn broken_v3_signature_is_caught_before_the_activation() {
+        let f = fixture();
+        let mut w = f.watched;
+        // A v3 slot holding the legacy signature (or any wrong one).
+        w.kit_v3 = Some(w.kit.clone());
+        let warn = v3_readiness(&f.vault, &w, BEFORE).expect("must warn");
+        assert!(warn.contains("does not open"), "{warn}");
+    }
+
     #[test]
     fn stale_kit_is_reported_with_the_attack() {
         let f = fixture();
         let mut w = f.watched;
         w.kit.salt = [0u8; 32]; // does not open the commitment
+        if let Some(k) = w.kit_v3.as_mut() {
+            k.salt = [0u8; 32];
+        }
         let mut v = f.vault.clone();
         v.transfer(10, f.thief.clone(), 500 * MICRO_QTR).unwrap();
         let Action::KitStale(findings) = decide(&v, &w, 11, RecoveryFormat::Full) else { panic!() };
@@ -639,7 +790,17 @@ mod tests {
         let w = load_watched(&cfg.accounts[0]).unwrap();
         assert_eq!(w.policy.recover_at, 12_500_000);
         assert_eq!(w.account, f.watched.account);
-        assert_eq!(decide(&f.vault, &w, 10, RecoveryFormat::Full), Action::Idle, "loaded kit opens the commitment");
+        // A kit from before v2.9.0 opens the vault only in the legacy encoding.
+        assert!(w.kit_v3.is_none());
+        assert_eq!(decide(&f.vault, &w, 10, RecoveryFormat::LegacyDigest), Action::Idle, "loaded kit opens the commitment");
+
+        // A v2.9.0 kit carries both signatures.
+        let mut kit3 = kit.clone();
+        kit3["proof_v3"] = serde_json::to_value(&f.watched.kit_v3.as_ref().unwrap().proof).unwrap();
+        std::fs::write(&kit_path, serde_json::to_vec(&kit3).unwrap()).unwrap();
+        let w = load_watched(&cfg.accounts[0]).unwrap();
+        assert_eq!(decide(&f.vault, &w, 10, RecoveryFormat::Full), Action::Idle);
+        assert_eq!(decide(&f.vault, &w, 10, RecoveryFormat::LegacyDigest), Action::Idle);
         let _ = std::fs::remove_dir_all(&dir);
     }
 
