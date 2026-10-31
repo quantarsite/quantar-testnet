@@ -61,14 +61,23 @@ pub const POLICY_UPDATE_TESTNET2: u64 = 40;
 
 /// Height from which quantar-testnet-2 blocks are decided by the votes of
 /// [`TESTNET2_BFT_VALIDATORS`]. Until then [`TESTNET2_VALIDATOR`] keeps
-/// making them alone and the others copy them. `u64::MAX` (never) until a
-/// release fixes a height above the live tip together with the set.
-pub const TESTNET2_BFT_FROM: u64 = u64::MAX;
+/// making them alone and the others copy them. Fixed in v2.10.0 at 100,
+/// chosen at tip 21, after the v3 recovery switch at 60.
+pub const TESTNET2_BFT_FROM: u64 = 100;
 
 /// Voting validators of quantar-testnet-2 from [`TESTNET2_BFT_FROM`] on,
 /// one per server, each on a different provider or region. Includes the
 /// current validator, so its key keeps signing across the switch.
-pub const TESTNET2_BFT_VALIDATORS: &[&str] = &[];
+pub const TESTNET2_BFT_VALIDATORS: &[&str] = &[
+    // San Francisco, DigitalOcean: the validator since genesis
+    "809ae6fb45d3d7c9a2c2f3968c58cc55ad6bb2ca2cfe84f65619c013bbcbbbff",
+    // Frankfurt, DigitalOcean
+    "fbeef7f77c020ebedf27417e1eaa4c1676b4bd2e192692db35a914b5c178b59c",
+    // Sao Paulo, Linode (Akamai)
+    "da14876269335bb687049d73033210845006eb1544803fd9f969f4a3c541f3df",
+    // Tokyo, Vultr
+    "a9705f52efea161c8f6a55bd30c2b093260783002993b7e71bf918c3713b73da",
+];
 
 /// Validators that vote from a fixed height on.
 #[derive(Clone, Debug, PartialEq, Eq)]
