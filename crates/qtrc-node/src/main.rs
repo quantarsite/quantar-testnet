@@ -289,9 +289,22 @@ async fn cmd_start(
     } else {
         Vec::new()
     };
+    if bft_peers.is_some() && init_state.bft_from_height > 1 && init_state.bft_from_height != u64::MAX && pre_bft.is_empty() {
+        anyhow::bail!(
+            "the validators vote from block {}: pass --validator <address> of the validator that makes the blocks before it",
+            init_state.bft_from_height
+        );
+    }
     if init_state.validators.is_empty() {
         init_state.validators = pre_bft;
     } else if init_state.bft_from_height > 1 {
+        if let Some(v) = pre_bft.iter().find(|p| !init_state.validators.iter().any(|v| v.address == p.address)) {
+            anyhow::bail!(
+                "validator {} makes the blocks before the switch but is not one of the voting validators; \
+                 it would stop at the switch height",
+                v.address.as_hex()
+            );
+        }
         init_state.pre_bft_validators = pre_bft;
     }
     if following && init_state.validators.is_empty() {
@@ -350,9 +363,19 @@ async fn cmd_start(
     for block in store.blocks() {
         let block = block?;
         let height = block.header.height;
-        engine
-            .replay_block(block)
-            .map_err(|e| anyhow::anyhow!("stored block {height} failed replay: {e}"))?;
+        let solo_after_switch = block.commit.is_none() && engine.state.read().bft_active_at(height);
+        engine.replay_block(block).map_err(|e| {
+            if solo_after_switch {
+                anyhow::anyhow!(
+                    "stored block {height} failed replay: {e}. It was made by one validator alone at or after \
+                     the switch to votes (block {}): this data dir ran an older binary past the switch. \
+                     Restore the backup taken before the upgrade, or move the data dir away and sync again.",
+                    engine.state.read().bft_from_height
+                )
+            } else {
+                anyhow::anyhow!("stored block {height} failed replay: {e}")
+            }
+        })?;
         replayed += 1;
     }
     {

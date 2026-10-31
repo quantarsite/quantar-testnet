@@ -201,6 +201,12 @@ const SYNC_EVERY: Duration = Duration::from_secs(10);
 
 const MAX_LATER: usize = 2_000;
 
+/// How far ahead of the next height an early message is kept.
+const LATER_WINDOW: u64 = 4;
+
+/// Least time between two catch-ups triggered by messages from ahead.
+const CATCH_UP_GAP: Duration = Duration::from_secs(2);
+
 impl Driver {
     pub fn new(engine: Arc<ConsensusEngine>, key: HydraXKeypair, out: Outbox, guard: SignGuard) -> Result<(Self, Inbox)> {
         let key = Arc::new(key);
@@ -290,7 +296,7 @@ impl Driver {
         self.act(a);
         // Messages that arrived early.
         let (now, keep): (Vec<_>, Vec<_>) = std::mem::take(&mut self.later).into_iter().partition(|m| m.height() == h);
-        self.later = keep.into_iter().filter(|m| m.height() > h).collect();
+        self.later = keep.into_iter().filter(|m| m.height() > h && m.height() <= h + LATER_WINDOW).collect();
         for m in now {
             self.feed(m);
         }
@@ -308,11 +314,18 @@ impl Driver {
             return;
         }
         if h > next {
-            if self.later.len() < MAX_LATER {
+            // Only a few heights ahead are worth keeping: anything further
+            // is either junk or means we are far behind, and the catch-up
+            // below brings the blocks with their proofs anyway.
+            if h <= next + LATER_WINDOW && self.later.len() < MAX_LATER {
                 self.later.push(m);
             }
-            // Others are ahead: fetch the blocks we are missing.
-            self.catch_up();
+            // Others are ahead: fetch the blocks we are missing, but not on
+            // every such message (one validator could otherwise keep this
+            // thread busy with HTTP round trips).
+            if self.last_sync.elapsed() >= CATCH_UP_GAP {
+                self.catch_up();
+            }
             return;
         }
         if self.running != Some(h) {

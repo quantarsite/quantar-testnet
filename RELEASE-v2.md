@@ -502,3 +502,45 @@ a altura precisa subir no código antes.
 Volta atrás: até o bloco 59 o binário anterior refaz a mesma chain (a
 v0.8.0 tem a v3 em `u64::MAX`, mas nenhum bloco abaixo de 60 muda). Do
 bloco 60 em diante, só com o backup.
+
+## v2.10.0: quatro validadores votando a partir do bloco 100 (sem reset)
+
+- Até o bloco 99, São Francisco (`TESTNET2_VALIDATOR`) continua fazendo
+  os blocos sozinho, como sempre. Frankfurt, São Paulo e Tóquio já rodam
+  como validadores, mas só copiam e conferem esses blocos pela porta p2p.
+  A partir do 100, todo bloco precisa de prova de commit: precommits de
+  mais de 2/3 dos quatro (`TESTNET2_BFT_FROM`, `TESTNET2_BFT_VALIDATORS`).
+- `ChainState.pre_bft_validators`: quem fazia os blocos antes da troca.
+  Sem isso os nós esperariam os blocos 1 a 99 em rodízio dos quatro e a
+  rede recusaria a própria história.
+- Na rede ao vivo, a lista e a altura vêm do código. O `--bft-config` só
+  diz onde achar cada um (`p2p`) e precisa bater com o código; um
+  validador sem ele não inicia. Em rede local, `--validator` é obrigatório
+  quando a votação começa depois do bloco 1, e esse validador precisa
+  estar entre os que votam.
+- `/proof` traz a prova de commit; `qtrc-wallet proof` confere os votos
+  do conjunto fixo no código. Cabeçalho de antes do bloco 100 só com
+  `--before-switch`, porque depois da troca uma chave sozinha não basta.
+- Chaves novas nos três servidores novos, geradas em cada um. As da
+  devnet não são usadas: a devnet assina com o mesmo identificador de
+  rede (`quantar-testnet-2`), então votos dela valeriam aqui.
+- Mensagens de alturas futuras: só até 4 à frente ficam guardadas, e a
+  busca de blocos que elas disparam acontece no máximo a cada 2 segundos.
+- Revisão independente: nenhum achado crítico no consenso. Corrigidos o
+  da carteira (alto) e os de configuração e fila (baixos).
+
+Riscos que ficam, conhecidos:
+- Se a chave de São Francisco for usada para fazer dois blocos diferentes
+  na mesma altura antes do 100, a troca pode travar até uma intervenção
+  manual. Não piora o que existe hoje: essa chave já controla a rede
+  sozinha até lá.
+- Votos e transações não carregam o hash da gênese, só o identificador
+  da rede. Por isso nenhuma chave pode ser usada em duas redes com o
+  mesmo identificador.
+- Nós que não atualizarem: depois do 100 um nó antigo aceita blocos
+  solo de São Francisco e recusa os votados. Os quatro precisam estar na
+  v0.10.0 antes do 100; a altura atual era 21 quando ela foi fixada.
+- A porta p2p aceita só os IPs das URLs da configuração, com limite por
+  IP. Isso protege contra excesso de pedidos, não contra quem controla um
+  desses IPs; as mensagens em si são todas conferidas pela assinatura.
+- Ensaio local: `deploy/bft/rehearse-handover.sh`.

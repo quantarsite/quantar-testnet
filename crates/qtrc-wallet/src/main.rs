@@ -92,7 +92,15 @@ enum Command {
     /// Check an account's balance yourself: verifies the validator's
     /// HYDRA-X signature on the latest block header and the Merkle proof
     /// of the account against the state root in that header
-    Proof { address: Option<String> },
+    Proof {
+        address: Option<String>,
+        /// Accept a header from before the network's switch to validator
+        /// votes, trusting the one validator's key alone. Only meaningful
+        /// while the network has not reached the switch yet: after it, a
+        /// node answering with such a header is lying or stale
+        #[arg(long)]
+        before_switch: bool,
+    },
     /// Sentinel guardian: recovery key and delayed large transfers
     #[command(subcommand)]
     Guardian(GuardianCmd),
@@ -211,12 +219,12 @@ fn run(cli: Cli) -> Result<()> {
         Command::Guardian(GuardianCmd::Policy { delay, allowance }) => {
             cmd_policy(&http, rpc, &key_path, delay, &allowance)
         }
-        Command::Proof { address } => {
+        Command::Proof { address, before_switch } => {
             let addr = match address {
                 Some(a) => parse_address(&a)?,
                 None => load_wallet(&key_path)?.address(),
             };
-            cmd_proof(&http, rpc, &addr, &parse_address(&cli.validator)?)
+            cmd_proof(&http, rpc, &addr, &parse_address(&cli.validator)?, before_switch)
         }
         Command::Vault { address } => {
             let addr = match address {
@@ -605,7 +613,24 @@ fn verify_header_final(
     commit: Option<&qtrc_common::block::CommitProof>,
     validator: &Address,
     bft: Option<&qtrc_common::chain::KnownBft>,
+    before_switch: bool,
 ) -> Result<String> {
+    // Once the network votes, one key alone must never be enough: a node
+    // holding the first validator's key could otherwise sign a made-up
+    // header just below the switch height (with any timestamp) and have it
+    // accepted. Below the switch only on request, while it is still ahead.
+    if let Some(b) = bft.filter(|b| header.height < b.from_height) {
+        if !before_switch {
+            bail!(
+                "the node answered with block {}, before the switch to validator votes at block {}. \
+                 Such a block is trusted on one key alone. If the network has not reached block {} yet, \
+                 run again with --before-switch; if it has, this node is lying or out of date.",
+                header.height,
+                b.from_height,
+                b.from_height
+            );
+        }
+    }
     if let Some(b) = bft.filter(|b| header.height >= b.from_height) {
         use qtrc_bft::types as mc;
         let commit = commit.ok_or_else(|| {
@@ -648,6 +673,7 @@ fn verify_header_final(
     Ok(format!("signed by validator {}", short_addr(validator)))
 }
 
+#[allow(clippy::too_many_arguments)]
 fn verify_proof_answer(
     header: &qtrc_common::block::BlockHeader,
     sigs: &[qtrc_common::block::ValidatorSig],
@@ -656,8 +682,9 @@ fn verify_proof_answer(
     addr: &Address,
     validator: &Address,
     bft: Option<&qtrc_common::chain::KnownBft>,
+    before_switch: bool,
 ) -> Result<(Proven, String)> {
-    let by = verify_header_final(header, sigs, commit, validator, bft)?;
+    let by = verify_header_final(header, sigs, commit, validator, bft, before_switch)?;
     let root = header.state_root.ok_or_else(|| anyhow!("this block has no state root"))?;
     let proof = proof.ok_or_else(|| {
         anyhow!("NOT VERIFIED: the node sent no proof (it says the account is empty, which cannot be proven yet)")
@@ -671,7 +698,7 @@ fn verify_proof_answer(
     Ok((Proven { height: header.height, timestamp: header.timestamp, root, leaf: proof.leaf.clone() }, by))
 }
 
-fn cmd_proof(http: &Client, rpc: &str, addr: &Address, validator: &Address) -> Result<()> {
+fn cmd_proof(http: &Client, rpc: &str, addr: &Address, validator: &Address, before_switch: bool) -> Result<()> {
     use qtrc_common::block::{BlockHeader, ValidatorSig};
     use qtrc_common::state_root::Proof;
 
@@ -683,7 +710,8 @@ fn cmd_proof(http: &Client, rpc: &str, addr: &Address, validator: &Address) -> R
         serde_json::from_value(r.get("commit").cloned().unwrap_or(Value::Null)).context("bad commit proof from node")?;
 
     let bft = qtrc_common::chain::testnet2_bft();
-    let (p, by) = verify_proof_answer(&header, &sigs, commit.as_ref(), proof.as_ref(), addr, validator, bft.as_ref())?;
+    let (p, by) =
+        verify_proof_answer(&header, &sigs, commit.as_ref(), proof.as_ref(), addr, validator, bft.as_ref(), before_switch)?;
     let age = chrono::Utc::now().timestamp().saturating_sub(p.timestamp);
 
     println!("Verified with ML-DSA-87 AND SLH-DSA-SHA2-256s, {by}.");
@@ -1115,28 +1143,34 @@ mod tests {
         let anyone = keys[0].address();
 
         let three = commit(&[&keys[0], &keys[1], &keys[3]], &header);
-        let by = verify_header_final(&header, &sigs, Some(&three), &anyone, Some(&bft)).unwrap();
+        let by = verify_header_final(&header, &sigs, Some(&three), &anyone, Some(&bft), false).unwrap();
         assert!(by.contains("3 of 4"), "{by}");
 
         let two = commit(&[&keys[0], &keys[1]], &header);
-        assert!(verify_header_final(&header, &sigs, Some(&two), &anyone, Some(&bft)).is_err(), "2 of 4 is not final");
-        assert!(verify_header_final(&header, &sigs, None, &anyone, Some(&bft)).is_err(), "no proof");
+        assert!(verify_header_final(&header, &sigs, Some(&two), &anyone, Some(&bft), false).is_err(), "2 of 4 is not final");
+        assert!(verify_header_final(&header, &sigs, None, &anyone, Some(&bft), false).is_err(), "no proof");
 
         let outsider = HydraXKeypair::generate();
         let forged = commit(&[&keys[0], &keys[1], &outsider], &header);
-        assert!(verify_header_final(&header, &sigs, Some(&forged), &anyone, Some(&bft)).is_err(), "outsider vote");
+        assert!(verify_header_final(&header, &sigs, Some(&forged), &anyone, Some(&bft), false).is_err(), "outsider vote");
 
         let mut other = header.clone();
         other.state_root = Some([9; 32]);
-        assert!(verify_header_final(&other, &sigs, Some(&three), &anyone, Some(&bft)).is_err(), "votes for another header");
+        assert!(verify_header_final(&other, &sigs, Some(&three), &anyone, Some(&bft), false).is_err(), "votes for another header");
 
         // Below the activation the single validator's signature still rules,
         // and a header from it at or above the activation needs votes.
         let mut early = header.clone();
         early.height = 79;
         let early_sigs = vec![ValidatorSig { validator: keys[2].address(), signature: keys[2].sign(&early.signing_bytes()) }];
-        assert!(verify_header_final(&early, &early_sigs, None, &keys[2].address(), Some(&bft)).is_ok());
-        assert!(verify_header_final(&header, &sigs, None, &keys[2].address(), Some(&bft)).is_err());
+        // Below the activation: one key alone is refused unless asked for
+        // (a node with the first validator's key could forge such a header
+        // after the switch), and accepted on request.
+        let refused = verify_header_final(&early, &early_sigs, None, &keys[2].address(), Some(&bft), false).unwrap_err();
+        assert!(refused.to_string().contains("--before-switch"), "{refused}");
+        assert!(verify_header_final(&early, &early_sigs, None, &keys[2].address(), Some(&bft), true).is_ok());
+        // At or above it the flag changes nothing: votes are required.
+        assert!(verify_header_final(&header, &sigs, None, &keys[2].address(), Some(&bft), true).is_err());
     }
 
     #[test]
@@ -1166,19 +1200,19 @@ mod tests {
         let real = HydraXKeypair::generate();
         let evil = HydraXKeypair::generate();
         let (h, s) = header_by(&evil);
-        assert!(verify_proof_answer(&h, &s, None, Some(&proof), &victim, &real.address(), None).is_err(), "evil key refused");
+        assert!(verify_proof_answer(&h, &s, None, Some(&proof), &victim, &real.address(), None, false).is_err(), "evil key refused");
 
         let (h, s) = header_by(&real);
-        let (ok, _) = verify_proof_answer(&h, &s, None, Some(&proof), &victim, &real.address(), None).unwrap();
+        let (ok, _) = verify_proof_answer(&h, &s, None, Some(&proof), &victim, &real.address(), None, false).unwrap();
         assert_eq!(ok.leaf.balance, 1_000_000 * MICRO_QTR);
 
         // Signature by the validator over a different header is refused.
         let (mut h2, s2) = header_by(&real);
         h2.height += 1;
-        assert!(verify_proof_answer(&h2, &s2, None, Some(&proof), &victim, &real.address(), None).is_err());
+        assert!(verify_proof_answer(&h2, &s2, None, Some(&proof), &victim, &real.address(), None, false).is_err());
 
         // No proof is "not verified", never a statement of fact.
-        let err = verify_proof_answer(&h, &s, None, None, &victim, &real.address(), None).unwrap_err().to_string();
+        let err = verify_proof_answer(&h, &s, None, None, &victim, &real.address(), None, false).unwrap_err().to_string();
         assert!(err.contains("NOT VERIFIED"), "{err}");
     }
 
