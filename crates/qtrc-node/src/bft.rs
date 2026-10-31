@@ -219,6 +219,14 @@ impl Driver {
         self.engine.state.read().height + 1
     }
 
+    /// Heights before the BFT activation are not voted on: on a chain that
+    /// had one validator first, that validator still makes them alone and
+    /// the others copy them (the periodic catch-up), so they all arrive at
+    /// the activation height with the same history.
+    fn votes_on(&self, h: u64) -> bool {
+        self.engine.state.read().bft_active_at(h)
+    }
+
     pub fn run(mut self) {
         info!(address = %self.key.address(), "BFT validator running");
         loop {
@@ -253,7 +261,7 @@ impl Driver {
             // over at the new height with the same sign guard.
             self.reset_runner(next);
         }
-        if self.running.is_none() && !self.engine.mempool.read().is_empty() {
+        if self.running.is_none() && self.votes_on(next) && !self.engine.mempool.read().is_empty() {
             self.start(next);
         }
     }
@@ -268,6 +276,9 @@ impl Driver {
     }
 
     fn start(&mut self, h: u64) {
+        if !self.votes_on(h) {
+            return;
+        }
         let vs = match self.engine.bft_validator_set() {
             Ok(vs) => vs,
             Err(e) => return warn!("cannot start height {h}: {e}"),
@@ -293,7 +304,7 @@ impl Driver {
         if !self.engine.state.read().validators.iter().any(|v| v.address == sender) {
             return;
         }
-        if h < next {
+        if h < next || !self.votes_on(h) {
             return;
         }
         if h > next {

@@ -86,6 +86,10 @@ struct ProofResponse {
     /// That block's validator signatures (verify the proposer's over
     /// `header.signing_bytes()`)
     validator_sigs: Vec<qtrc_common::block::ValidatorSig>,
+    /// On blocks decided by votes: the precommits that made it final
+    /// (verify with `qtrc_bft::verify_commit` against the validator set)
+    #[serde(skip_serializing_if = "Option::is_none")]
+    commit:         Option<qtrc_common::block::CommitProof>,
     /// Inclusion proof; null if the account is empty
     proof:          Option<qtrc_common::state_root::Proof>,
 }
@@ -168,11 +172,11 @@ async fn get_proof(
         (StatusCode::BAD_REQUEST, Json(ErrorResponse { error: e.to_string() }))
     })?;
     // Building the proof walks every account: keep it off the async runtime.
-    let result = tokio::task::spawn_blocking(move || engine.state_proof(&addr))
+    let result = tokio::task::spawn_blocking(move || engine.state_proof_with_commit(&addr))
         .await
         .map_err(|e| (StatusCode::INTERNAL_SERVER_ERROR, Json(ErrorResponse { error: e.to_string() })))?;
     match result {
-        Ok((header, validator_sigs, proof)) => Ok(Json(ProofResponse { header, validator_sigs, proof })),
+        Ok((header, validator_sigs, commit, proof)) => Ok(Json(ProofResponse { header, validator_sigs, commit, proof })),
         Err(e) => Err((StatusCode::CONFLICT, Json(ErrorResponse { error: e.to_string() }))),
     }
 }

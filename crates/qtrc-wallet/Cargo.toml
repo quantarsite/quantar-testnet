@@ -15,6 +15,8 @@ path = "src/main.rs"
 qtrc-crypto.path = "../qtrc-crypto"
 qtrc-common.path = "../qtrc-common"
 qtrc-sentinel.path = "../qtrc-sentinel"
+# Commit proofs: the same check the nodes run on blocks decided by votes
+qtrc-bft.path = "../qtrc-bft"
 rand.workspace = true
 hex.workspace = true
 serde.workspace = true

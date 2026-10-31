@@ -36,6 +36,12 @@ pub struct ChainState {
     pub block_hash: BlockHash,
     pub accounts:   HashMap<String, AccountState>, // key = address hex
     pub validators: Vec<ValidatorInfo>,
+    /// Who made the blocks before `bft_from_height`, on a chain that ran
+    /// with one validator before the voting started. Empty: the same set
+    /// as `validators` (a chain that votes from block 1, or never votes).
+    /// Not part of the state root, like `validators`.
+    #[serde(default)]
+    pub pre_bft_validators: Vec<ValidatorInfo>,
     /// First block height that charges `TX_FEE`. A chain created before
     /// fees existed keeps its old blocks valid by activating them later.
     #[serde(default = "fees_from_genesis")]
@@ -126,6 +132,16 @@ impl ChainState {
     /// Whether the block at `height` must carry a state root.
     pub fn bft_active_at(&self, height: u64) -> bool {
         height >= self.bft_from_height
+    }
+
+    /// The validator set that decides the block at `height`: the voting
+    /// set from `bft_from_height` on, the earlier one before it.
+    pub fn validators_at(&self, height: u64) -> &[ValidatorInfo] {
+        if !self.bft_active_at(height) && !self.pre_bft_validators.is_empty() {
+            &self.pre_bft_validators
+        } else {
+            &self.validators
+        }
     }
 
     pub fn state_root_active_at(&self, height: u64) -> bool {

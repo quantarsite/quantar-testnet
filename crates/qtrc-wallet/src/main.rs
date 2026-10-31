@@ -595,13 +595,39 @@ struct Proven {
 /// Check a node's answer without trusting the node: the header must be
 /// signed (ML-DSA-87 AND SLH-DSA) by the expected validator, and the proof
 /// must lead from the account to the state root in that header.
-fn verify_proof_answer(
+/// Who made `header` final. From the network's BFT activation on: a commit
+/// proof, precommits from more than two thirds of the validator set fixed
+/// in code, the same check every node runs. Before it: the one validator's
+/// HYDRA-X signature over the header.
+fn verify_header_final(
     header: &qtrc_common::block::BlockHeader,
     sigs: &[qtrc_common::block::ValidatorSig],
-    proof: Option<&qtrc_common::state_root::Proof>,
-    addr: &Address,
+    commit: Option<&qtrc_common::block::CommitProof>,
     validator: &Address,
-) -> Result<Proven> {
+    bft: Option<&qtrc_common::chain::KnownBft>,
+) -> Result<String> {
+    if let Some(b) = bft.filter(|b| header.height >= b.from_height) {
+        use qtrc_bft::types as mc;
+        let commit = commit.ok_or_else(|| {
+            anyhow!("block {} was decided by votes but the node sent no commit proof", header.height)
+        })?;
+        let vs = qtrc_bft::ValidatorSet::new(
+            b.validators.iter().map(|a| qtrc_bft::Validator { address: qtrc_bft::ValAddr::from(a), power: 1 }).collect(),
+        )
+        .map_err(|e| anyhow!("validator set: {e}"))?;
+        let cert = mc::CommitCertificate::<qtrc_bft::Ctx> {
+            height: qtrc_bft::Height(header.height),
+            round: mc::Round::new(commit.round),
+            value_id: qtrc_bft::BlockId(header.hash().0),
+            commit_signatures: commit
+                .precommits
+                .iter()
+                .map(|p| mc::CommitSignature::new(qtrc_bft::ValAddr::from(&p.validator), qtrc_bft::Signature::from_hydrax(&p.signature)))
+                .collect(),
+        };
+        qtrc_bft::verify_commit(&cert, &vs).map_err(|e| anyhow!("commit proof invalid: {e}"))?;
+        return Ok(format!("final by the votes of {} of {} validators", commit.precommits.len(), b.validators.len()));
+    }
     if &header.proposer != validator {
         bail!(
             "header was proposed by {}, not by the expected validator {}",
@@ -619,6 +645,19 @@ fn verify_proof_answer(
     sig.signature
         .verify(&header.signing_bytes())
         .map_err(|e| anyhow!("validator signature on the header is invalid: {e}"))?;
+    Ok(format!("signed by validator {}", short_addr(validator)))
+}
+
+fn verify_proof_answer(
+    header: &qtrc_common::block::BlockHeader,
+    sigs: &[qtrc_common::block::ValidatorSig],
+    commit: Option<&qtrc_common::block::CommitProof>,
+    proof: Option<&qtrc_common::state_root::Proof>,
+    addr: &Address,
+    validator: &Address,
+    bft: Option<&qtrc_common::chain::KnownBft>,
+) -> Result<(Proven, String)> {
+    let by = verify_header_final(header, sigs, commit, validator, bft)?;
     let root = header.state_root.ok_or_else(|| anyhow!("this block has no state root"))?;
     let proof = proof.ok_or_else(|| {
         anyhow!("NOT VERIFIED: the node sent no proof (it says the account is empty, which cannot be proven yet)")
@@ -629,7 +668,7 @@ fn verify_proof_answer(
     if !proof.verify(&root) {
         bail!("PROOF INVALID: the node's answer does not match the signed state root");
     }
-    Ok(Proven { height: header.height, timestamp: header.timestamp, root, leaf: proof.leaf.clone() })
+    Ok((Proven { height: header.height, timestamp: header.timestamp, root, leaf: proof.leaf.clone() }, by))
 }
 
 fn cmd_proof(http: &Client, rpc: &str, addr: &Address, validator: &Address) -> Result<()> {
@@ -640,11 +679,14 @@ fn cmd_proof(http: &Client, rpc: &str, addr: &Address, validator: &Address) -> R
     let header: BlockHeader = serde_json::from_value(r["header"].clone()).context("bad header from node")?;
     let sigs: Vec<ValidatorSig> = serde_json::from_value(r["validator_sigs"].clone()).context("bad signatures from node")?;
     let proof: Option<Proof> = serde_json::from_value(r["proof"].clone()).context("bad proof from node")?;
+    let commit: Option<qtrc_common::block::CommitProof> =
+        serde_json::from_value(r.get("commit").cloned().unwrap_or(Value::Null)).context("bad commit proof from node")?;
 
-    let p = verify_proof_answer(&header, &sigs, proof.as_ref(), addr, validator)?;
+    let bft = qtrc_common::chain::testnet2_bft();
+    let (p, by) = verify_proof_answer(&header, &sigs, commit.as_ref(), proof.as_ref(), addr, validator, bft.as_ref())?;
     let age = chrono::Utc::now().timestamp().saturating_sub(p.timestamp);
 
-    println!("Verified with ML-DSA-87 AND SLH-DSA-SHA2-256s, signed by validator {}.", short_addr(validator));
+    println!("Verified with ML-DSA-87 AND SLH-DSA-SHA2-256s, {by}.");
     println!("account : {}", addr.as_hex());
     println!("balance : {} QTR", format_qtr(p.leaf.balance));
     println!("nonce   : {}", p.leaf.nonce);
@@ -1038,6 +1080,65 @@ mod tests {
     }
 
     /// Regression W1: a node cannot pass off a header signed by its own key.
+    /// From the BFT activation on, a header is accepted only with
+    /// precommits from more than 2/3 of the set fixed in code.
+    #[test]
+    fn voted_blocks_need_a_commit_proof_from_the_fixed_set() {
+        use qtrc_common::block::{BlockHash, BlockHeader, CommitProof, ValidatorSig};
+        use qtrc_common::chain::KnownBft;
+        use qtrc_common::tx::TxHash;
+
+        let keys: Vec<_> = (0..4).map(|_| HydraXKeypair::generate()).collect();
+        let bft = KnownBft { from_height: 80, validators: keys.iter().map(|k| k.address()).collect() };
+        let header = BlockHeader {
+            height: 81,
+            prev_hash: BlockHash([0; 32]),
+            merkle_root: TxHash([0; 32]),
+            timestamp: 0,
+            proposer: keys[2].address(),
+            state_root: Some([0; 32]),
+            witness_root: None,
+        };
+        let sigs = vec![ValidatorSig { validator: keys[2].address(), signature: keys[2].sign(&header.signing_bytes()) }];
+        let precommit = |k: &HydraXKeypair, h: &BlockHeader| {
+            let v = qtrc_bft::Vote {
+                typ: qtrc_bft::types::VoteType::Precommit,
+                height: qtrc_bft::Height(h.height),
+                round: qtrc_bft::types::Round::new(0),
+                value: qtrc_bft::types::NilOrVal::Val(qtrc_bft::BlockId(h.hash().0)),
+                validator: qtrc_bft::ValAddr::from(&k.address()),
+                extension: None,
+            };
+            ValidatorSig { validator: k.address(), signature: k.sign(&v.sign_bytes()) }
+        };
+        let commit = |ks: &[&HydraXKeypair], h: &BlockHeader| CommitProof { round: 0, precommits: ks.iter().map(|k| precommit(k, h)).collect() };
+        let anyone = keys[0].address();
+
+        let three = commit(&[&keys[0], &keys[1], &keys[3]], &header);
+        let by = verify_header_final(&header, &sigs, Some(&three), &anyone, Some(&bft)).unwrap();
+        assert!(by.contains("3 of 4"), "{by}");
+
+        let two = commit(&[&keys[0], &keys[1]], &header);
+        assert!(verify_header_final(&header, &sigs, Some(&two), &anyone, Some(&bft)).is_err(), "2 of 4 is not final");
+        assert!(verify_header_final(&header, &sigs, None, &anyone, Some(&bft)).is_err(), "no proof");
+
+        let outsider = HydraXKeypair::generate();
+        let forged = commit(&[&keys[0], &keys[1], &outsider], &header);
+        assert!(verify_header_final(&header, &sigs, Some(&forged), &anyone, Some(&bft)).is_err(), "outsider vote");
+
+        let mut other = header.clone();
+        other.state_root = Some([9; 32]);
+        assert!(verify_header_final(&other, &sigs, Some(&three), &anyone, Some(&bft)).is_err(), "votes for another header");
+
+        // Below the activation the single validator's signature still rules,
+        // and a header from it at or above the activation needs votes.
+        let mut early = header.clone();
+        early.height = 79;
+        let early_sigs = vec![ValidatorSig { validator: keys[2].address(), signature: keys[2].sign(&early.signing_bytes()) }];
+        assert!(verify_header_final(&early, &early_sigs, None, &keys[2].address(), Some(&bft)).is_ok());
+        assert!(verify_header_final(&header, &sigs, None, &keys[2].address(), Some(&bft)).is_err());
+    }
+
     #[test]
     fn proof_requires_the_expected_validator() {
         use qtrc_common::block::{BlockHash, BlockHeader, ValidatorSig};
@@ -1065,19 +1166,19 @@ mod tests {
         let real = HydraXKeypair::generate();
         let evil = HydraXKeypair::generate();
         let (h, s) = header_by(&evil);
-        assert!(verify_proof_answer(&h, &s, Some(&proof), &victim, &real.address()).is_err(), "evil key refused");
+        assert!(verify_proof_answer(&h, &s, None, Some(&proof), &victim, &real.address(), None).is_err(), "evil key refused");
 
         let (h, s) = header_by(&real);
-        let ok = verify_proof_answer(&h, &s, Some(&proof), &victim, &real.address()).unwrap();
+        let (ok, _) = verify_proof_answer(&h, &s, None, Some(&proof), &victim, &real.address(), None).unwrap();
         assert_eq!(ok.leaf.balance, 1_000_000 * MICRO_QTR);
 
         // Signature by the validator over a different header is refused.
         let (mut h2, s2) = header_by(&real);
         h2.height += 1;
-        assert!(verify_proof_answer(&h2, &s2, Some(&proof), &victim, &real.address()).is_err());
+        assert!(verify_proof_answer(&h2, &s2, None, Some(&proof), &victim, &real.address(), None).is_err());
 
         // No proof is "not verified", never a statement of fact.
-        let err = verify_proof_answer(&h, &s, None, &victim, &real.address()).unwrap_err().to_string();
+        let err = verify_proof_answer(&h, &s, None, None, &victim, &real.address(), None).unwrap_err().to_string();
         assert!(err.contains("NOT VERIFIED"), "{err}");
     }
 

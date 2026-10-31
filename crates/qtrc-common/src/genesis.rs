@@ -97,6 +97,7 @@ impl Genesis {
             block_hash: BlockHash::zero(),
             accounts,
             validators,
+            pre_bft_validators: Vec::new(),
             fee_from_height: 1,
             burned: 0,
             sentinel_from_height: 1,

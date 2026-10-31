@@ -59,6 +59,50 @@ pub const RECOVERY_V3_TESTNET2: u64 = 60;
 /// the same on every node.
 pub const POLICY_UPDATE_TESTNET2: u64 = 40;
 
+/// Height from which quantar-testnet-2 blocks are decided by the votes of
+/// [`TESTNET2_BFT_VALIDATORS`]. Until then [`TESTNET2_VALIDATOR`] keeps
+/// making them alone and the others copy them. `u64::MAX` (never) until a
+/// release fixes a height above the live tip together with the set.
+pub const TESTNET2_BFT_FROM: u64 = u64::MAX;
+
+/// Voting validators of quantar-testnet-2 from [`TESTNET2_BFT_FROM`] on,
+/// one per server, each on a different provider or region. Includes the
+/// current validator, so its key keeps signing across the switch.
+pub const TESTNET2_BFT_VALIDATORS: &[&str] = &[];
+
+/// Validators that vote from a fixed height on.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct KnownBft {
+    pub from_height: u64,
+    pub validators: Vec<qtrc_crypto::Address>,
+}
+
+/// The voting set fixed in code for `genesis`, if it is a known network
+/// and a BFT activation has been fixed for it.
+#[must_use]
+pub fn known_bft(genesis: &Genesis) -> Option<KnownBft> {
+    known_activations(genesis)?;
+    bft_from(TESTNET2_BFT_FROM, TESTNET2_BFT_VALIDATORS)
+}
+
+/// The voting set of quantar-testnet-2, if one is fixed yet. For clients
+/// (the wallet) that check blocks of the live network without a genesis.
+#[must_use]
+pub fn testnet2_bft() -> Option<KnownBft> {
+    bft_from(TESTNET2_BFT_FROM, TESTNET2_BFT_VALIDATORS)
+}
+
+fn bft_from(from_height: u64, validators: &[&str]) -> Option<KnownBft> {
+    if from_height == u64::MAX {
+        return None;
+    }
+    let validators = validators
+        .iter()
+        .map(|a| qtrc_crypto::Address::from_hex(a).expect("valid constant"))
+        .collect();
+    Some(KnownBft { from_height, validators })
+}
+
 /// The fixed activations of `genesis`, if it is a known network.
 #[must_use]
 pub fn known_activations(genesis: &Genesis) -> Option<Activations> {
@@ -94,5 +138,23 @@ mod tests {
             assert_eq!(known_validators(&live).unwrap()[0].as_hex(), TESTNET2_VALIDATOR);
         }
         assert!(known_validators(&Genesis::testnet_with_faucet(None)).is_none());
+    }
+
+    /// The set fixed for the live network must be safe to switch to:
+    /// at least 4 validators (one can fail), no duplicates, the current
+    /// validator among them, and a height after the rules already active.
+    #[test]
+    fn fixed_bft_set_is_sane() {
+        let Some(b) = bft_from(TESTNET2_BFT_FROM, TESTNET2_BFT_VALIDATORS) else {
+            assert!(TESTNET2_BFT_VALIDATORS.is_empty(), "validators listed without a height");
+            return;
+        };
+        let set: std::collections::HashSet<_> = b.validators.iter().collect();
+        assert!(b.validators.len() >= 4, "fewer than 4 validators");
+        assert_eq!(set.len(), b.validators.len(), "duplicate validator");
+        assert!(TESTNET2_BFT_VALIDATORS.contains(&TESTNET2_VALIDATOR), "current validator missing");
+        let (from, v3, policy) = (b.from_height, TESTNET2.recovery_v3, TESTNET2.policy_update);
+        assert!(from > v3, "BFT before the v3 recovery switch");
+        assert!(from > policy, "BFT before the policy change switch");
     }
 }

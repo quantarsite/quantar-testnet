@@ -241,44 +241,69 @@ async fn cmd_start(
             init_state.policy_update_from_height = store.policy_update_from_height()?;
         }
     }
-    // Several validators voting (BFT), on a network not fixed in code.
+    let info_of = |address: qtrc_crypto::Address| qtrc_common::state::ValidatorInfo { address, stake: 1 };
+    let known_network = qtrc_common::chain::known_activations(&genesis).is_some();
+    let known_bft = qtrc_common::chain::known_bft(&genesis);
+    let following = !follow.is_empty();
+
+    // Several validators voting (BFT). On the live network who they are and
+    // from which height comes from the code; the config only says where
+    // to reach them, and must agree with the code exactly.
     let bft_peers = match &bft_config {
         Some(path) => {
-            if qtrc_common::chain::known_activations(&genesis).is_some() {
-                anyhow::bail!("--bft-config is for networks not fixed in code; the live network's rules come from the code");
-            }
             let (from, peers) = bft::BftConfig::load(path)?;
+            if known_network {
+                let Some(kb) = &known_bft else {
+                    anyhow::bail!("this network has no BFT activation fixed in code yet; start without --bft-config");
+                };
+                check_known_bft(kb, from, &peers)?;
+            }
             init_state.bft_from_height = from;
-            init_state.validators = peers
-                .iter()
-                .map(|p| qtrc_common::state::ValidatorInfo { address: p.address.clone(), stake: 1 })
-                .collect();
+            init_state.validators = peers.iter().map(|p| info_of(p.address.clone())).collect();
             info!(validators = peers.len(), bft_from_height = from, "Blocks decided by validator votes (BFT)");
             Some(peers)
         }
-        None => None,
+        None => {
+            if let Some(kb) = &known_bft {
+                if !following {
+                    anyhow::bail!(
+                        "this network switches to validator votes at block {}: a validator needs --bft-config \
+                         with the validators' p2p addresses (a follower needs --follow)",
+                        kb.from_height
+                    );
+                }
+                init_state.bft_from_height = kb.from_height;
+                init_state.validators = kb.validators.iter().cloned().map(info_of).collect();
+            }
+            None
+        }
     };
-    // Who signs the blocks. Without a set, the node would expect its own
-    // signature on every block, which only works on the single validator.
-    if bft_peers.is_some() {
-        // Set above from the BFT config.
-    } else if let Some(vs) = qtrc_common::chain::known_validators(&genesis) {
-        init_state.validators = vs
-            .into_iter()
-            .map(|address| qtrc_common::state::ValidatorInfo { address, stake: 1 })
-            .collect();
+    // Who made the blocks before the voting (or makes all of them, on a
+    // chain that never votes). Without any set, the node would expect its
+    // own signature on every block, which only works on a lone validator.
+    let pre_bft: Vec<_> = if let Some(vs) = qtrc_common::chain::known_validators(&genesis) {
+        vs.into_iter().map(info_of).collect()
     } else if let Some(v) = &validator {
         let address = qtrc_crypto::Address::from_hex(v).map_err(|e| anyhow::anyhow!("--validator must be a 64-hex address: {e}"))?;
-        init_state.validators = vec![qtrc_common::state::ValidatorInfo { address, stake: 1 }];
+        vec![info_of(address)]
+    } else {
+        Vec::new()
+    };
+    if init_state.validators.is_empty() {
+        init_state.validators = pre_bft;
+    } else if init_state.bft_from_height > 1 {
+        init_state.pre_bft_validators = pre_bft;
     }
-    let following = !follow.is_empty();
     if following && init_state.validators.is_empty() {
         anyhow::bail!("--follow needs to know the validator: this chain has none fixed in code, pass --validator <address>");
     }
-    if !following && !init_state.validators.is_empty() && !init_state.validators.iter().any(|v| v.address == keypair.address()) {
+    let me = keypair.address();
+    let in_set = |set: &[qtrc_common::state::ValidatorInfo]| set.iter().any(|v| v.address == me);
+    let makes_pre_bft_blocks = in_set(&init_state.pre_bft_validators);
+    if !following && !init_state.validators.is_empty() && !in_set(&init_state.validators) && !makes_pre_bft_blocks {
         anyhow::bail!(
             "this node's key ({}) is not a validator of this chain; start with --follow <peer> to run a follower",
-            keypair.address().as_hex()
+            me.as_hex()
         );
     }
     info!(
@@ -412,7 +437,9 @@ async fn cmd_start(
         let e = engine.clone();
         let w = wake.clone();
         std::thread::spawn(move || follow::run(e, peers, w));
-    } else if !bft_validator {
+    } else if !bft_validator || makes_pre_bft_blocks {
+        // A lone validator, or the one that keeps making blocks alone until
+        // the BFT activation (the producer stops itself at that height).
         let engine_clone = engine.clone();
         tokio::spawn(async move {
             run_block_producer(engine_clone).await;
@@ -426,8 +453,42 @@ async fn cmd_start(
     Ok(())
 }
 
+/// A `--bft-config` for the live network must match the code: same
+/// activation height, same validators (order does not matter, the voting
+/// set is sorted). It only adds where to reach each one.
+fn check_known_bft(kb: &qtrc_common::chain::KnownBft, from: u64, peers: &[bft::Peer]) -> Result<()> {
+    if from != kb.from_height {
+        anyhow::bail!("--bft-config says bft_from_height {from}, but this network fixes it at {}", kb.from_height);
+    }
+    let mut got: Vec<String> = peers.iter().map(|p| p.address.as_hex()).collect();
+    let mut want: Vec<String> = kb.validators.iter().map(|a| a.as_hex()).collect();
+    got.sort();
+    want.sort();
+    if got != want {
+        anyhow::bail!(
+            "--bft-config must list exactly the validators fixed in code for this network:\n  {}",
+            want.join("\n  ")
+        );
+    }
+    Ok(())
+}
+
 #[cfg(test)]
 mod tests {
+    #[test]
+    fn live_bft_config_must_match_the_code() {
+        use super::bft::Peer;
+        use qtrc_crypto::Address;
+        let a = |b: u8| Address([b; 32]);
+        let kb = qtrc_common::chain::KnownBft { from_height: 80, validators: vec![a(1), a(2), a(3), a(4)] };
+        let peers = |xs: &[u8]| xs.iter().map(|b| Peer { address: a(*b), url: format!("http://10.0.0.{b}:9545") }).collect::<Vec<_>>();
+        assert!(super::check_known_bft(&kb, 80, &peers(&[4, 2, 3, 1])).is_ok(), "order does not matter");
+        assert!(super::check_known_bft(&kb, 79, &peers(&[1, 2, 3, 4])).is_err(), "other height");
+        assert!(super::check_known_bft(&kb, 80, &peers(&[1, 2, 3])).is_err(), "missing one");
+        assert!(super::check_known_bft(&kb, 80, &peers(&[1, 2, 3, 5])).is_err(), "swapped one");
+        assert!(super::check_known_bft(&kb, 80, &peers(&[1, 2, 3, 4, 5])).is_err(), "extra one");
+    }
+
     #[test]
     fn node_key_is_created_once_and_kept() {
         let dir = std::env::temp_dir().join(format!("qtrc-node-key-{}", std::process::id()));

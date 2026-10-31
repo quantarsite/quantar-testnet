@@ -71,6 +71,8 @@ struct Checked {
 struct LastBlock {
     header: BlockHeader,
     sigs:   Vec<ValidatorSig>,
+    /// Its commit proof, on blocks decided by votes
+    commit: Option<qtrc_common::block::CommitProof>,
     tree:   Option<Arc<StateTree>>,
     from:   u64,
 }
@@ -221,14 +223,18 @@ impl ConsensusEngine {
         self
     }
 
-    /// Return the validator that should propose at `height`.
+    /// Return the validator that should propose at `height`, taken from
+    /// the set that decides that height: before the BFT activation on a
+    /// chain that had one validator first, that validator, so its history
+    /// replays unchanged.
     pub fn proposer_at(&self, height: u64) -> Option<Address> {
         let state = self.state.read();
-        if state.validators.is_empty() {
+        let set = state.validators_at(height);
+        if set.is_empty() {
             return None;
         }
-        let idx = (height as usize) % state.validators.len();
-        Some(state.validators[idx].address.clone())
+        let idx = (height as usize) % set.len();
+        Some(set[idx].address.clone())
     }
 
     /// Add a transaction to the mempool after pipeline validation.
@@ -407,6 +413,19 @@ impl ConsensusEngine {
         &self,
         addr: &Address,
     ) -> Result<(BlockHeader, Vec<ValidatorSig>, Option<qtrc_common::state_root::Proof>), ConsensusError> {
+        self.state_proof_with_commit(addr).map(|(h, s, _, p)| (h, s, p))
+    }
+
+    /// [`Self::state_proof`] plus the block's commit proof (on blocks
+    /// decided by votes), taken together so they always match.
+    #[allow(clippy::type_complexity)]
+    pub fn state_proof_with_commit(
+        &self,
+        addr: &Address,
+    ) -> Result<
+        (BlockHeader, Vec<ValidatorSig>, Option<qtrc_common::block::CommitProof>, Option<qtrc_common::state_root::Proof>),
+        ConsensusError,
+    > {
         // Header, signatures and tree are swapped together at commit, so the
         // proof always matches the header it is served with. O(log n), no
         // state lock.
@@ -417,7 +436,7 @@ impl ConsensusEngine {
         let Some(tree) = last.tree else {
             return Err(ConsensusError::Busy(format!("state roots start at block {}", last.from)));
         };
-        Ok((last.header, last.sigs, tree.proof(addr)))
+        Ok((last.header, last.sigs, last.commit, tree.proof(addr)))
     }
 
     /// Expose ingestion metrics for monitoring.
@@ -439,7 +458,7 @@ impl ConsensusEngine {
         {
             let state = self.state.read();
             // With BFT the consensus round decides who proposes.
-            if !bft && proposer != self.address && !state.validators.is_empty() {
+            if !bft && proposer != self.address && !state.validators_at(next_height).is_empty() {
                 return Err(ConsensusError::NotProposer { height: next_height });
             }
         }
@@ -710,6 +729,7 @@ impl ConsensusEngine {
         *self.last_block.write() = Some(LastBlock {
             header: block.header.clone(),
             sigs: block.validator_sigs.clone(),
+            commit: block.commit.clone(),
             tree,
             from: state.state_root_from_height,
         });
@@ -803,6 +823,14 @@ pub async fn run_block_producer(engine: Arc<ConsensusEngine>) {
         // one empty block every 5 s would grow the disk by over 1 GB a day.
         if engine.mempool.read().is_empty() {
             continue;
+        }
+        // From the BFT activation on, blocks are decided by votes, never
+        // made alone: the validator's BFT driver takes over at that height.
+        {
+            let st = engine.state.read();
+            if st.bft_active_at(st.height + 1) {
+                continue;
+            }
         }
 
         // Signing and verifying take hundreds of milliseconds; keep that off
