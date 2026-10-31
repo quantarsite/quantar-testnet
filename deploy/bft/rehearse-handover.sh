@@ -8,7 +8,8 @@ cd "$(dirname "$0")/../.." && cargo build --release -p qtrc-node -p qtrc-wallet 
 B=$PWD/target/release
 D=${1:-$(mktemp -d)}
 H=${H:-5}
-rm -rf "$D"; mkdir -p "$D"
+if [ -e "$D" ] && [ -n "$(ls -A "$D")" ]; then echo "$D is not empty; pass a new or empty folder"; exit 1; fi
+mkdir -p "$D"
 addr() { "$B/qtrc-node" keygen --out "$1" | awk '/^Address/ {print $3}'; }
 addr "$D/faucet.key" > "$D/faucet.addr"
 for i in 1 2 3 4; do addr "$D/v$i.key" > "$D/v$i.addr"; done
