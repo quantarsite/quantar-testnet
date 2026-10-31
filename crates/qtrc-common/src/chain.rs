@@ -33,7 +33,8 @@ pub const TESTNET2_VALIDATOR: &str = "809ae6fb45d3d7c9a2c2f3968c58cc55ad6bb2ca2c
 
 /// Rules of quantar-testnet-2 as they happened on the live node: fee from
 /// block 5 (v2.0.2), Sentinel from 6 (v2.1.0), state root from 15
-/// (v2.3.0), witness root from 20 (v2.4.0).
+/// (v2.3.0), witness root from 20 (v2.4.0), policy changes from 40
+/// (v2.8.0).
 ///
 /// `recovery_v3` stays at `u64::MAX` (never) until a release fixes a real
 /// height above the live tip: every node must ship the same number, so it
@@ -54,9 +55,9 @@ pub const TESTNET2: Activations =
 pub const RECOVERY_V3_TESTNET2: u64 = u64::MAX;
 
 /// Height at which quantar-testnet-2 starts accepting Sentinel policy
-/// changes. Like `recovery_v3`, it stays at `u64::MAX` until a release
-/// fixes a real height above the live tip, the same on every node.
-pub const POLICY_UPDATE_TESTNET2: u64 = u64::MAX;
+/// changes. Fixed in v2.8.0 above the live tip (21 when it was chosen),
+/// the same on every node.
+pub const POLICY_UPDATE_TESTNET2: u64 = 40;
 
 /// The fixed activations of `genesis`, if it is a known network.
 #[must_use]

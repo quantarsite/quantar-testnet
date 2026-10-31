@@ -416,3 +416,40 @@ com 503 (os timers sempre entram).
 
 Falta antes de ativar numa rede pública: servidores em provedores
 diferentes e revisão independente.
+
+## v2.8.0: mudança de limites do Sentinel (sem reset)
+
+- `UpdatePolicy`: o dono muda `delay_blocks` e `allowance_per_window` da
+  própria conta. Apertar (limite menor ou igual e atraso maior ou igual)
+  vale no bloco seguinte. Qualquer outra mudança, inclusive mista, espera
+  o atraso atual em público, com o limite antigo valendo durante a espera;
+  a recuperação cancela. Limite novo abaixo do que já saiu na janela é
+  recusado (`AllowanceInUse`).
+- Ativa no bloco 40 da quantar-testnet-2 (`POLICY_UPDATE_TESTNET2`).
+  Antes dele a operação é recusada; blocos antigos refazem igual.
+- O watchtower recupera a conta diante de qualquer mudança de limites na
+  fila que não seja a `expected_policy` da config.
+- Carteira: `qtrc-wallet guardian policy --delay N --allowance X`; o
+  `vault` mostra a mudança pendente. `/status` mostra
+  `policy_update_from_height`.
+- Vaults que nunca pedem mudança mantêm a mesma codificação no state root
+  (vetor v1 inalterado; vetor novo para a mudança pendente).
+
+Esta versão também leva ao servidor o que entrou depois da v2.6.0 (BFT da
+v2.7.0 e recuperação v3), tudo desligado na rede no ar: BFT só vale com
+`--bft-config`, que a quantar-testnet-2 recusa, e a recuperação v3 segue
+em `u64::MAX`. Os blocos continuam gravados no formato 0x04.
+
+Deploy, seguidor primeiro (207.154.219.21), depois validador
+(164.90.145.184). Os dois antes do bloco 40.
+
+1. Backup: `systemctl stop <serviços>` e
+   `cp -a /var/lib/quantar /root/backup-quantar-$(date +%F)-v2.7`
+2. `cd ~/hx-mempool && git pull`, `cd ~/quantar-testnet && git pull && cargo build --release`
+3. Seguidor: `install -m 755 target/release/qtrc-{node,wallet} /usr/local/bin/`.
+   Validador: `install -m 755 target/release/qtrc-{node,faucet,wallet,watchtower} /usr/local/bin/`
+4. Iniciar os serviços e conferir `systemctl is-active`.
+5. `/status` mostra `version 0.8.0` e `policy_update_from_height 40`.
+
+Volta atrás: o binário anterior lê os dados até o primeiro bloco com uma
+`UpdatePolicy`; depois dele, só com o backup.
